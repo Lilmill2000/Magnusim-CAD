@@ -1,0 +1,562 @@
+/*
+ * Sketch mode (proposal §3.3; design-language §sketch colours): constraint
+ * glyphs (12 px outline icons on white badges), dimension labels (12 px
+ * #101828 on a white pill with a #d0d5dd border; driven grey in parentheses),
+ * value boxes typed while drawing, the Sketch panel's state line, conflicts
+ * list and the in-frame "Make it driven?" question (the core modal's card).
+ * Colours only through var(--mg-*) / var(--cad-*).
+ * Owner: P3-SKETCH.
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
+.cad-sketch-annotations > * {
+  position: absolute;
+  left: 0;
+  top: 0;
+  will-change: transform;
+}
+
+/* ---- constraint glyphs ---- */
+.cad-sk-glyph {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  margin: -8px 0 0 -8px;
+  border: 1px solid var(--mg-border);
+  border-radius: 3px;
+  background: var(--mg-bg);
+  color: var(--mg-text);
+  pointer-events: auto;
+  cursor: pointer;
+  box-sizing: border-box;
+}
+.cad-sk-glyph:hover {
+  border-color: var(--cad-set);
+}
+.cad-sk-glyph:focus-visible,
+.cad-sk-dim:focus-visible {
+  outline: 2px solid var(--mg-primary);
+  outline-offset: 1px;
+}
+.cad-sk-glyph.is-selected {
+  border-color: var(--cad-pick);
+  box-shadow: 0 0 0 1px var(--cad-pick);
+}
+.cad-sk-glyph.is-over {
+  border-color: var(--cad-sketch-over);
+  color: var(--cad-sketch-over);
+}
+.cad-sk-glyph.is-inference {
+  pointer-events: none;
+  color: var(--mg-primary-ink, #1570ef);
+  border-color: var(--mg-primary-ink, #1570ef);
+}
+
+/* ---- dimension labels ---- */
+.cad-sk-dim {
+  padding: 1px 6px;
+  border: 1px solid var(--mg-border);
+  border-radius: 10px;
+  background: var(--mg-bg);
+  color: var(--mg-text);
+  font-size: 12px;
+  line-height: 16px;
+  white-space: nowrap;
+  transform-origin: 0 0;
+  translate: -50% -50%;
+  pointer-events: auto;
+  cursor: pointer;
+  user-select: none;
+}
+.cad-sk-dim.is-driven {
+  color: var(--mg-text-muted);
+}
+.cad-sk-dim.is-selected {
+  border-color: var(--cad-pick);
+  box-shadow: 0 0 0 1px var(--cad-pick);
+}
+.cad-sk-dim.is-over {
+  border-color: var(--cad-sketch-over);
+  color: var(--cad-sketch-over);
+}
+.cad-sk-dim.is-preview {
+  color: var(--mg-primary-ink, #1570ef);
+  border-color: var(--mg-primary-ink, #1570ef);
+  pointer-events: none;
+}
+
+/* ---- value boxes (typed while drawing) and the dimension editor ---- */
+.cad-sk-box {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  translate: -50% 0;
+  padding: 2px 4px;
+  border: 1px solid var(--mg-border);
+  border-radius: 4px;
+  background: var(--mg-bg);
+  box-shadow: var(--cad-menu-shadow);
+  font-size: 11px;
+  color: var(--mg-text-body);
+  pointer-events: auto;
+  /* Over the labels and glyphs; the box with the keyboard over everything. */
+  z-index: 1;
+}
+.cad-sk-box:focus-within {
+  z-index: 2;
+}
+.cad-sk-box.is-editor {
+  translate: -50% -50%;
+  padding: 1px;
+}
+.cad-sk-box-k {
+  color: var(--mg-text-muted);
+}
+.cad-sk-box input {
+  width: 72px;
+  font-size: 12px;
+  padding: 2px 4px;
+}
+.cad-sk-box.is-locked input {
+  border-color: var(--cad-warning-border);
+  font-weight: 600;
+}
+.cad-sk-box.is-error input {
+  border-color: var(--mg-danger);
+  color: var(--mg-danger);
+}
+/* Why a typed value cannot be used, under its box ("Radius must be at least 20 mm"). */
+.cad-sk-box-err {
+  position: absolute;
+  top: calc(100% + 2px);
+  left: 0;
+  padding: 1px 6px;
+  border: 1px solid var(--mg-danger);
+  border-radius: 4px;
+  background: var(--mg-bg);
+  color: var(--mg-danger);
+  font-size: 11px;
+  white-space: nowrap;
+  pointer-events: none;
+}
+.cad-sk-box-err[hidden] {
+  display: none;
+}
+
+/* ---- the Sketch panel ---- */
+.cad-sk-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+}
+/* The dot is the key to the lines' colour: the colour they are drawn in; in a dark view, where the
+   lines take two (E2), its left half the colour over a light face (the -on-face tokens). */
+.cad-sk-state-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--cad-sketch-key-under);
+  box-shadow: var(--cad-sketch-key-under-on-face);
+}
+.cad-sk-state.is-fully .cad-sk-state-dot {
+  background: var(--cad-sketch-key-full);
+  box-shadow: var(--cad-sketch-key-full-on-face);
+}
+.cad-sk-state.is-over .cad-sk-state-dot,
+.cad-sk-state.is-unsolved .cad-sk-state-dot {
+  background: var(--cad-sketch-key-over);
+  box-shadow: var(--cad-sketch-key-over-on-face);
+}
+.cad-sk-state.is-over,
+.cad-sk-state.is-unsolved {
+  color: var(--cad-sketch-over);
+}
+.cad-sk-hint {
+  margin: 6px 0;
+}
+.cad-sk-check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 4px 0 8px;
+  font-size: 12px;
+}
+.cad-sk-section {
+  margin: 8px 0;
+}
+.cad-sk-selected {
+  margin: 2px 0 6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cad-sk-actions {
+  display: flex;
+  gap: 6px;
+}
+.cad-sk-conflicts {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 0;
+}
+.cad-sk-conflicts li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 3px 0;
+  border-bottom: 1px solid var(--mg-divider);
+  color: var(--cad-sketch-over);
+}
+.cad-sk-conflict-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---- "Make it driven?" (the core modal's card, style.css:2562-2615) ---- */
+.cad-sk-dialog {
+  padding: 0;
+  border: none;
+  border-radius: var(--mg-radius-md);
+  background: transparent;
+}
+.cad-sk-dialog::backdrop {
+  background: var(--cad-modal-backdrop);
+}
+.cad-sk-dialog-card {
+  width: min(420px, 92vw);
+  padding: 18px 20px 16px;
+  border-radius: var(--mg-radius-md);
+  background: var(--mg-bg);
+  box-shadow: var(--cad-modal-shadow);
+  color: var(--mg-text-strong);
+}
+.cad-sk-dialog-card h2 {
+  margin: 0 0 12px;
+  font-size: 16px;
+  font-weight: 650;
+}
+.cad-sk-dialog-copy {
+  margin: 0 0 12px;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--mg-text-body);
+}
+.cad-sk-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+/* Sketch with nothing selected: what to pick, over the top of the view (sketch/commands.ts). */
+.cad-sketch-pick {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 4px 12px;
+  border: 1px solid var(--mg-border);
+  border-radius: var(--mg-radius-pill);
+  background: var(--mg-bg);
+  color: var(--mg-text);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  box-shadow: var(--mg-shadow-tooltip);
+}
+
+.cad-sketch-pick[data-problem='1'] {
+  color: var(--mg-danger);
+}
+
+/* ==== ux010 PANELS (begin): the compact Sketch panel (src/sketch/panel.tsx) ==== */
+/* Narrower than a feature panel's 360 px: compact, it holds a hint, a tool's few fields and a value. */
+.tree-detail:not(.is-wide) > .cad-panel[data-cad-panel='sketch'] {
+  width: 288px;
+}
+
+/* The head, one line: the name (renamable) on the left takes the ellipsis (its full text is the tooltip);
+   the state dot and words, then the chevron, on the right keep their full width (review 2: the DOF
+   state was cut, "Over defined · 4 conflic…", and the name wrapped). */
+.cad-panel[data-cad-panel='sketch'] > .mgk-panel-head > :first-child {
+  min-width: 48px;
+  flex: 1 1 auto;
+}
+
+.cad-panel[data-cad-panel='sketch'] .mesh-title-row .mgk-panel-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cad-panel[data-cad-panel='sketch'] .mesh-title-row > button {
+  flex: none;
+}
+
+.cad-sk-head-aside {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  flex: none;
+}
+
+.cad-sk-head-aside .cad-sk-state {
+  flex: none;
+  font-size: 12px;
+}
+
+.cad-sk-state-dot {
+  flex: none;
+}
+
+.cad-sk-state-words {
+  white-space: nowrap;
+}
+
+.cad-panel[data-cad-panel='sketch'] .cad-sk-hint:first-child {
+  margin-top: 0;
+}
+
+/* The dimension being edited or just placed. */
+.cad-sk-dimension-value {
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+  vertical-align: bottom;
+}
+
+/* Details ▸ in the foot, beside Delete: a quiet disclosure, not an action. */
+.cad-sk-details-btn {
+  margin: 0;
+  padding: 2px 0;
+  font: inherit;
+  font-size: 12px;
+  color: var(--mg-text-muted);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+}
+
+.cad-sk-details-btn:hover,
+.cad-sk-details-btn:focus-visible {
+  color: var(--mg-text-strong);
+  text-decoration: underline;
+  outline: none;
+}
+
+/* The kit's focus ring (as the rails'), review 7. */
+.cad-sk-details-btn:focus-visible {
+  border-radius: 3px;
+  box-shadow: 0 0 0 2px var(--mg-focus);
+}
+/* The compact hint: one line, cut with an ellipsis (the full hint is the tooltip and in Details). */
+.cad-sk-hint.is-one-line > * {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The collapsed panel: its rail, and beside it the active tool's own inputs (the tool card). */
+.cad-rail-group {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  max-height: 100%;
+  min-height: 0;
+}
+
+.cad-rail-group > .cad-rail {
+  max-height: 100%;
+}
+
+.cad-tool-card {
+  box-sizing: border-box;
+  width: 248px;
+  padding: 8px 10px;
+  font-size: 12px;
+  background: var(--mg-bg);
+  border: 1px solid var(--mg-card-border);
+  border-left: 3px solid var(--cad-panel-accent-sketch);
+  border-radius: var(--mg-radius-md);
+  box-shadow: var(--mg-shadow-md);
+  animation: cad-rail-in 140ms ease-out;
+}
+
+.cad-tool-card .cad-sk-hint {
+  margin: 0 0 4px;
+}
+
+.cad-tool-card .cad-sk-section {
+  margin: 4px 0 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cad-tool-card {
+    animation: none;
+  }
+}
+
+/* ==== ux010 PANELS (end) ==== */
+
+/* ==== ux010 DRAW (start): the construction drawing badge, a fillet's radius arrow ==== */
+/* Construction drawing on: a small badge at the top of the view (where the model's "Select a plane" prompt sits; never both). */
+.cad-sketch-annotations > .cad-sk-construction-badge {
+  left: 50%;
+  top: 12px;
+  transform: translateX(-50%);
+  padding: 3px 10px;
+  border: 1px dashed var(--mg-text-muted);
+  border-radius: var(--mg-radius-pill);
+  background: var(--mg-bg);
+  color: var(--mg-text);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  box-shadow: var(--mg-shadow-tooltip);
+  pointer-events: none;
+  /* "Construction · X" and its × (Turn off construction), which takes the click. */
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding-right: 3px;
+}
+.cad-sketch-annotations > .cad-sk-construction-badge[hidden] {
+  display: none;
+}
+.cad-sk-construction-key {
+  display: inline-block;
+  min-width: 14px;
+  padding: 0 3px;
+  border: 1px solid var(--mg-border);
+  border-bottom-width: 2px;
+  border-radius: 3px;
+  font: inherit;
+  font-size: 10px;
+  line-height: 13px;
+  text-align: center;
+  color: var(--mg-text-muted);
+}
+.cad-sk-construction-off {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--mg-text);
+  margin-left: 2px;
+  font-size: 16px;
+  font-weight: 400;
+  line-height: 1;
+  cursor: pointer;
+  pointer-events: auto;
+}
+.cad-sk-construction-off:hover {
+  background: var(--cad-icon-btn-hover-bg);
+  color: var(--mg-text);
+}
+.cad-sk-construction-off:focus-visible {
+  outline: 2px solid var(--mg-primary);
+  outline-offset: 1px;
+}
+
+/* The relations palette (SolidWorks' Add Relations): a row of relation buttons beside the selection. */
+.cad-sketch-annotations > .cad-sk-relations {
+  display: inline-flex;
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid var(--mg-border);
+  border-radius: 6px;
+  background: var(--mg-bg);
+  box-shadow: var(--cad-menu-shadow);
+  pointer-events: auto;
+  will-change: auto;
+  z-index: 2;
+}
+.cad-sketch-annotations > .cad-sk-relations[hidden] {
+  display: none;
+}
+.cad-sk-relations-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--mg-text);
+  cursor: pointer;
+}
+.cad-sk-relations-btn:hover {
+  border-color: var(--mg-border);
+  background: var(--cad-icon-btn-hover-bg);
+}
+.cad-sk-relations-btn:focus-visible {
+  outline: 2px solid var(--mg-primary);
+  outline-offset: 1px;
+}
+/* Already in the sketch: pressed, and nothing to add. */
+.cad-sk-relations-btn.is-present {
+  border-color: var(--cad-toolbar-active-border);
+  background: var(--cad-toolbar-active-bg);
+  color: var(--cad-toolbar-active-icon);
+  cursor: default;
+}
+/* The radius arrow: its tail on the arc, pointing away from the centre (rotated by the overlay); a press anywhere on it drags it. */
+.cad-sketch-annotations > .cad-sk-handle {
+  /* A generous grab box (38 x 22) around a light arrow: a thin shaft, a small head, a small ring. */
+  width: 38px;
+  height: 22px;
+  transform-origin: 0 0;
+  /* Review B1: the arrow takes the press itself (above the labels and glyphs it may cross). */
+  pointer-events: auto;
+  cursor: grab; /* the overlay sets the sketch's own grab cursor on the element */
+  z-index: 3;
+  color: var(--mg-primary-ink, #1570ef);
+}
+.cad-sk-handle svg {
+  display: block;
+  overflow: visible;
+}
+.cad-sk-handle svg path:first-child {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+}
+.cad-sk-handle svg path:last-child {
+  fill: currentColor;
+  stroke: var(--mg-bg);
+  stroke-width: 1;
+  stroke-linejoin: round;
+}
+.cad-sk-handle::before {
+  content: '';
+  position: absolute;
+  left: 0.5px;
+  top: 7.5px;
+  width: 7px;
+  height: 7px;
+  border: 1.5px solid currentColor;
+  border-radius: 50%;
+  background: var(--mg-bg);
+  box-sizing: border-box;
+}
+.cad-sk-handle.is-active {
+  color: var(--cad-pick);
+}
+/* ==== ux010 DRAW (end) ==== */

@@ -1,0 +1,258 @@
+import { Fragment, useCallback, useLayoutEffect, useMemo, useRef, useState, type PointerEvent, type ReactNode } from 'react';
+import { formatSimTime } from '../format/time';
+import {
+  drawable,
+  formatValue,
+  legendSeries,
+  linePlotGeometry,
+  nearestRow,
+  PAD_B,
+  PAD_L,
+  PAD_R,
+  PAD_T,
+  PLOT_H,
+  PLOT_W,
+  seriesColor,
+  tipLeft,
+  xTickLabel,
+  type LinePlotX,
+  type LineRow,
+  type LineSeries,
+} from './linePlotGeometry';
+
+export type { LinePlotX, LineSeries } from './linePlotGeometry';
+
+export interface LinePlotProps {
+  rows: ReadonlyArray<Record<string, number | undefined>>;
+  series: LineSeries[];
+  /** The plot's accessible name (role=img). */
+  label: string;
+  /** The row key of the x value; default 't'. */
+  xKey?: string;
+  /**
+   * Iterations (labelled 1 … n) or simulated seconds (0 s … end), `max` the planned end;
+   * or 'linear': a number axis with round ticks over the data (and `min`/`max`), below zero too.
+   */
+  x: LinePlotX;
+  /** Log (decades; values ≤ 0 are skipped) or linear (round ticks). `unit` is shown under the y labels. */
+  y: { scale: 'log' | 'linear'; unit?: string };
+  /** Default true. */
+  legend?: boolean;
+  /** Plot height in px (and viewBox units); default 132, as the core residual plot. */
+  height?: number;
+  /** The hover tip's content for a row; default: x, then the dashed series, then the solid ones. */
+  tip?: (row: Record<string, number | undefined>) => ReactNode;
+}
+
+interface Hover {
+  row: LineRow;
+  /** The cursor's x in px from the plot's left edge. */
+  x: number;
+  /** The plot's width in px. */
+  width: number;
+}
+
+/** The core residual plot's readout: x, then each dashed series, then the solid series on one line. */
+function DefaultTip({
+  row,
+  xKey,
+  x,
+  series,
+  metrics,
+  scale,
+}: {
+  row: LineRow;
+  xKey: string;
+  x: LinePlotX;
+  series: LineSeries[];
+  metrics: LineSeries[];
+  scale: 'log' | 'linear';
+}) {
+  const xv = Number(row[xKey]);
+  const head =
+    x.kind === 'linear'
+      ? `${x.label ?? xKey} = ${x.format ? x.format(xv) : xTickLabel(xv, 1e-4)}`
+      : x.kind === 'seconds'
+        ? `t = ${formatSimTime(xv)}`
+        : `Iteration ${Math.round(xv)}`;
+  return (
+    <>
+      <b className="mgk-plot-tip-head">{head}</b>
+      {metrics
+        .filter((m) => Number.isFinite(Number(row[m.key])))
+        .map((m) => (
+          <Fragment key={m.key}>
+            <br />
+            <span>
+              {m.label} {formatValue(m, Number(row[m.key]))}
+            </span>
+          </Fragment>
+        ))}
+      <br />
+      {series
+        .filter((s) => !s.dashed && drawable(row[s.key], scale))
+        .map((s, i) => (
+          <span key={s.key}>
+            {i ? ' · ' : ''}
+            <span style={{ color: seriesColor(series, s) }}>{s.label}</span> {formatValue(s, Number(row[s.key]))}
+          </span>
+        ))}
+    </>
+  );
+}
+
+/** A small line chart (the core's residual plot, generalised): log or linear y, a hover readout and a legend. */
+export function LinePlot({ rows, series, label, xKey = 't', x, y, legend = true, height = PLOT_H, tip }: LinePlotProps) {
+  const xKind = x.kind;
+  const xMax = x.max;
+  const xMin = x.kind === 'linear' ? x.min : undefined;
+  const xFormat = x.kind === 'linear' ? x.format : undefined;
+  const scale = y.scale;
+  const seconds = xKind === 'seconds';
+  const linear = xKind === 'linear';
+  // Drawn at the width it has (a wide workspace panel or a narrow side panel): one viewBox
+  // unit per pixel, so its text and lines are never stretched. PLOT_W until it is measured.
+  const [boxWidth, setBoxWidth] = useState(0);
+  const watched = useRef<ResizeObserver | null>(null);
+  const boxRef = useCallback((el: HTMLDivElement | null) => {
+    watched.current?.disconnect();
+    watched.current = null;
+    if (!el) return;
+    const read = () => {
+      const w = el.clientWidth;
+      if (w > 0) setBoxWidth(w);
+    };
+    read();
+    if (typeof ResizeObserver !== 'undefined') {
+      watched.current = new ResizeObserver(read);
+      watched.current.observe(el);
+    }
+  }, []);
+  const width = boxWidth > 0 ? boxWidth : PLOT_W;
+  const geo = useMemo(
+    () =>
+      linePlotGeometry(rows, series, {
+        xKey,
+        x: xKind === 'linear' ? { kind: 'linear', min: xMin, max: xMax, format: xFormat } : { kind: xKind, max: xMax },
+        y: { scale },
+        height,
+        width,
+      }),
+    [rows, series, xKey, xKind, xMin, xMax, xFormat, scale, height, width],
+  );
+  const svgRef = useRef<SVGSVGElement | null>(null);
+  const tipRef = useRef<HTMLDivElement | null>(null);
+  const [hover, setHover] = useState<Hover | null>(null);
+  const [left, setLeft] = useState(0);
+
+  // Place the tip once its width is known: flipped left of the cursor near the right edge.
+  useLayoutEffect(() => {
+    const el = tipRef.current;
+    if (!hover || !el) return;
+    setLeft(tipLeft(hover.x, el.getBoundingClientRect().width, hover.width));
+  }, [hover]);
+
+  if (!geo) return null;
+  const g = geo;
+
+  function onMove(e: PointerEvent<HTMLDivElement>) {
+    const svg = svgRef.current;
+    if (!svg) return;
+    const r = svg.getBoundingClientRect();
+    if (!r.width) return;
+    const sx = ((e.clientX - r.left) / r.width) * g.width;
+    const t = g.xmin + ((sx - PAD_L) / (g.width - PAD_L - PAD_R)) * (g.xmax - g.xmin);
+    const row = nearestRow(rows, xKey, t);
+    if (!row) return;
+    setHover({ row, x: (g.xOf(Number(row[xKey])) / g.width) * r.width, width: r.width });
+  }
+
+  return (
+    <div className="mgk-type mgk-linechart">
+      <div ref={boxRef} className="mgk-plot" onPointerMove={onMove} onPointerLeave={() => setHover(null)}>
+        <svg
+          ref={svgRef}
+          className="mgk-plot-svg"
+          viewBox={`0 0 ${g.width} ${height}`}
+          preserveAspectRatio="none"
+          role="img"
+          aria-label={label}
+          style={{ height: `${height}px` }}
+        >
+          {g.ticks.map((d, i) => (
+            <g key={i}>
+              <line className="mgk-plot-grid" x1={PAD_L} y1={d.y.toFixed(1)} x2={g.width - PAD_R} y2={d.y.toFixed(1)} />
+              <text className="mgk-plot-label" x={PAD_L - 4} y={(d.y + 3).toFixed(1)} textAnchor="end" fontSize="8">
+                {d.label}
+              </text>
+            </g>
+          ))}
+          {linear ? (
+            g.xTicks.map((d, i) => (
+              <g key={`x${i}`}>
+                <line className="mgk-plot-grid" x1={d.x.toFixed(1)} y1={PAD_T} x2={d.x.toFixed(1)} y2={height - PAD_B} />
+                <text
+                  className="mgk-plot-label"
+                  x={d.x.toFixed(1)}
+                  y={height - 4}
+                  textAnchor={i === 0 ? 'start' : i === g.xTicks.length - 1 ? 'end' : 'middle'}
+                  fontSize="8"
+                >
+                  {d.label}
+                </text>
+              </g>
+            ))
+          ) : (
+            <>
+              <text className="mgk-plot-label" x={PAD_L} y={height - 4} fontSize="8">
+                {seconds ? '0 s' : '1'}
+              </text>
+              <text className="mgk-plot-label" x={g.width - PAD_R} y={height - 4} textAnchor="end" fontSize="8">
+                {seconds ? formatSimTime(g.xmax) : String(Math.round(g.xmax))}
+              </text>
+            </>
+          )}
+          {y.unit ? (
+            <text className="mgk-plot-label" x={PAD_L - 4} y={height - 4} textAnchor="end" fontSize="8">
+              {y.unit}
+            </text>
+          ) : null}
+          {g.lines.map((l) => (
+            <polyline
+              key={l.key}
+              className={l.dashed ? 'mgk-plot-line mgk-plot-line--dashed' : 'mgk-plot-line'}
+              style={{ stroke: l.color }}
+              points={l.points}
+            />
+          ))}
+        </svg>
+        <div className="mgk-plot-cursor" hidden={!hover} style={hover ? { left: `${hover.x.toFixed(1)}px` } : undefined} />
+        <div ref={tipRef} className="mgk-plot-tip" hidden={!hover} style={hover ? { left: `${left.toFixed(1)}px` } : undefined}>
+          {hover ? (
+            tip ? (
+              tip(hover.row)
+            ) : (
+              <DefaultTip row={hover.row} xKey={xKey} x={x} series={series} metrics={g.metrics} scale={scale} />
+            )
+          ) : null}
+        </div>
+      </div>
+      {legend ? (
+        <div className="mgk-plot-legend">
+          {legendSeries(rows, series, scale).map((s) => {
+            const c = seriesColor(series, s);
+            return (
+              <span key={s.key} className="mgk-plot-key">
+                <i
+                  className="mgk-plot-swatch"
+                  style={{ background: s.dashed ? `repeating-linear-gradient(90deg, ${c} 0 4px, transparent 4px 6px)` : c }}
+                />
+                {s.label}
+              </span>
+            );
+          })}
+        </div>
+      ) : null}
+    </div>
+  );
+}

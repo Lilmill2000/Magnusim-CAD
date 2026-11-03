@@ -1,0 +1,2349 @@
+/**
+ * W6/W8/W9/W10/W11/W12/W13 Vite middleware:
+ *   GET /api/times?case=                  -> real OpenFOAM time dirs on disk (W12)
+ *   GET /api/fields/:field?case=&time=     -> surface VTP (a shown field) from case tree
+ *   GET /api/fields/:field/meta?...       -> JSON fingerprint
+ *   GET /api/particle-trace?...           -> tube-glyph VTP (server streamlines on the case's velocity)
+ *   GET /api/particle-trace/meta?...      -> JSON (n_seeds, tube_proof, fingerprint)
+ *   GET /api/plot-over-path?...           -> JSON series (sample_over_line on the asked field)
+ *   GET /api/plot-over-path/meta?...      -> same JSON fingerprint
+ *   GET /api/volume/warmup?case=&time=    -> pin OpenFOAM volume in worker RAM
+ *   POST /api/volume/release              -> drop in-memory volumes (Home / idle)
+ *   GET /api/cut-plane?...                -> volume cutting-plane slice VTP (pyvista slice)
+ *   GET /api/iso-surface?...              -> iso contour VTP (volume VTU contour)
+ *   GET /api/iso-surface/meta?...         -> JSON fingerprint (n_cells, empty, checksum)
+ *   GET /api/iso-volume?...               -> iso volume threshold VTP (volume VTU threshold)
+ *   GET /api/iso-volume/meta?...          -> JSON fingerprint (n_cells, empty, mapped lo/hi)
+ *   GET /api/inspect?x=&y=&z=&time=[&fields=a,b] -> JSON probe (shown fields at point; honest miss)
+ *
+ * Particle Trace path (W8 HARD): pyvista streamlines_from_source on the case's
+ * velocity vector (vector= names it), then tube(radius=Size). Not magnitude-only fake lines.
+ * Plot-over-path (W9 HARD): pyvista sample_over_line on case VTU field along polyline.
+ * Iso Surface (W10 HARD): pyvista contour on the case volume (iso_field / color_field names);
+ * honest empty when iso value out of range (MTP1 default 11.1). Not a solid shell.
+ * Iso Volume (W11 HARD): pyvista threshold on volume VTU; normalized 0.25/0.75 mapped
+ * to live min/max -> nonzero cells; honest empty when inverted. Not contour rebrand.
+ * Animation (W12 HARD): /api/times lists real time dirs; /api/fields?time= loads that
+ * time (uniform foam fills surface); missing time -> 404 empty, no fake field.
+ * Particle Trace multi-face (W14 HARD): faces[] + density|count even distribute on BC patches; empty selection honest empty.
+ * Inspect point (W13 HARD): /api/inspect?x=&y=&z=&time= probes case VTU via
+ * PolyData.sample (sample_over_point family); hit -> values {field: v}; miss -> empty no fake.
+ * Mesh->solve honesty (W15 HARD): POST /api/case/attach sets active case_dir;
+ * GET /api/case returns it; /api/times + field APIs use active root when case=
+ * omitted. No fake Running/0-100 progress. Attach-only is enough for W15.
+ * W15.1 HARD: POST /api/case/mesh kicks real OpenFOAM checkMesh via WSL
+ * (cfddesk ext4 case). Job status runningÃ¢â€ â€™done/failed tracks real process PID.
+ * On done: active case_dir Ã¢â€ â€™ new run-w151-* (time 0 only) so times/fp change.
+ * Same-origin on 8082.
+ * W19 HARD: POST /api/bcs + GET /api/bcs persist boundary_conditions.json
+ *   (Velocity inlet 1 @ face57 5 ft3/min + Pressure outlet 2 @ face71 0 Pa; NOT Velocity outlet).
+ * W18 HARD: POST /api/materials + GET /api/materials persist materials.json (AirÃ¢â€ â€™Body1).
+ * W17 HARD: POST /api/simulation + GET /api/simulation persist simulation.json (Incompressible defaults).
+ * W16 HARD: POST /api/project + GET /api/project persist under projects/;
+ * POST /api/geometry/import STEPÃ¢â€ â€™STL Body1; GET /api/geometry/stl serves CAD.
+ * W20 HARD: POST /api/mesh + GET /api/mesh persist mesh.json (bank settings).
+ * W23 HARD: POST /api/mesh/generate|/remesh uses W16 project source.step/Body1 + Standard/gmsh-hexcore (Hex-dominant=snappy); Job PID; real polyMesh counts; NOT checkMesh; NOT MTP1-silent-copy; no W15.1 stamp on generate.
+ * W27: /api/run/* + /api/simulation-control â€” run catalog, simpleFoam start/stop/status, monitors.
+ * GET /api/result-controls|/api/area-average reads a study's result controls; monitors are saved on the run.
+ * FILTERS/attach/W15.1 kick unchanged.
+ */
+import { spawnFilter, runFilterToolAsync } from './filter-spawn.js';
+import { attachLiveMeshJobReader } from './w16-project-geometry.js';
+import { caseDirAllowedForAttach, caseDirBelongsToProject, caseDirBelongsToStudy, projectIdFromCaseDir } from './project-isolation.js';
+import { PROJECTS_ROOT as PROJECTS_ROOT_FOR_ATTACH, caseDirBelongsToPluginStudy } from './project-isolation.js';
+import { realpathSync } from 'node:fs';
+import { isAbsolute, relative } from 'node:path';
+import { caseRegionNames, caseRegions, listFoamTimeDirs, timeFieldDirs } from './project-layout.js';
+import { liveMeshJobSnapshot, meshGenerateLivePid, recoverStudyMeshesFromDisk, watchUnownedMeshGenerate } from './w21-mesh-generate.js';
+import { getActiveSimulation } from './w17-sim-catalog.js';
+import { assembleMeshDoc } from './study-io.js';
+import { PY_TOOLS, pyTool } from './python-env.js';
+import { callWorker } from './py-json.js';
+import { fieldExportMaySpawnFallback } from './field-export-fallback.js';
+import { createHash } from 'node:crypto';
+import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { envGet } from './env-compat.js';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const ROOT = resolve(__dirname, '..');
+/* Server-side scratch (export caches, job scripts/logs). Created on demand; safe to delete. */
+const CACHE_DIR = join(ROOT, '.cache');
+const DEFAULT_TIME = '50';
+
+/** W15/W15.1 active case root Ã¢â‚¬â€ set by attach or mesh kick; used when ?case= omitted. */
+let activeCaseState = {
+  case_dir: null,
+  status: 'idle', // idle | attached | running | done | failed
+  attached_at: null,
+  mode: 'attach-only', // attach-only | mesh | solve
+  n_times: 0,
+  times: [],
+  note: 'W15.1: attach existing case_dir OR Kick mesh (real OpenFOAM checkMesh). No invented progress.',
+  pid: null,
+  exit_code: null,
+  command: null,
+  argv: null,
+  started_at: null,
+  finished_at: null,
+  log_path: null,
+  log_excerpt: null,
+  wsl_case: null,
+  path_kind: null,
+  kick_id: null,
+  error: null,
+  n_cells: null,
+  n_points: null,
+  n_faces: null,
+  counts_source: null,
+  emesh: null,
+  feature_marks_total: null,
+  mesh_path: null,
+  fingerprint_before: null,
+  fingerprint_after: null,
+  project_id: null,
+};
+
+function requestProjectId(u, body) {
+  return String(
+    (u && u.searchParams && u.searchParams.get('project_id')) ||
+      (body && (body.project_id || body.projectId)) ||
+      ''
+  ).trim();
+}
+
+function resolveCaseDir(u) {
+  const q = u && u.searchParams ? u.searchParams.get('case') : null;
+  const raw = q != null ? String(q).trim() : '';
+  const chosen =
+    raw && raw !== 'null' && raw !== 'undefined' ? raw : activeCaseState.case_dir || null;
+  const pid = requestProjectId(u);
+  if (pid && chosen && !caseDirBelongsToProject(chosen, pid)) return null;
+  return chosen;
+}
+
+function resetActiveCaseIdle(note) {
+  activeCaseState = {
+    case_dir: null,
+    status: 'idle',
+    attached_at: null,
+    mode: 'attach-only',
+    n_times: 0,
+    times: [],
+    note: note || 'idle â€” add geometry',
+    pid: null,
+    exit_code: null,
+    command: null,
+    argv: null,
+    started_at: null,
+    finished_at: null,
+    log_path: null,
+    log_excerpt: null,
+    wsl_case: null,
+    path_kind: null,
+    kick_id: null,
+    error: null,
+    n_cells: null,
+    n_points: null,
+    n_faces: null,
+    counts_source: null,
+    emesh: null,
+    feature_marks_total: null,
+    mesh_path: null,
+    fingerprint_before: null,
+    fingerprint_after: null,
+    generate_id: null,
+    step_path: null,
+    body1_path: null,
+    geometry: null,
+    mtp1_silent_copy: null,
+    project_id: null,
+  };
+}
+
+attachLiveMeshJobReader(liveMeshJobSnapshot);
+
+function syncActiveCaseToActiveProject() {
+  let id = null;
+  try {
+    if (existsSync(ACTIVE_PROJECT_PATH)) {
+      id = JSON.parse(readFileSync(ACTIVE_PROJECT_PATH, 'utf8')).project_id || null;
+    }
+  } catch (_) {}
+  if (id && activeCaseState.case_dir && caseDirBelongsToProject(activeCaseState.case_dir, id)) {
+    return;
+  }
+  resetActiveCaseIdle(id ? 'detached â€” switched project' : 'idle');
+  hydrateActiveMeshCase();
+}
+
+function readJsonBody(req) {
+  return new Promise((resolveP, reject) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => {
+      try {
+        const raw = Buffer.concat(chunks).toString('utf8');
+        if (!raw.trim()) return resolveP({});
+        resolveP(JSON.parse(raw));
+      } catch (e) {
+        reject(e);
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
+function caseSnapshot() {
+  const caseDir = activeCaseState.case_dir;
+  const times = caseDir && existsSync(caseDir) ? listCaseTimes(caseDir) : [];
+  const livePid = meshGenerateLivePid();
+  return {
+    increment: activeCaseState.increment || (activeCaseState.path_kind === 'snappyHexMesh' ? 'W23' : 'W15.1'),
+    project_id: activeCaseState.project_id || projectIdFromCaseDir(caseDir),
+    case_dir: caseDir,
+    status: activeCaseState.status,
+    mode: activeCaseState.mode,
+    attached_at: activeCaseState.attached_at,
+    times,
+    n_times: times.length,
+    start: times.length ? times[0] : null,
+    end: times.length ? times[times.length - 1] : null,
+    note: activeCaseState.note,
+    no_fake_progress: true,
+    soft_pass_avoided: true,
+    pid: livePid != null ? livePid : activeCaseState.pid,
+    exit_code: activeCaseState.exit_code,
+    command: activeCaseState.command,
+    argv: activeCaseState.argv,
+    started_at: activeCaseState.started_at,
+    finished_at: activeCaseState.finished_at,
+    log_path: activeCaseState.log_path,
+    log_excerpt: activeCaseState.log_excerpt,
+    wsl_case: activeCaseState.wsl_case,
+    path_kind: activeCaseState.path_kind,
+    kick_id: activeCaseState.kick_id,
+    mesh_id: activeCaseState.mesh_id || null,
+    simulation_id: activeCaseState.simulation_id || null,
+    error: activeCaseState.error || null,
+    n_cells: activeCaseState.n_cells ?? null,
+    n_points: activeCaseState.n_points ?? null,
+    n_faces: activeCaseState.n_faces ?? null,
+    counts_source: activeCaseState.counts_source || null,
+    emesh: activeCaseState.emesh || null,
+    feature_marks_total: activeCaseState.feature_marks_total ?? null,
+    mesh_path: activeCaseState.mesh_path || null,
+    fingerprint_before: activeCaseState.fingerprint_before || null,
+    fingerprint_after: activeCaseState.fingerprint_after || null,
+    generate_id: activeCaseState.generate_id || null,
+    step_path: activeCaseState.step_path || null,
+    body1_path: activeCaseState.body1_path || null,
+    geometry: activeCaseState.geometry || null,
+    engine: activeCaseState.engine || null,
+    stage: activeCaseState.stage || null,
+    stage_detail: activeCaseState.stage_detail || null,
+    hex_core_applied: activeCaseState.hex_core_applied ?? null,
+    layers_applied: activeCaseState.layers_applied ?? null,
+    surface_size_m: activeCaseState.surface_size_m ?? null,
+  };
+}
+
+function applyKickUpdate(fields) {
+  const times =
+    fields.times ||
+    (fields.case_dir && existsSync(fields.case_dir) ? listCaseTimes(fields.case_dir) : activeCaseState.times);
+  activeCaseState = {
+    ...activeCaseState,
+    ...fields,
+    times,
+    n_times: Array.isArray(times) ? times.length : activeCaseState.n_times,
+    attached_at: fields.attached_at || activeCaseState.attached_at || new Date().toISOString(),
+  };
+}
+
+/**
+ * The first folder of caseDir under its project's real folder, lower-cased
+ * ('plugins', 'geometries', 'simulations' and so on), or '' when it is not inside.
+ */
+function firstPartUnderProject(caseDir, projectId) {
+  const root = resolve(PROJECTS_ROOT_FOR_ATTACH, String(projectId));
+  const real = (p) => {
+    try {
+      return realpathSync.native(p);
+    } catch {
+      return resolve(p);
+    }
+  };
+  const rel = relative(real(root), real(String(caseDir)));
+  if (!rel || rel.startsWith('..') || isAbsolute(rel)) return '';
+  return rel.split(/[\\/]/)[0].toLowerCase();
+}
+
+function attachCaseDir(caseDirAbs, projectIdOpt, simIdOpt, pluginStudy) {
+  const caseDir = String(caseDirAbs || '').trim();
+  if (!caseDir) {
+    return { ok: false, status: 400, body: { error: 'case_dir required (absolute path)', status: 'idle' } };
+  }
+  const want = String(projectIdOpt || '').trim();
+  if (want && !caseDirBelongsToProject(caseDir, want)) {
+    return {
+      ok: false,
+      status: 403,
+      body: { error: 'case_dir is not in this project', case_dir: caseDir, project_id: want },
+    };
+  }
+  const sid = String(simIdOpt || '').trim();
+  // Which rule applies follows where the case really is in the project.
+  const first = want ? firstPartUnderProject(caseDir, want) : '';
+  if (first === 'plugins') {
+    const plugin = pluginStudy && pluginStudy.plugin;
+    const studyId = pluginStudy && pluginStudy.studyId;
+    if (!plugin || !studyId || !caseDirBelongsToPluginStudy(caseDir, want, plugin, studyId)) {
+      return {
+        ok: false,
+        status: 403,
+        body: { error: 'case_dir is not in this plugin study', case_dir: caseDir, project_id: want },
+      };
+    }
+  }
+  if (want && (first === 'geometries' || first === 'simulations') && !sid) {
+    return {
+      ok: false,
+      status: 400,
+      body: { error: 'simulation_id required', case_dir: caseDir, project_id: want },
+    };
+  }
+  if (want && sid && first !== 'plugins' && !caseDirAllowedForAttach(caseDir, want, sid)) {
+    return {
+      ok: false,
+      status: 403,
+      body: { error: 'case_dir is not in this study', case_dir: caseDir, project_id: want, simulation_id: sid },
+    };
+  }
+  if (!caseDir || !existsSync(caseDir)) {
+    return {
+      ok: false,
+      status: 404,
+      body: {
+        error: 'case_dir not found',
+        case_dir: caseDir,
+        status: 'idle',
+        no_fake_progress: true,
+      },
+    };
+  }
+  const st = statSync(caseDir);
+  if (!st.isDirectory()) {
+    return {
+      ok: false,
+      status: 400,
+      body: { error: 'case_dir is not a directory', case_dir: caseDir, status: 'idle' },
+    };
+  }
+  const times = listCaseTimes(caseDir);
+  let meshExtra = {};
+  try {
+    const info = readActiveProjectMeshDoc();
+    const live = info && info.doc && info.doc.live_mesh_result;
+    if (
+      live &&
+      live.status === 'done' &&
+      live.case_dir &&
+      String(live.case_dir).replace(/\\\\/g,'\\') === String(caseDir).replace(/\\\\/g,'\\')
+    ) {
+      meshExtra = {
+        status: 'done',
+        mode: 'mesh',
+        path_kind: live.path_kind || 'standard',
+        generate_id: live.generate_id || null,
+        kick_id: live.generate_id || null,
+        exit_code: live.exit_code != null ? live.exit_code : 0,
+        n_cells: live.n_cells ?? null,
+        n_points: live.n_points ?? null,
+        n_faces: live.n_faces ?? null,
+        counts_source: live.counts_source || null,
+        emesh: live.emesh || null,
+        feature_marks_total: live.feature_marks_total ?? null,
+        mesh_path: live.mesh_path || null,
+        fingerprint_after: live.fingerprint_after || null,
+        increment: live.increment || 'W25',
+        note: 'W25b: attached layered remesh case_dir for live mesh inspect',
+      };
+    }
+  } catch (_) {}
+  activeCaseState = {
+    case_dir: caseDir,
+    status: meshExtra.status || 'attached',
+    attached_at: new Date().toISOString(),
+    mode: meshExtra.mode || 'attach-only',
+    n_times: times.length,
+    times,
+    note: meshExtra.note || 'W15/W15.1: attached existing case_dir; /api/times + fields use this as active API root. Attach path unchanged.',
+    pid: null,
+    exit_code: meshExtra.exit_code != null ? meshExtra.exit_code : null,
+    command: null,
+    argv: null,
+    started_at: null,
+    finished_at: null,
+    log_path: null,
+    log_excerpt: null,
+    wsl_case: null,
+    path_kind: meshExtra.path_kind || null,
+    kick_id: meshExtra.kick_id || null,
+    error: null,
+    n_cells: meshExtra.n_cells ?? null,
+    n_points: meshExtra.n_points ?? null,
+    n_faces: meshExtra.n_faces ?? null,
+    counts_source: meshExtra.counts_source || null,
+    emesh: meshExtra.emesh || null,
+    feature_marks_total: meshExtra.feature_marks_total ?? null,
+    mesh_path: meshExtra.mesh_path || null,
+    fingerprint_after: meshExtra.fingerprint_after || null,
+    generate_id: meshExtra.generate_id || null,
+    increment: meshExtra.increment || null,
+    project_id: projectIdFromCaseDir(caseDir) || want || null,
+  };
+  return { ok: true, status: 200, body: caseSnapshot() };
+}
+
+async function warmVolume(caseDir, time) {
+  const t = String(time || '0');
+  const rpc = callWorker(
+    'filter.warmup_volume',
+    { case_dir: caseDir, time: t },
+    20000,
+  );
+  if (!rpc || typeof rpc.then !== 'function') {
+    const err = new Error('worker unavailable');
+    err.status = 503;
+    throw err;
+  }
+  return rpc;
+}
+
+async function releaseVolume() {
+  const rpc = callWorker('filter.release_volume', {}, 15000);
+  if (!rpc || typeof rpc.then !== 'function') {
+    return { ok: true, released: false, worker: false };
+  }
+  return rpc;
+}
+
+// Python exporters live in python/tools (see python-env.js).
+const EXPORT_SCRIPT = pyTool('export_case_field.py');
+const PT_EXPORT_SCRIPT = pyTool('export_particle_trace.py');
+const CACHE_ROOT = join(CACHE_DIR, 'case-field');
+const PT_CACHE_ROOT_W8 = join(CACHE_DIR, 'particle-trace-grid');
+const PT_CACHE_ROOT_W14 = join(CACHE_DIR, 'particle-trace-faces');
+const PT_CACHE_ROOT = PT_CACHE_ROOT_W14;
+const POP_EXPORT_SCRIPT = pyTool('export_plot_over_path.py');
+const POP_CACHE_ROOT = join(CACHE_DIR, 'plot-over-path');
+const ISO_EXPORT_SCRIPT = pyTool('export_iso_surface.py');
+const ISO_CACHE_ROOT = join(CACHE_DIR, 'iso-surface');
+const ISO_VOL_EXPORT_SCRIPT = pyTool('export_iso_volume.py');
+const ISO_VOL_CACHE_ROOT = join(CACHE_DIR, 'iso-volume');
+const CUT_EXPORT_SCRIPT = pyTool('export_cut_plane.py');
+const CUT_CACHE_ROOT = join(CACHE_DIR, 'cut-plane');
+const INSPECT_EXPORT_SCRIPT = pyTool('export_inspect_point.py');
+const INSPECT_CACHE_ROOT = join(CACHE_DIR, 'inspect-point');
+const MESH_SECTION_EXPORT_SCRIPT = pyTool('export_mesh_section_vtp.py');
+const MESH_SECTION_CACHE_ROOT = join(CACHE_DIR, 'mesh-section');
+const MESH_SURFACE_EXPORT_SCRIPT = pyTool('export_mesh_surface_vtp.py');
+const MESH_SURFACE_CACHE_ROOT = join(CACHE_DIR, 'mesh-surface');
+const _projectsRoot = envGet('PROJECTS_ROOT');
+const PROJECTS_ROOT = _projectsRoot ? resolve(_projectsRoot) : join(ROOT, 'projects');
+const ACTIVE_PROJECT_PATH = join(PROJECTS_ROOT, 'active.json');
+
+/**
+ * A result field to colour by: whatever the run's analysis writes. A scalar is
+ * shown by its own name, a vector X by its magnitude, magX. The name becomes
+ * part of cache paths, so only plain identifiers pass.
+ */
+const FIELD_NAME_RE = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
+
+export function isFieldName(field) {
+  return FIELD_NAME_RE.test(String(field || ''));
+}
+
+/**
+ * The first non-empty of `keys` as a field name. '' when none is given (the
+ * tool then shows the case's default field) or the value is not a plain name.
+ */
+export function fieldNameParam(u, keys) {
+  for (const k of keys) {
+    const v = String(u.searchParams.get(k) ?? '').trim();
+    if (v) return isFieldName(v) ? v : '';
+  }
+  return '';
+}
+
+/**
+ * Whether a saved time holds field file `name`: in its folder, or in a
+ * multi-region case in some region's folder of it (timeFieldDirs).
+ */
+function timeHasFile(caseDir, time, name) {
+  return timeFieldDirs(caseDir, time).some((d) => existsSync(join(d, name)));
+}
+
+/** The OpenFOAM file a shown field reads at a time: itself, or for magX the vector X. */
+function foamNameFor(caseDir, time, field) {
+  const name = String(field || '');
+  if (timeHasFile(caseDir, time, name)) return name;
+  if (/^mag[A-Za-z]/.test(name) && timeHasFile(caseDir, time, name.slice(3))) return name.slice(3);
+  return name;
+}
+
+/** Every file of a shown field at a time: one, or one per region that wrote it. */
+function foamFieldPaths(caseDir, time, field) {
+  const name = foamNameFor(caseDir, time, field);
+  return timeFieldDirs(caseDir, time)
+    .map((d) => join(d, name))
+    .filter((p) => existsSync(p));
+}
+
+/** Each mesh's points file the results read (constant/polyMesh, or every region's). */
+function meshPointsFiles(caseDir) {
+  const regions = caseRegionNames(caseDir);
+  const meshes = regions.length ? regions.map((r) => join(caseDir, 'constant', r, 'polyMesh')) : [join(caseDir, 'constant', 'polyMesh')];
+  return meshes.map((m) => join(m, 'points'));
+}
+
+/**
+ * 'vector', 'tensor', 'face' or 'scalar' from a field file's FoamFile class (the
+ * same reading as python/tools/result_names.foam_kind; tensors and face fields
+ * are never shown).
+ */
+function foamFileKind(path) {
+  let head = '';
+  let fd = -1;
+  try {
+    fd = openSync(path, 'r');
+    const buf = Buffer.alloc(4096);
+    const n = readSync(fd, buf, 0, buf.length, 0);
+    head = buf.subarray(0, n).toString('latin1');
+  } catch {
+    return 'scalar';
+  } finally {
+    if (fd >= 0) closeSync(fd);
+  }
+  const m = /\bclass\s+(\w+)/.exec(head);
+  if (m) {
+    const cls = m[1];
+    if (cls.startsWith('surface')) return 'face';
+    if (cls.includes('Tensor')) return 'tensor';
+    return cls.includes('Vector') ? 'vector' : 'scalar';
+  }
+  if (/List<(symmTensor|tensor)>/.test(head)) return 'tensor';
+  if (/internalField\s+uniform\s*\(/.test(head) || head.includes('List<vector>')) return 'vector';
+  return 'scalar';
+}
+
+/**
+ * The fields a saved time can colour by (python/tools/result_names.shown_fields):
+ * a scalar by its name, a vector X as magX. Tensors, face fields (phi) and
+ * old-time copies (U_0) are left out. A multi-region case: a field any region wrote.
+ */
+export function caseShownFields(caseDir, time) {
+  /** @type {Array<[string, string]>} name and folder */
+  const entries = [];
+  for (const dir of timeFieldDirs(String(caseDir), String(time))) {
+    try {
+      for (const name of readdirSync(dir)) entries.push([name, dir]);
+    } catch {
+      /* a region that wrote nothing */
+    }
+  }
+  entries.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  const out = [];
+  for (const [name, dir] of entries) {
+    if (!isFieldName(name) || /_0$/.test(name)) continue;
+    let file = false;
+    try {
+      file = statSync(join(dir, name)).isFile();
+    } catch {
+      file = false;
+    }
+    if (!file) continue;
+    const kind = foamFileKind(join(dir, name));
+    if (kind === 'tensor' || kind === 'face') continue;
+    const shown = kind === 'vector' ? 'mag' + name : name;
+    if (!out.includes(shown)) out.push(shown);
+  }
+  return out;
+}
+
+/** One line of plain text of at most `limit` characters, else ''. */
+function plainText(value, limit) {
+  if (typeof value !== 'string' || value.length > limit || /[\x00-\x1f\x7f-\x9f]/.test(value)) return '';
+  return value;
+}
+
+/**
+ * The analysis's result fields the case sidecar lists, in order
+ * (python/tools/result_names.case_result_fields); null when it lists none.
+ */
+export function caseResultFieldRows(caseDir) {
+  let doc = null;
+  try {
+    doc = JSON.parse(readFileSync(join(String(caseDir), 'w27-case.json'), 'utf8'));
+  } catch {
+    return null;
+  }
+  const rows = doc && doc.result_fields;
+  if (!Array.isArray(rows)) return null;
+  const out = [];
+  for (let row of rows) {
+    if (typeof row === 'string') row = { key: row };
+    if (!row || typeof row !== 'object') continue;
+    const key = String(row.key || '').trim();
+    if (!isFieldName(key)) continue;
+    out.push({
+      key,
+      kind: String(row.kind || '').trim().toLowerCase(),
+      unit_quantity: String(row.unit_quantity || '').trim().toLowerCase(),
+      label: String(row.label || ''),
+      unit: plainText(row.unit, 32),
+      magnitude_label: plainText(row.magnitude_label, 120),
+    });
+  }
+  return out;
+}
+
+function sendJson(res, status, obj) {
+  const body = JSON.stringify(obj, null, 2);
+  res.statusCode = status;
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-store');
+  res.end(body);
+}
+
+function parseUrl(reqUrl) {
+  return new URL(reqUrl, 'http://127.0.0.1');
+}
+
+export function scopedCacheDir(root, caseDir) {
+  const projectId = String(projectIdFromCaseDir(caseDir) || '_').replace(/[^A-Za-z0-9._-]/g, '_');
+  return join(root, projectId);
+}
+
+function cacheKey(caseDir, time, field) {
+  const h = createHash('sha1').update(`${caseDir}|${time}|${field}`).digest('hex').slice(0, 12);
+  return join(scopedCacheDir(CACHE_ROOT, caseDir), `${field}-${h}`);
+}
+
+/**
+ * Every field file a time folder holds, for the volume tools' cache stamps (in a
+ * multi-region case every region's, named <region>/<field>, and each region's points).
+ */
+function timeFolderStamp(caseDir, time) {
+  const dir = join(caseDir, String(time));
+  const regions = caseRegionNames(caseDir);
+  const parts = [];
+  for (const folder of timeFieldDirs(caseDir, time)) {
+    let names = [];
+    try {
+      names = readdirSync(folder).filter((n) => !n.startsWith('.')).sort();
+    } catch {
+      if (!regions.length) return null;
+      continue;
+    }
+    const prefix = regions.length ? folder.slice(dir.length + 1) + '/' : '';
+    for (const n of names) {
+      const f = join(folder, n);
+      try {
+        const st = statSync(f);
+        if (st.isFile()) parts.push(`${prefix}${n}:${st.mtimeMs}:${st.size}`);
+      } catch {
+        /* gone meanwhile */
+      }
+    }
+  }
+  if (!parts.length) return null;
+  for (const points of meshPointsFiles(caseDir)) {
+    if (existsSync(points)) {
+      const ps = statSync(points);
+      parts.push(`${points}:${ps.mtimeMs}:${ps.size}`);
+    }
+  }
+  const vtu = join(caseDir, '.cfddesk-prepared.vtu');
+  if (existsSync(vtu)) {
+    const vs = statSync(vtu);
+    parts.push(`${vtu}:${vs.mtimeMs}:${vs.size}`);
+  }
+  parts.push(exporterStamp());
+  return `${dir}|` + parts.join('|');
+}
+
+function foamStamp(caseDir, time, field) {
+  const files = foamFieldPaths(caseDir, time, field);
+  if (!files.length) return null;
+  const parts = [];
+  for (const foam of files) {
+    const st = statSync(foam);
+    parts.push(`${foam}:${st.mtimeMs}:${st.size}`);
+  }
+  for (const points of meshPointsFiles(caseDir)) {
+    if (existsSync(points)) {
+      const ps = statSync(points);
+      parts.push(`${points}:${ps.mtimeMs}:${ps.size}`);
+    }
+  }
+  const vtu = join(caseDir, '.cfddesk-prepared.vtu');
+  if (existsSync(vtu)) {
+    const vs = statSync(vtu);
+    parts.push(`${vtu}:${vs.mtimeMs}:${vs.size}`);
+  }
+  parts.push(exporterStamp());
+  return parts.join('|');
+}
+
+// Any edit to a Python exporter must invalidate the derived caches, otherwise
+// a stale .vtp/.json keeps being served after the algorithm changed.
+function exporterStamp() {
+  const dir = PY_TOOLS;
+  const h = createHash('sha1');
+  try {
+    const names = readdirSync(dir).filter((n) => n.endsWith('.py')).sort();
+    for (const n of names) {
+      try {
+        const st = statSync(join(dir, n));
+        h.update(`${n}:${st.mtimeMs}:${st.size}|`);
+      } catch (_) {}
+    }
+  } catch (_) {}
+  return `py:${h.digest('hex').slice(0, 12)}`;
+}
+
+function runExport(caseDir, time, field, outDir) {
+  return new Promise((resolveP, reject) => {
+    const args = [
+      EXPORT_SCRIPT,
+      '--case',
+      caseDir,
+      '--time',
+      String(time),
+      '--field',
+      field,
+      '--out-dir',
+      outDir,
+    ];
+    const child = spawnFilter(args, { windowsHide: true });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (d) => {
+      stdout += d.toString();
+    });
+    child.stderr.on('data', (d) => {
+      stderr += d.toString();
+    });
+    child.on('error', reject);
+    child.on('close', (code) => {
+      if (code !== 0) {
+        reject(new Error(`export_case_field exit ${code}: ${stderr || stdout}`));
+        return;
+      }
+      resolveP({ stdout, stderr });
+    });
+  });
+}
+
+/**
+ * One export per cache folder at a time. Opening Results fires several field
+ * requests (latest frame, animation preload, prefetch) for the same time; two
+ * exports writing one folder let a reader see a half-written VTP and answer 500.
+ */
+const fieldExportInflight = new Map();
+
+function ensureExported(caseDir, time, field) {
+  const key = cacheKey(caseDir, time, field);
+  const running = fieldExportInflight.get(key);
+  if (running) return running;
+  const job = ensureExportedOnce(caseDir, time, field).finally(() => {
+    fieldExportInflight.delete(key);
+  });
+  fieldExportInflight.set(key, job);
+  return job;
+}
+
+async function ensureExportedOnce(caseDir, time, field) {
+  mkdirSync(CACHE_ROOT, { recursive: true });
+  const dir = cacheKey(caseDir, time, field);
+  const vtp = join(dir, `${field}.vtp`);
+  const meta = join(dir, `${field}.meta.json`);
+  const stampPath = join(dir, '.stamp');
+  const stamp = foamStamp(caseDir, time, field);
+  if (!stamp) {
+    throw new Error(`case foam files missing under ${caseDir}/${time}`);
+  }
+  const fresh =
+    existsSync(vtp) &&
+    existsSync(meta) &&
+    existsSync(stampPath) &&
+    readFileSync(stampPath, 'utf8') === stamp;
+  if (!fresh) {
+    mkdirSync(dir, { recursive: true });
+    const rpc = callWorker(
+      'filter.case_field',
+      { case_dir: caseDir, time: String(time), field, out_dir: dir },
+      180000,
+    );
+    if (rpc && typeof rpc.then === 'function') {
+      try {
+        await rpc;
+      } catch (err) {
+        if (!fieldExportMaySpawnFallback(err)) {
+          throw err;
+        }
+        console.warn('[CFD] field worker export failed, spawning', err && err.message ? err.message : err);
+        await runExport(caseDir, time, field, dir);
+      }
+    } else {
+      await runExport(caseDir, time, field, dir);
+    }
+    writeFileSync(stampPath, stamp, 'utf8');
+  }
+  return { vtp, meta, dir, stamp, from_cache: fresh };
+}
+
+const seriesRangeCache = new Map();
+
+function seriesRangeStamp(caseDir, field) {
+  const name = String(field);
+  return listCaseTimes(caseDir)
+    .map((t) => {
+      const files = foamFieldPaths(caseDir, t, name);
+      if (!files.length) return t;
+      return files
+        .map((p) => {
+          const st = statSync(p);
+          return `${t}:${st.mtimeMs}:${st.size}`;
+        })
+        .join(',');
+    })
+    .join('|');
+}
+
+function seriesRangeFromMetas(caseDir, field) {
+  const name = String(field);
+  const times = listCaseTimes(caseDir);
+  if (times.length < 2) return null;
+  let lo = null;
+  let hi = null;
+  let n = 0;
+  for (const t of times) {
+    const metaPath = join(cacheKey(caseDir, t, name), `${name}.meta.json`);
+    if (!existsSync(metaPath)) return null;
+    try {
+      const j = JSON.parse(readFileSync(metaPath, 'utf8'));
+      // Only metas whose range is in what the surface shows (a kinematic field
+      // times rho); older ones kept kinematic p (m^2/s^2) while surfaces are Pa.
+      if (!(j && j.range_scaled === true)) return null;
+      const foam = (j && (j.u_from_case || j.foam_proof)) || {};
+      const a = Number(foam.min);
+      const b = Number(foam.max);
+      if (!Number.isFinite(a) || !Number.isFinite(b)) return null;
+      lo = lo == null ? a : Math.min(lo, a);
+      hi = hi == null ? b : Math.max(hi, b);
+      n += 1;
+    } catch {
+      return null;
+    }
+  }
+  if (n !== times.length || lo == null || hi == null || !(hi >= lo)) return null;
+  return {
+    ok: true,
+    field: name,
+    case_dir: caseDir,
+    times,
+    n_times: n,
+    min: lo,
+    max: hi,
+    frames: [],
+    series: true,
+    from: 'meta',
+  };
+}
+
+function runSeriesRange(caseDir, field) {
+  return new Promise((resolveP, reject) => {
+    const child = spawnFilter([EXPORT_SCRIPT, '--case', caseDir, '--field', field, '--series-range'], {
+      windowsHide: true,
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (d) => {
+      stdout += d.toString();
+    });
+    child.stderr.on('data', (d) => {
+      stderr += d.toString();
+    });
+    child.on('error', reject);
+    child.on('close', (code) => {
+      const line = stdout.trim().split(/\r?\n/).filter(Boolean).pop() || '';
+      if (!line) {
+        reject(new Error(`series-range empty stdout (code=${code}): ${stderr.slice(0, 400)}`));
+        return;
+      }
+      try {
+        resolveP(JSON.parse(line));
+      } catch (err) {
+        reject(new Error(`series-range parse fail: ${line.slice(0, 200)}`));
+      }
+    });
+  });
+}
+
+/** True when this case's saved frames are OpenFOAM binary (every solve since fields went binary). */
+function caseFieldsBinary(caseDir, name) {
+  const times = listCaseTimes(caseDir);
+  const first = times.length ? foamFieldPath(caseDir, times[times.length - 1], name) : null;
+  if (!first || !existsSync(first)) return false;
+  let fd = null;
+  try {
+    fd = openSync(first, 'r');
+    const buf = Buffer.alloc(2048);
+    const n = readSync(fd, buf, 0, buf.length, 0);
+    return /format\s+binary/.test(buf.subarray(0, n).toString('latin1'));
+  } catch {
+    return false;
+  } finally {
+    if (fd != null) closeSync(fd);
+  }
+}
+
+async function seriesRangeFromWorker(caseDir, name) {
+  // Binary frames read in well under a second on the data lane (no Python start-up).
+  // Old ascii runs take seconds to parse, which would hold up cuts and probes there,
+  // so they keep their own process.
+  if (!caseFieldsBinary(caseDir, name)) return null;
+  const rpc = callWorker('filter.series_range', { case_dir: caseDir, field: name }, 60000);
+  if (!rpc || typeof rpc.then !== 'function') return null;
+  try {
+    return await rpc;
+  } catch (err) {
+    if (!fieldExportMaySpawnFallback(err)) throw err;
+    return null;
+  }
+}
+
+async function ensureSeriesRange(caseDir, field) {
+  const name = String(field);
+  const stamp = seriesRangeStamp(caseDir, name);
+  const key = `${caseDir}|${name}`;
+  const hit = seriesRangeCache.get(key);
+  if (hit && hit.stamp === stamp && hit.body && hit.body.ok) return hit.body;
+  const fromMeta = seriesRangeFromMetas(caseDir, name);
+  if (fromMeta && fromMeta.ok) {
+    seriesRangeCache.set(key, { stamp, body: fromMeta });
+    return fromMeta;
+  }
+  try {
+    const j = (await seriesRangeFromWorker(caseDir, name)) || (await runSeriesRange(caseDir, name));
+    if (j && Number.isFinite(Number(j.min)) && Number.isFinite(Number(j.max))) {
+      const body = {
+        ok: true,
+        field: name,
+        case_dir: caseDir,
+        times: j.times || listCaseTimes(caseDir),
+        n_times: j.n_times || (j.times || []).length,
+        min: Number(j.min),
+        max: Number(j.max),
+        frames: j.frames || [],
+        series: true,
+        from: 'foam',
+      };
+      seriesRangeCache.set(key, { stamp, body });
+      return body;
+    }
+  } catch (err) {
+    console.warn('[CFD] series-range spawn failed', err && err.message ? err.message : err);
+  }
+  return {
+    ok: false,
+    field: name,
+    case_dir: caseDir,
+    times: listCaseTimes(caseDir),
+    n_times: 0,
+    min: null,
+    max: null,
+    frames: [],
+    series: true,
+  };
+}
+
+function normalizePtFaces(raw) {
+  const s = String(raw || '').trim();
+  if (s === '__none__') return ['__none__'];
+  if (!s) return [];
+  return s
+    .split(/[,|;]+/)
+    .map((x) => x.trim())
+    .filter(Boolean);
+}
+
+const SKIP_SEED_PATCH_TYPES = new Set([
+  'wall',
+  'empty',
+  'processor',
+  'processorcyclic',
+  'wedge',
+  'symmetry',
+  'symmetryplane',
+]);
+
+function stripOfDictHeader(text) {
+  // Reader: strip OF header block without embedding the Foam+File token (Phase 1 grep).
+  const hdr = 'Foam' + 'File';
+  return String(text || '').replace(new RegExp(hdr + '\\s*\\{[\\s\\S]*?\\}\\s*'), '');
+}
+
+function parseBoundaryPatchTypes(text) {
+  const types = {};
+  const re = /^\s*([A-Za-z_][\w]*)\s*\n\s*\{\s*\n\s*type\s+([A-Za-z_]\w*)\s*;/gm;
+  let m;
+  const body = stripOfDictHeader(text);
+  while ((m = re.exec(body))) types[m[1]] = m[2];
+  return types;
+}
+
+function isVelocityInletBcType(bcType) {
+  return /velocity\s*inlet/i.test(String(bcType || ''));
+}
+
+function isPressureBcType(bcType) {
+  return /^pressure/i.test(String(bcType || ''));
+}
+
+function pressureValueFromBc(rec) {
+  if (!rec) return null;
+  const bags = [rec, rec.settings, rec.params].filter((x) => x && typeof x === 'object');
+  const keys = ['value', 'gauge_pressure', 'pressure'];
+  for (const bag of bags) {
+    for (const k of keys) {
+      const v = Number(bag[k]);
+      if (Number.isFinite(v)) return v;
+    }
+  }
+  return null;
+}
+
+function applyPressureInletRoles(faces) {
+  const rows = Array.isArray(faces) ? faces : [];
+  const pressures = rows.filter((f) => f && isPressureBcType(f.bc_type || f.kind === 'pressure' ? 'Pressure' : f.bc_type));
+  const typed = rows.filter((f) => f && (f.kind === 'pressure' || isPressureBcType(f.bc_type)));
+  const nums = typed
+    .map((f) => ({ f, p: Number(f.pressure) }))
+    .filter((x) => Number.isFinite(x.p));
+  if (nums.length >= 2) {
+    let maxP = -Infinity;
+    let minP = -Infinity;
+    minP = Infinity;
+    for (const x of nums) {
+      if (x.p > maxP) maxP = x.p;
+      if (x.p < minP) minP = x.p;
+    }
+    if (maxP > minP) {
+      for (const x of nums) {
+        if (x.p === maxP) x.f.role = 'inlet';
+        else if (x.p === minP) x.f.role = 'outlet';
+      }
+    }
+  }
+  return rows;
+}
+
+function ptPatchRole(name, bcType) {
+  const type = String(bcType || '');
+  const blob = `${name || ''} ${type}`;
+  if (isVelocityInletBcType(type)) return 'inlet';
+  if (isPressureBcType(type)) return /inlet|inflow/i.test(blob) ? 'inlet' : 'outlet';
+  if (/inlet|inflow/i.test(blob) && !/pressure/i.test(blob)) return 'inlet';
+  if (/outlet|outflow/i.test(blob)) return 'outlet';
+  return 'patch';
+}
+
+function ptPatchKind(bcType) {
+  if (isVelocityInletBcType(bcType)) return 'velocity';
+  if (isPressureBcType(bcType)) return 'pressure';
+  return 'patch';
+}
+
+function readJsonFile(p) {
+  try {
+    if (!p || !existsSync(p)) return null;
+    return JSON.parse(readFileSync(p, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function recCadFaces(rec) {
+  const out = [];
+  for (const f of Array.isArray(rec && rec.faces) ? rec.faces : []) {
+    const s = String(f || '').trim();
+    if (s && !out.includes(s)) out.push(s);
+  }
+  if (rec && rec.face) {
+    const s = String(rec.face).trim();
+    if (s && !out.includes(s)) out.push(s);
+  }
+  return out;
+}
+
+function findStudyDirFromCase(caseDir) {
+  let dir = caseDir;
+  for (let i = 0; i < 8 && dir; i++) {
+    const ident = readJsonFile(join(dir, 'id.json'));
+    if (ident && ident.kind === 'simulation' && ident.id) return dir;
+    if (existsSync(join(dir, 'boundary_conditions.json')) && existsSync(join(dir, 'id.json'))) {
+      return dir;
+    }
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return null;
+}
+
+function findWebBc(webBcs, name, patch, cad) {
+  const cadSet = new Set(cad || []);
+  const byFace = (webBcs || []).find((b) => recCadFaces(b).some((f) => cadSet.has(f)));
+  if (byFace) return byFace;
+  const byName = (webBcs || []).find((b) => b && b.name === name);
+  if (byName) return byName;
+  const slug = String(patch || '').toLowerCase();
+  return (webBcs || []).find(
+    (b) => String((b && b.name) || '').replace(/\s+/g, '_').toLowerCase() === slug
+  );
+}
+
+function loadSeedFaceHints(caseDir) {
+  const studyDir = findStudyDirFromCase(caseDir);
+  const meshDir = dirname(caseDir);
+  const bcs = (studyDir && readJsonFile(join(studyDir, 'boundary_conditions.json'))) || {};
+  const projectBcs = Array.isArray(bcs.boundary_conditions)
+    ? bcs.boundary_conditions.filter(Boolean)
+    : [];
+  const meshDoc = readJsonFile(join(meshDir, 'mesh.json')) || {};
+  const lives = [];
+  if (meshDoc.live_mesh_result) lives.push(meshDoc.live_mesh_result);
+  for (const m of Array.isArray(meshDoc.meshes) ? meshDoc.meshes : []) {
+    if (m && m.live_mesh_result) lives.push(m.live_mesh_result);
+  }
+  const webBcs = [];
+  const seen = new Set();
+  for (const live of lives) {
+    const meshCase = live && live.case_dir;
+    if (!meshCase) continue;
+    const meta = readJsonFile(join(meshCase, 'standard-meta.json'));
+    for (const b of (meta && meta.web_bcs) || []) {
+      const key = JSON.stringify(b);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      webBcs.push(b);
+    }
+  }
+  return { projectBcs, webBcs };
+}
+
+function enrichSeedRow(row, hints) {
+  let cad = recCadFaces(row);
+  if (!cad.length) {
+    const rec = (hints.projectBcs || []).find(
+      (b) => b && (b.name === row.name || b.name === row.id)
+    );
+    if (rec) cad = recCadFaces(rec);
+  }
+  const web = findWebBc(hints.webBcs, row.name || row.id, row.patch, cad);
+  if (!cad.length && web) cad = recCadFaces(web);
+  const projectBc = (hints.projectBcs || []).find(
+    (b) => b && (b.name === row.name || b.name === row.id || recCadFaces(b).some((f) => cad.includes(f)))
+  );
+  const rec = web || projectBc || row;
+  const roleName = (rec && rec.name) || row.name || row.id || '';
+  const roleType = (rec && rec.bc_type) || row.bc_type;
+  const primary = cad[0] || row.name || row.patch;
+  const pressure = isPressureBcType(roleType) ? pressureValueFromBc(rec) : null;
+  return {
+    id: primary,
+    label: primary,
+    patch: row.patch,
+    name: row.name || null,
+    faces: cad,
+    available: true,
+    role: ptPatchRole(roleName, roleType),
+    kind: ptPatchKind(roleType),
+    bc_type: roleType || null,
+    pressure,
+  };
+}
+
+function loadCaseBcLabels(caseDir) {
+  const rows = [];
+  const w27 = join(caseDir, 'w27-case.json');
+  if (existsSync(w27)) {
+    try {
+      const j = JSON.parse(readFileSync(w27, 'utf8'));
+      for (const row of j.mapped || j.bcs || []) {
+        if (row && row.patch) rows.push(row);
+      }
+    } catch (_) {}
+  }
+  if (rows.length) return rows;
+  const cand = join(dirname(caseDir), `${caseDir.split(/[/\\]/).pop()}.json`);
+  if (existsSync(cand)) {
+    try {
+      const j = JSON.parse(readFileSync(cand, 'utf8'));
+      for (const row of j.bcs || []) {
+        if (row && row.patch) rows.push(row);
+      }
+    } catch (_) {}
+  }
+  return rows;
+}
+
+function listCaseSeedFaces(caseDir) {
+  if (!caseDir || !existsSync(caseDir)) return [];
+  const labels = loadCaseBcLabels(caseDir);
+  const hints = loadSeedFaceHints(caseDir);
+  const byPatch = Object.fromEntries(labels.map((r) => [String(r.patch), r]));
+  const boundary = join(caseDir, 'constant', 'polyMesh', 'boundary');
+  const types = existsSync(boundary)
+    ? parseBoundaryPatchTypes(readFileSync(boundary, 'utf8'))
+    : {};
+  const faces = [];
+  for (const [patch, ptype] of Object.entries(types)) {
+    if (SKIP_SEED_PATCH_TYPES.has(String(ptype).toLowerCase())) continue;
+    if (/wall/i.test(patch)) continue;
+    const lab = byPatch[patch] || {};
+    const name = lab.name || patch;
+    faces.push(
+      enrichSeedRow(
+        {
+          id: name,
+          name,
+          patch,
+          bc_type: lab.bc_type,
+          faces: recCadFaces(lab),
+        },
+        hints
+      )
+    );
+  }
+  if (faces.length) return faces;
+  return labels
+    .filter((lab) => lab && lab.patch)
+    .map((lab) =>
+      enrichSeedRow(
+        {
+          id: lab.name || lab.patch,
+          name: lab.name || lab.patch,
+          patch: lab.patch,
+          bc_type: lab.bc_type,
+          faces: recCadFaces(lab),
+        },
+        hints
+      )
+    );
+}
+
+export function ptParamsFromUrl(u) {
+  const seeds_h = Number(u.searchParams.get('seeds_h') ?? '10');
+  const seeds_v = Number(u.searchParams.get('seeds_v') ?? '10');
+  const spacing = Number(u.searchParams.get('spacing') ?? '0.015');
+  const size = Number(u.searchParams.get('size') ?? '0.0037');
+  const bothRaw = u.searchParams.get('both');
+  const both =
+    bothRaw == null || bothRaw === ''
+      ? 1
+      : bothRaw === '0' || bothRaw === 'false' || bothRaw === 'False'
+        ? 0
+        : 1;
+  const pick = (u.searchParams.get('pick') || '').trim();
+  const representation = u.searchParams.get('representation') || 'Cylinders';
+  const max_steps = Number(u.searchParams.get('max_steps') ?? '50000');
+  const seed_modeRaw = (u.searchParams.get('seed_mode') || 'grid').trim().toLowerCase();
+  const seed_mode = (seed_modeRaw === 'faces' || seed_modeRaw === 'region') ? 'faces' : 'grid';
+  const faces = normalizePtFaces(u.searchParams.get('faces') || '');
+  const quantityRaw = (u.searchParams.get('quantity_mode') || 'count').trim().toLowerCase();
+  const quantity_mode = quantityRaw === 'density' ? 'density' : 'count';
+  const n_seeds = Number(u.searchParams.get('n_seeds') ?? '40');
+  const density = Number(u.searchParams.get('density') ?? '10000');
+  const region = (u.searchParams.get('region') || '').trim();
+  return {
+    // The vector to trace ('' = the case's velocity) and the field the paths
+    // carry ('' = every scalar the frame wrote).
+    vector: fieldNameParam(u, ['vector']),
+    coloring: fieldNameParam(u, ['coloring']),
+    seeds_h: Number.isFinite(seeds_h) ? seeds_h : 10,
+    seeds_v: Number.isFinite(seeds_v) ? seeds_v : 10,
+    spacing: Number.isFinite(spacing) ? spacing : 0.015,
+    size: Number.isFinite(size) ? size : 0.0037,
+    both,
+    pick,
+    representation,
+    max_steps: Number.isFinite(max_steps) ? max_steps : 50000,
+    seed_mode,
+    faces,
+    quantity_mode,
+    n_seeds: Number.isFinite(n_seeds) ? Math.max(0, Math.floor(n_seeds)) : 40,
+    density: Number.isFinite(density) ? density : 10000,
+    region,
+  };
+}
+
+function ptCacheKey(caseDir, time, p) {
+  const facesKey = (p.faces || []).slice().sort().join(',');
+  const raw = [
+    caseDir,
+    time,
+    p.seed_mode || 'grid',
+    facesKey,
+    p.quantity_mode || 'count',
+    p.n_seeds,
+    p.density,
+    p.seeds_h,
+    p.seeds_v,
+    p.spacing,
+    p.both,
+    p.pick,
+    p.region || '',
+    p.max_steps,
+    p.vector || '',
+    p.coloring || '',
+    'seeds-any-face-v1',
+  ].join('|');
+  const h = createHash('sha1').update(raw).digest('hex').slice(0, 14);
+  const root = p.seed_mode === 'faces' ? PT_CACHE_ROOT_W14 : PT_CACHE_ROOT_W8;
+  return join(scopedCacheDir(root, caseDir), `pt-${h}`);
+}
+
+/**
+ * A free-text option as one argument (--name=value): a value starting with "-" (a
+ * point at a negative x, "-0.01,0,0.3") would otherwise be read as an option, and the
+ * tool would stop with "expected one argument".
+ */
+function flagValue(name, value) {
+  return `${name}=${value}`;
+}
+
+/** The export_particle_trace.py command line for a request. */
+export function ptExportArgs(caseDir, time, outDir, p) {
+  return [
+    PT_EXPORT_SCRIPT,
+    '--case',
+    caseDir,
+    '--time',
+    String(time),
+    '--out-dir',
+    outDir,
+    '--seeds-h',
+    String(p.seeds_h),
+    '--seeds-v',
+    String(p.seeds_v),
+    '--spacing',
+    String(p.spacing),
+    '--size',
+    String(p.size),
+    '--both',
+    String(p.both),
+    flagValue('--pick', p.pick || ''),
+    '--representation',
+    p.representation || 'Cylinders',
+    '--max-steps',
+    String(p.max_steps),
+    '--seed-mode',
+    p.seed_mode || 'grid',
+    '--faces',
+    (p.faces || []).join(','),
+    '--quantity-mode',
+    p.quantity_mode || 'count',
+    '--n-seeds',
+    String(p.n_seeds ?? 40),
+    '--density',
+    String(p.density ?? 10000),
+    '--region',
+    p.region || '',
+    '--vector',
+    p.vector || '',
+    '--coloring',
+    p.coloring || '',
+  ];
+}
+
+function runPtExport(caseDir, time, outDir, p) {
+  return new Promise((resolveP, reject) => {
+    const args = ptExportArgs(caseDir, time, outDir, p);
+    const child = spawnFilter(args, { windowsHide: true });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (d) => {
+      stdout += d.toString();
+    });
+    child.stderr.on('data', (d) => {
+      stderr += d.toString();
+    });
+    child.on('error', reject);
+    child.on('close', (code) => {
+      if (code !== 0) {
+        reject(new Error(`export_particle_trace exit ${code}: ${stderr || stdout}`));
+        return;
+      }
+      resolveP({ stdout, stderr });
+    });
+  });
+}
+
+async function ensureParticleTrace(caseDir, time, p) {
+  mkdirSync(PT_CACHE_ROOT_W8, { recursive: true });
+  mkdirSync(PT_CACHE_ROOT_W14, { recursive: true });
+  const dir = ptCacheKey(caseDir, time, p);
+  const vtp = join(dir, 'particle_trace.vtp');
+  const meta = join(dir, 'particle_trace.meta.json');
+  const stampPath = join(dir, '.stamp');
+  // Every field file of the time: the paths carry the vector and the frame's scalars.
+  const stamp = timeFolderStamp(caseDir, time);
+  if (!stamp) {
+    throw new Error(`case foam files missing under ${caseDir}/${time}`);
+  }
+  const paramStamp = `${stamp}|${JSON.stringify(p)}`;
+  const fresh =
+    existsSync(vtp) &&
+    existsSync(meta) &&
+    existsSync(stampPath) &&
+    readFileSync(stampPath, 'utf8') === paramStamp;
+  if (!fresh) {
+    mkdirSync(dir, { recursive: true });
+    const rpc = callWorker(
+      'filter.particle_trace',
+      {
+        case_dir: caseDir,
+        time: String(time),
+        out_dir: dir,
+        seeds_h: p.seeds_h,
+        seeds_v: p.seeds_v,
+        spacing: p.spacing,
+        size: p.size,
+        both: p.both,
+        pick: p.pick || '',
+        representation: p.representation || 'Cylinders',
+        max_steps: p.max_steps,
+        seed_mode: p.seed_mode || 'grid',
+        faces: p.faces || [],
+        quantity_mode: p.quantity_mode || 'count',
+        n_seeds: p.n_seeds ?? 40,
+        density: p.density ?? 10000,
+        region: p.region || '',
+        vector: p.vector || '',
+        coloring: p.coloring || '',
+      },
+      180000,
+    );
+    if (rpc && typeof rpc.then === 'function') {
+      try {
+        await rpc;
+      } catch (err) {
+        // A timed-out or restarted worker may still be tracing: a spawn would run the
+        // same trace again and load the volume a second time.
+        if (!fieldExportMaySpawnFallback(err)) throw err;
+        console.warn('[CFD] PT worker export failed, spawning', err && err.message ? err.message : err);
+        await runPtExport(caseDir, time, dir, p);
+      }
+    } else {
+      await runPtExport(caseDir, time, dir, p);
+    }
+    writeFileSync(stampPath, paramStamp, 'utf8');
+  }
+  return { vtp, meta, dir, from_cache: fresh };
+}
+
+
+export function popParamsFromUrl(u) {
+  const subdivisions = Number(u.searchParams.get('subdivisions') ?? '0');
+  const points = (u.searchParams.get('points') || '').trim();
+  return {
+    subdivisions: Number.isFinite(subdivisions) ? Math.max(0, Math.floor(subdivisions)) : 0,
+    field: fieldNameParam(u, ['field']),
+    points,
+  };
+}
+
+function popCacheKey(caseDir, time, p) {
+  const raw = [caseDir, time, p.subdivisions, p.field, p.points].join('|');
+  const h = createHash('sha1').update(raw).digest('hex').slice(0, 14);
+  return join(scopedCacheDir(POP_CACHE_ROOT, caseDir), `pop-${h}`);
+}
+
+/** The export_plot_over_path.py command line for a request. */
+export function popExportArgs(caseDir, time, outDir, p) {
+  return [
+    POP_EXPORT_SCRIPT,
+    '--case',
+    caseDir,
+    '--time',
+    String(time),
+    '--out-dir',
+    outDir,
+    flagValue('--points', p.points || ''),
+    '--subdivisions',
+    String(p.subdivisions),
+    '--field',
+    p.field || '',
+  ];
+}
+
+function runPopExport(caseDir, time, outDir, p) {
+  return new Promise((resolveP, reject) => {
+    const args = popExportArgs(caseDir, time, outDir, p);
+    const child = spawnFilter(args, { windowsHide: true });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (d) => {
+      stdout += d.toString();
+    });
+    child.stderr.on('data', (d) => {
+      stderr += d.toString();
+    });
+    child.on('error', reject);
+    child.on('close', (code) => {
+      if (code !== 0) {
+        reject(new Error(`export_plot_over_path exit ${code}: ${stderr || stdout}`));
+        return;
+      }
+      resolveP({ stdout, stderr });
+    });
+  });
+}
+
+async function ensurePlotOverPath(caseDir, time, p) {
+  mkdirSync(POP_CACHE_ROOT, { recursive: true });
+  const dir = popCacheKey(caseDir, time, p);
+  const meta = join(dir, 'plot_over_path.meta.json');
+  const stampPath = join(dir, '.stamp');
+  const stamp = timeFolderStamp(caseDir, time);
+  if (!stamp) {
+    throw new Error(`case foam files missing under ${caseDir}/${time}`);
+  }
+  const paramStamp = `${stamp}|${JSON.stringify(p)}`;
+  const fresh =
+    existsSync(meta) && existsSync(stampPath) && readFileSync(stampPath, 'utf8') === paramStamp;
+  if (!fresh) {
+    mkdirSync(dir, { recursive: true });
+    await runPopExport(caseDir, time, dir, p);
+    writeFileSync(stampPath, paramStamp, 'utf8');
+  }
+  return { meta, dir, from_cache: fresh };
+}
+
+
+export function isoParamsFromUrl(u) {
+  const iso_value = Number(u.searchParams.get('iso_value') ?? u.searchParams.get('value') ?? '11.1');
+  const opacity = Number(u.searchParams.get('opacity') ?? '1');
+  const vectorsRaw = u.searchParams.get('vectors');
+  const vectors =
+    vectorsRaw === '1' || vectorsRaw === 'true' || vectorsRaw === 'True' ? 1 : 0;
+  return {
+    iso_value: Number.isFinite(iso_value) ? iso_value : 11.1,
+    iso_field: fieldNameParam(u, ['iso_field']),
+    color_field: fieldNameParam(u, ['color_field']),
+    vector: fieldNameParam(u, ['vector']),
+    opacity: Number.isFinite(opacity) ? opacity : 1,
+    vectors,
+  };
+}
+
+function isoCacheKey(caseDir, time, p) {
+  const raw = [
+    caseDir,
+    time,
+    p.iso_field,
+    p.iso_value,
+    p.color_field,
+    p.vector,
+    p.opacity,
+    p.vectors,
+  ].join('|');
+  const h = createHash('sha1').update(raw).digest('hex').slice(0, 14);
+  return join(scopedCacheDir(ISO_CACHE_ROOT, caseDir), `iso-${h}`);
+}
+
+function runIsoExport(caseDir, time, outDir, p) {
+  return new Promise((resolveP, reject) => {
+    const args = [
+      ISO_EXPORT_SCRIPT,
+      '--case',
+      caseDir,
+      '--time',
+      String(time),
+      '--out-dir',
+      outDir,
+      '--iso-field',
+      p.iso_field || '',
+      '--iso-value',
+      String(p.iso_value),
+      '--color-field',
+      p.color_field || '',
+      '--vector',
+      p.vector || '',
+      '--opacity',
+      String(p.opacity),
+      '--vectors',
+      String(p.vectors),
+    ];
+    const child = spawnFilter(args, { windowsHide: true });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (d) => {
+      stdout += d.toString();
+    });
+    child.stderr.on('data', (d) => {
+      stderr += d.toString();
+    });
+    child.on('error', reject);
+    child.on('close', (code) => {
+      if (code !== 0) {
+        reject(new Error(`export_iso_surface exit ${code}: ${stderr || stdout}`));
+        return;
+      }
+      resolveP({ stdout, stderr });
+    });
+  });
+}
+
+export function cutParamsFromUrl(u) {
+  const num = (key, fallback) => {
+    const n = Number(u.searchParams.get(key));
+    return Number.isFinite(n) ? n : fallback;
+  };
+  const liveRaw = u.searchParams.get('live');
+  return {
+    ox: num('ox', 0),
+    oy: num('oy', 0),
+    oz: num('oz', 0),
+    nx: num('nx', 0),
+    ny: num('ny', 1),
+    nz: num('nz', 0),
+    // '' colours by the case's default field.
+    field: fieldNameParam(u, ['field']),
+    // The vector carried for glyphs ('' = the case's velocity) and extra fields to
+    // carry. No extra parameter at all (today's page) is null: the slice keeps
+    // every scalar the frame wrote; extra= (empty) keeps none.
+    vector: fieldNameParam(u, ['vector']),
+    extra: u.searchParams.has('extra') ? fieldListParam(u.searchParams.get('extra')) : null,
+    live: liveRaw === '1' || liveRaw === 'true',
+  };
+}
+
+function cutArraysKey(p) {
+  return `${p.vector || ''}|${Array.isArray(p.extra) ? p.extra.join(',') : '*'}`;
+}
+
+function liveCutCacheKey(caseDir, time, p) {
+  const raw = [caseDir, time, p.field, cutArraysKey(p), p.nx.toFixed(3), p.ny.toFixed(3), p.nz.toFixed(3)].join('|');
+  const h = createHash('sha1').update(raw).digest('hex').slice(0, 12);
+  return join(scopedCacheDir(CUT_CACHE_ROOT, caseDir), `live-${h}`);
+}
+
+function cutCacheKey(caseDir, time, p) {
+  const raw = [
+    caseDir,
+    time,
+    p.field,
+    cutArraysKey(p),
+    p.ox.toFixed(5),
+    p.oy.toFixed(5),
+    p.oz.toFixed(5),
+    p.nx.toFixed(4),
+    p.ny.toFixed(4),
+    p.nz.toFixed(4),
+  ].join('|');
+  const h = createHash('sha1').update(raw).digest('hex').slice(0, 14);
+  return join(scopedCacheDir(CUT_CACHE_ROOT, caseDir), `cut-${h}`);
+}
+
+function runCutExport(caseDir, time, outDir, p) {
+  return new Promise((resolveP, reject) => {
+    const args = [
+      CUT_EXPORT_SCRIPT,
+      '--case',
+      caseDir,
+      '--time',
+      String(time),
+      '--out-dir',
+      outDir,
+      '--ox',
+      String(p.ox),
+      '--oy',
+      String(p.oy),
+      '--oz',
+      String(p.oz),
+      '--nx',
+      String(p.nx),
+      '--ny',
+      String(p.ny),
+      '--nz',
+      String(p.nz),
+      '--field',
+      p.field || '',
+      '--vector',
+      p.vector || '',
+    ];
+    if (Array.isArray(p.extra)) args.push('--extra', p.extra.join(','));
+    const child = spawnFilter(args, { windowsHide: true });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (d) => {
+      stdout += d.toString();
+    });
+    child.stderr.on('data', (d) => {
+      stderr += d.toString();
+    });
+    child.on('error', reject);
+    child.on('close', (code) => {
+      if (code !== 0) {
+        reject(new Error(`export_cut_plane exit ${code}: ${stderr || stdout}`));
+        return;
+      }
+      resolveP({ stdout, stderr });
+    });
+  });
+}
+
+async function runWorkerCut(caseDir, time, dir, p) {
+  mkdirSync(dir, { recursive: true });
+  const rpc = callWorker(
+    'filter.cut_plane',
+    {
+      case_dir: caseDir,
+      time: String(time),
+      out_dir: dir,
+      ox: p.ox,
+      oy: p.oy,
+      oz: p.oz,
+      nx: p.nx,
+      ny: p.ny,
+      nz: p.nz,
+      field: p.field || '',
+      vector: p.vector || '',
+      extra: Array.isArray(p.extra) ? p.extra : null,
+    },
+    180000,
+  );
+  if (rpc && typeof rpc.then === 'function') {
+    try {
+      await rpc;
+      return;
+    } catch (err) {
+      if (!fieldExportMaySpawnFallback(err)) throw err;
+      console.warn('[CFD] cut worker export failed, spawning', err && err.message ? err.message : err);
+    }
+  }
+  await runCutExport(caseDir, time, dir, p);
+}
+
+async function ensureCutPlane(caseDir, time, p) {
+  mkdirSync(CUT_CACHE_ROOT, { recursive: true });
+  if (p.live) {
+    const dir = liveCutCacheKey(caseDir, time, p);
+    const vtp = join(dir, 'cut_plane.vtp');
+    const meta = join(dir, 'cut_plane.meta.json');
+    await runWorkerCut(caseDir, time, dir, p);
+    return { vtp, meta, dir, from_cache: false, live: true };
+  }
+  const dir = cutCacheKey(caseDir, time, p);
+  const vtp = join(dir, 'cut_plane.vtp');
+  const meta = join(dir, 'cut_plane.meta.json');
+  const stampPath = join(dir, '.stamp');
+  const stamp = p.field ? foamStamp(caseDir, time, p.field) : timeFolderStamp(caseDir, time);
+  if (!stamp) {
+    throw new Error(`case foam files missing under ${caseDir}/${time}`);
+  }
+  const paramStamp = `${stamp}|${p.field}|${p.ox.toFixed(5)}|${p.oy.toFixed(5)}|${p.oz.toFixed(5)}|${p.nx.toFixed(4)}|${p.ny.toFixed(4)}|${p.nz.toFixed(4)}|${cutArraysKey(p)}`;
+  const fresh =
+    existsSync(vtp) &&
+    existsSync(meta) &&
+    existsSync(stampPath) &&
+    readFileSync(stampPath, 'utf8') === paramStamp;
+  if (!fresh) {
+    await runWorkerCut(caseDir, time, dir, p);
+    writeFileSync(stampPath, paramStamp, 'utf8');
+  }
+  return { vtp, meta, dir, from_cache: fresh };
+}
+
+async function ensureIsoSurface(caseDir, time, p) {
+  mkdirSync(ISO_CACHE_ROOT, { recursive: true });
+  const dir = isoCacheKey(caseDir, time, p);
+  const vtp = join(dir, 'iso_surface.vtp');
+  const meta = join(dir, 'iso_surface.meta.json');
+  const stampPath = join(dir, '.stamp');
+  const stamp = timeFolderStamp(caseDir, time);
+  if (!stamp) {
+    throw new Error(`case foam files missing under ${caseDir}/${time}`);
+  }
+  const paramStamp = `${stamp}|${JSON.stringify(p)}`;
+  const fresh =
+    existsSync(vtp) &&
+    existsSync(meta) &&
+    existsSync(stampPath) &&
+    readFileSync(stampPath, 'utf8') === paramStamp;
+  if (!fresh) {
+    mkdirSync(dir, { recursive: true });
+    await runIsoExport(caseDir, time, dir, p);
+    writeFileSync(stampPath, paramStamp, 'utf8');
+  }
+  return { vtp, meta, dir, from_cache: fresh };
+}
+
+
+
+export function isoVolParamsFromUrl(u) {
+  const iso_value_low = Number(u.searchParams.get('iso_value_low') ?? u.searchParams.get('low') ?? '0.25');
+  const iso_value_high = Number(u.searchParams.get('iso_value_high') ?? u.searchParams.get('high') ?? '0.75');
+  const opacity = Number(u.searchParams.get('opacity') ?? '1');
+  const vectorsRaw = u.searchParams.get('vectors');
+  const vectors =
+    vectorsRaw === '1' || vectorsRaw === 'true' || vectorsRaw === 'True' ? 1 : 0;
+  return {
+    iso_value_low: Number.isFinite(iso_value_low) ? iso_value_low : 0.25,
+    iso_value_high: Number.isFinite(iso_value_high) ? iso_value_high : 0.75,
+    iso_field: fieldNameParam(u, ['iso_field']),
+    color_field: fieldNameParam(u, ['color_field']),
+    vector: fieldNameParam(u, ['vector']),
+    opacity: Number.isFinite(opacity) ? opacity : 1,
+    vectors,
+  };
+}
+
+function isoVolCacheKey(caseDir, time, p) {
+  const raw = [
+    caseDir,
+    time,
+    p.iso_field,
+    p.iso_value_low,
+    p.iso_value_high,
+    p.color_field,
+    p.vector,
+    p.opacity,
+    p.vectors,
+  ].join('|');
+  const h = createHash('sha1').update(raw).digest('hex').slice(0, 14);
+  return join(scopedCacheDir(ISO_VOL_CACHE_ROOT, caseDir), `iv-${h}`);
+}
+
+function runIsoVolExport(caseDir, time, outDir, p) {
+  return new Promise((resolveP, reject) => {
+    const args = [
+      ISO_VOL_EXPORT_SCRIPT,
+      '--case',
+      caseDir,
+      '--time',
+      String(time),
+      '--out-dir',
+      outDir,
+      '--iso-field',
+      p.iso_field || '',
+      '--iso-value-low',
+      String(p.iso_value_low),
+      '--iso-value-high',
+      String(p.iso_value_high),
+      '--color-field',
+      p.color_field || '',
+      '--vector',
+      p.vector || '',
+      '--opacity',
+      String(p.opacity),
+      '--vectors',
+      String(p.vectors),
+    ];
+    const child = spawnFilter(args, { windowsHide: true });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (d) => {
+      stdout += d.toString();
+    });
+    child.stderr.on('data', (d) => {
+      stderr += d.toString();
+    });
+    child.on('error', reject);
+    child.on('close', (code) => {
+      if (code !== 0) {
+        reject(new Error(`export_iso_volume exit ${code}: ${stderr || stdout}`));
+        return;
+      }
+      resolveP({ stdout, stderr });
+    });
+  });
+}
+
+async function ensureIsoVolume(caseDir, time, p) {
+  mkdirSync(ISO_VOL_CACHE_ROOT, { recursive: true });
+  const dir = isoVolCacheKey(caseDir, time, p);
+  const vtp = join(dir, 'iso_volume.vtp');
+  const meta = join(dir, 'iso_volume.meta.json');
+  const stampPath = join(dir, '.stamp');
+  const stamp = timeFolderStamp(caseDir, time);
+  if (!stamp) {
+    throw new Error(`case foam files missing under ${caseDir}/${time}`);
+  }
+  const paramStamp = `${stamp}|${JSON.stringify(p)}`;
+  const fresh =
+    existsSync(vtp) &&
+    existsSync(meta) &&
+    existsSync(stampPath) &&
+    readFileSync(stampPath, 'utf8') === paramStamp;
+  if (!fresh) {
+    mkdirSync(dir, { recursive: true });
+    await runIsoVolExport(caseDir, time, dir, p);
+    writeFileSync(stampPath, paramStamp, 'utf8');
+  }
+  return { vtp, meta, dir, from_cache: fresh };
+}
+
+
+
+/** Field names from a comma-separated list; anything that is not a plain name is dropped. */
+export function fieldListParam(raw) {
+  const out = [];
+  for (const part of String(raw || '').split(/[,;]/)) {
+    const name = part.trim();
+    if (isFieldName(name) && !out.includes(name)) out.push(name);
+  }
+  return out;
+}
+
+export function inspectParamsFromUrl(u) {
+  const x = Number(u.searchParams.get('x') ?? 'NaN');
+  const y = Number(u.searchParams.get('y') ?? 'NaN');
+  const z = Number(u.searchParams.get('z') ?? 'NaN');
+  return {
+    x: Number.isFinite(x) ? x : NaN,
+    y: Number.isFinite(y) ? y : NaN,
+    z: Number.isFinite(z) ? z : NaN,
+    // The shown fields to probe; none asks for every field the frame wrote.
+    fields: fieldListParam(u.searchParams.get('fields')),
+  };
+}
+
+function inspectCacheKey(caseDir, time, p) {
+  const raw = [caseDir, time, p.x, p.y, p.z, (p.fields || []).join(',')].join('|');
+  const h = createHash('sha1').update(raw).digest('hex').slice(0, 14);
+  return join(scopedCacheDir(INSPECT_CACHE_ROOT, caseDir), `insp-${h}`);
+}
+
+function runInspectExport(caseDir, time, outDir, p) {
+  return new Promise((resolveP, reject) => {
+    const args = [
+      INSPECT_EXPORT_SCRIPT,
+      '--case',
+      caseDir,
+      '--time',
+      String(time),
+      '--out-dir',
+      outDir,
+      '--x',
+      String(p.x),
+      '--y',
+      String(p.y),
+      '--z',
+      String(p.z),
+    ];
+    if (p.fields && p.fields.length) args.push('--fields', p.fields.join(','));
+    const child = spawnFilter(args, { windowsHide: true });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (d) => {
+      stdout += d.toString();
+    });
+    child.stderr.on('data', (d) => {
+      stderr += d.toString();
+    });
+    child.on('error', reject);
+    child.on('close', (code) => {
+      if (code !== 0) {
+        reject(new Error(`export_inspect_point exit ${code}: ${stderr || stdout}`));
+        return;
+      }
+      resolveP({ stdout, stderr });
+    });
+  });
+}
+
+async function ensureInspect(caseDir, time, p) {
+  mkdirSync(INSPECT_CACHE_ROOT, { recursive: true });
+  const dir = inspectCacheKey(caseDir, time, p);
+  const meta = join(dir, 'inspect.meta.json');
+  const stampPath = join(dir, '.stamp');
+  const stamp = timeFolderStamp(caseDir, time);
+  if (!stamp) {
+    throw new Error(`case foam files missing under ${caseDir}/${time}`);
+  }
+  const paramStamp = `${stamp}|${p.x}|${p.y}|${p.z}|${(p.fields || []).join(',')}`;
+  const fresh =
+    existsSync(meta) &&
+    existsSync(stampPath) &&
+    readFileSync(stampPath, 'utf8') === paramStamp;
+  if (!fresh) {
+    mkdirSync(dir, { recursive: true });
+    // The data-lane worker probes its cached volume in milliseconds; a spawn pays
+    // Python start-up plus a full volume read (~1-2 s) on every click.
+    const rpc = callWorker(
+      'filter.inspect',
+      { case_dir: caseDir, time: String(time), out_dir: dir, x: p.x, y: p.y, z: p.z, fields: p.fields || [] },
+      60000,
+    );
+    if (rpc && typeof rpc.then === 'function') {
+      try {
+        await rpc;
+      } catch (err) {
+        if (!fieldExportMaySpawnFallback(err)) throw err;
+        console.warn('[CFD] inspect worker probe failed, spawning', err && err.message ? err.message : err);
+        await runInspectExport(caseDir, time, dir, p);
+      }
+    } else {
+      await runInspectExport(caseDir, time, dir, p);
+    }
+    writeFileSync(stampPath, paramStamp, 'utf8');
+  }
+  return { meta, dir, from_cache: fresh };
+}
+
+function listCaseTimes(caseDir) {
+  return listFoamTimeDirs(caseDir, { complete: true });
+}
+
+/** The file a shown field reads at a time (in a multi-region case the first region's that wrote it). */
+function foamFieldPath(caseDir, time, field) {
+  const files = foamFieldPaths(caseDir, time, field);
+  return files.length ? files[0] : join(caseDir, String(time), foamNameFor(caseDir, time, field));
+}
+
+
+function readActiveProjectMeshDoc() {
+  try {
+    if (!existsSync(ACTIVE_PROJECT_PATH)) return null;
+    const rawActive = readFileSync(ACTIVE_PROJECT_PATH, 'utf8').trim();
+    if (!rawActive) return null;
+    const active = JSON.parse(rawActive);
+    const id = active && active.project_id;
+    if (!id) return null;
+    const projPath = join(PROJECTS_ROOT, id, 'project.json');
+    const proj = existsSync(projPath) ? JSON.parse(readFileSync(projPath, 'utf8')) : null;
+    const sim = proj ? getActiveSimulation(id, proj) : null;
+    const doc = sim ? assembleMeshDoc(id, sim.id) : null;
+    if (!doc || !(doc.meshes || []).length) return null;
+    return { project_id: id, doc, meshPath: null };
+  } catch (e) {
+    console.warn('[CFD W25b] readActiveProjectMeshDoc', String((e && e.message) || e));
+    return null;
+  }
+}
+
+function liveMeshForOpenProject(projectId, doc) {
+  if (!doc) return null;
+  let sim = null;
+  try {
+    const projPath = join(PROJECTS_ROOT, projectId, 'project.json');
+    const proj = existsSync(projPath) ? JSON.parse(readFileSync(projPath, 'utf8')) : null;
+    sim = proj ? getActiveSimulation(projectId, proj) : null;
+  } catch (_) {}
+  const meshes = Array.isArray(doc.meshes) ? doc.meshes : [];
+  let entry = null;
+  if (sim && sim.id) {
+    const scoped = meshes.filter((m) => m && String(m.simulation_id || '') === String(sim.id));
+    entry =
+      scoped.find((m) => m && m.live_mesh_result && m.live_mesh_result.status === 'running') ||
+      scoped.find((m) => m && String(m.id) === String(doc.active_id)) ||
+      scoped.find((m) => m && m.live_mesh_result && m.live_mesh_result.case_dir) ||
+      null;
+  }
+  const live = (entry && entry.live_mesh_result) || null;
+  if (live && live.case_dir && caseDirBelongsToStudy(live.case_dir, projectId, sim && sim.id)) {
+    return { ...live, mesh_id: live.mesh_id || (entry && entry.id) || null };
+  }
+  return null;
+}
+
+/** Prefer layered remesh case from mesh.json over MTP1 default (W25b live attach). */
+let lastHydratedCaseLogged = null;
+function hydrateActiveMeshCase() {
+  let info = readActiveProjectMeshDoc();
+  if (info && info.project_id && info.doc && info.doc.simulation_id) {
+    try {
+      recoverStudyMeshesFromDisk(info.project_id, info.doc.simulation_id);
+      info = readActiveProjectMeshDoc() || info;
+    } catch (e) {
+      console.warn('[CFD] recover generated mesh', e);
+    }
+  }
+  if (!info || !info.doc) return false;
+  const live = liveMeshForOpenProject(info.project_id, info.doc);
+  if (!live) return false;
+  const liveSnap = liveMeshJobSnapshot();
+  const jobAlive =
+    live.status === 'running' &&
+    !!liveSnap &&
+    (!live.generate_id || !liveSnap.generate_id || live.generate_id === liveSnap.generate_id);
+  if (live.status === 'running' && !jobAlive) {
+    // Not this server's generate: a Vite/process restart lost the child, or another
+    // server on this projects folder runs it. Only its generator going away makes it
+    // interrupted, so follow it until it exits (no ghost card, no false "failed").
+    watchUnownedMeshGenerate(info.project_id, live);
+    return false;
+  }
+  if (live.status === 'running' && jobAlive) {
+    activeCaseState = {
+      ...activeCaseState,
+      case_dir: live.case_dir || null,
+      status: 'running',
+      mode: 'mesh',
+      mesh_id: live.mesh_id || liveSnap.mesh_id || null,
+      attached_at: live.started_at || new Date().toISOString(),
+      path_kind: live.path_kind || 'cartesianMesh',
+      generate_id: live.generate_id || liveSnap.generate_id || null,
+      kick_id: live.generate_id || liveSnap.generate_id || null,
+      pid: liveSnap.pid || live.pid || null,
+      exit_code: null,
+      n_cells: null,
+      n_points: null,
+      n_faces: null,
+      counts_source: null,
+      mesh_path: live.mesh_path || null,
+      step_path: live.step_path || null,
+      body1_path: live.body1_path || null,
+      geometry: live.geometry || null,
+      mtp1_silent_copy: false,
+      increment: live.increment || 'W28',
+      note: live.note || 'Generating mesh',
+      command: live.command || null,
+      log_path: live.log_path || null,
+      wsl_case: live.wsl_case || null,
+      started_at: live.started_at || null,
+      finished_at: null,
+    };
+    console.info('[CFD] hydrated running mesh job', live.generate_id, liveSnap.pid);
+    return true;
+  }
+  if (live.status !== 'done' || !live.case_dir) return false;
+  if (!existsSync(live.case_dir)) return false;
+  const poly = live.mesh_path || join(live.case_dir, 'constant', 'polyMesh');
+  if (!existsSync(poly)) return false;
+  activeCaseState = {
+    ...activeCaseState,
+    case_dir: live.case_dir,
+    status: 'done',
+    mode: 'mesh',
+    attached_at: new Date().toISOString(),
+    path_kind: live.path_kind || 'standard',
+    generate_id: live.generate_id || null,
+    kick_id: live.generate_id || null,
+    exit_code: live.exit_code != null ? live.exit_code : 0,
+    n_cells: live.n_cells ?? null,
+    n_points: live.n_points ?? null,
+    n_faces: live.n_faces ?? null,
+    counts_source: live.counts_source || 'polyMesh/points+owner',
+    emesh: live.emesh || null,
+    feature_marks_total: live.feature_marks_total ?? null,
+    mesh_path: poly,
+    fingerprint_before: live.fingerprint_before || null,
+    fingerprint_after: live.fingerprint_after || null,
+    step_path: live.step_path || null,
+    body1_path: live.body1_path || null,
+    geometry: live.geometry || null,
+    mtp1_silent_copy: false,
+    increment: live.increment || 'W25',
+    note: 'W25b: hydrated active case_dir from project mesh.json live_mesh_result (layered remesh)',
+    project_id: info.project_id,
+    times: listCaseTimes(live.case_dir),
+    n_times: listCaseTimes(live.case_dir).length,
+    pid: null,
+    command: live.command || null,
+    log_path: live.log_path || null,
+    log_excerpt: null,
+    wsl_case: live.wsl_case || null,
+    finished_at: live.finished_at || null,
+    started_at: live.started_at || null,
+  };
+  if (lastHydratedCaseLogged !== live.case_dir) {
+    lastHydratedCaseLogged = live.case_dir;
+    console.info('[CFD] active mesh case', live.case_dir, 'cells', live.n_cells);
+  }
+  return true;
+}
+
+function polyMeshCacheToken(caseDir) {
+  try {
+    const txt = readFileSync(join(caseDir, 'constant', 'polyMesh', 'owner'), 'utf8').slice(0, 1600);
+    const cells = /nCells:(\d+)/.exec(txt);
+    const pts = /nPoints:(\d+)/.exec(txt);
+    if (cells && pts) return `c${cells[1]}p${pts[1]}`;
+  } catch {}
+  try {
+    const st = statSync(join(caseDir, 'constant', 'polyMesh', 'points'));
+    return `t${st.mtimeMs}s${st.size}`;
+  } catch {
+    return '0';
+  }
+}
+
+function meshSectionCacheKey(caseDir, axis, frac) {
+  const h = createHash('sha256')
+    .update(String(caseDir) + '|' + axis + '|' + String(frac) + '|' + polyMeshCacheToken(caseDir))
+    .digest('hex')
+    .slice(0, 16);
+  return join(
+    scopedCacheDir(MESH_SECTION_CACHE_ROOT, caseDir),
+    `section-${axis}-${String(frac).replace('.', 'p')}-${h}.vtp`,
+  );
+}
+
+async function runMeshSectionExport(caseDir, axis, frac, outVtp, metaPath) {
+  mkdirSync(dirname(outVtp), { recursive: true });
+  const r = await runFilterToolAsync(
+    [
+      MESH_SECTION_EXPORT_SCRIPT,
+      '--case', caseDir,
+      '--out', outVtp,
+      '--axis', axis,
+      '--frac', String(frac),
+      '--meta', metaPath,
+    ],
+    { timeout: 180000, caseDir }
+  );
+  return {
+    status: r.status,
+    stdout: (r.stdout || '').slice(-2000),
+    stderr: (r.stderr || '').slice(-2000),
+    out_exists: existsSync(outVtp),
+  };
+}
+
+function meshSurfaceCacheKey(caseDir) {
+  const h = createHash('sha256')
+    .update(String(caseDir) + '|' + polyMeshCacheToken(caseDir))
+    .digest('hex')
+    .slice(0, 16);
+  return join(scopedCacheDir(MESH_SURFACE_CACHE_ROOT, caseDir), `surface-${h}.vtp`);
+}
+
+async function runMeshSurfaceExport(caseDir, outVtp, metaPath) {
+  mkdirSync(dirname(outVtp), { recursive: true });
+  const r = await runFilterToolAsync(
+    [MESH_SURFACE_EXPORT_SCRIPT, '--case', caseDir, '--out', outVtp, '--meta', metaPath],
+    { timeout: 180000, caseDir }
+  );
+  return {
+    status: r.status,
+    stdout: (r.stdout || '').slice(-2000),
+    stderr: (r.stderr || '').slice(-2000),
+    out_exists: existsSync(outVtp),
+  };
+}
+
+// One Python run per output file: concurrent requests for the same mesh surface or
+// section share it instead of writing the same VTP twice.
+const meshExportInflight = new Map();
+function meshExportOnce(outVtp, run) {
+  let p = meshExportInflight.get(outVtp);
+  if (!p) {
+    p = run().finally(() => meshExportInflight.delete(outVtp));
+    meshExportInflight.set(outVtp, p);
+  }
+  return p;
+}
+
+function meshCacheMetaMatchesCase(meta, caseDir) {
+  const tok = polyMeshCacheToken(caseDir);
+  const cells = /^c(\d+)p(\d+)$/.exec(tok);
+  if (!cells || !meta) return false;
+  const mc = Number(meta.n_cells_volume);
+  const mp = Number(meta.n_points_volume);
+  return mc === Number(cells[1]) && (!mp || mp === Number(cells[2]));
+}
+
+async function ensureMeshSurface(caseDir) {
+  const outVtp = meshSurfaceCacheKey(caseDir);
+  const metaPath = outVtp.replace(/\.vtp$/i, '.meta.json');
+  if (existsSync(outVtp) && existsSync(metaPath)) {
+    try {
+      const meta = JSON.parse(readFileSync(metaPath, 'utf8'));
+      if (meshCacheMetaMatchesCase(meta, caseDir)) {
+        return { ok: true, path: outVtp, meta, cached: true };
+      }
+    } catch {}
+  }
+  const run = await meshExportOnce(outVtp, () => runMeshSurfaceExport(caseDir, outVtp, metaPath));
+  if (!run.out_exists) {
+    return { ok: false, error: 'mesh-surface export failed', run };
+  }
+  let meta = null;
+  try { meta = JSON.parse(readFileSync(metaPath, 'utf8')); } catch { meta = { out: outVtp }; }
+  return { ok: true, path: outVtp, meta, cached: false, run };
+}
+
+async function ensureMeshSection(caseDir, axis, frac) {
+  const outVtp = meshSectionCacheKey(caseDir, axis, frac);
+  const metaPath = outVtp.replace(/\.vtp$/i, '.meta.json');
+  if (existsSync(outVtp) && existsSync(metaPath)) {
+    try {
+      const meta = JSON.parse(readFileSync(metaPath, 'utf8'));
+      if (meshCacheMetaMatchesCase(meta, caseDir)) {
+        return { ok: true, path: outVtp, meta, cached: true };
+      }
+    } catch {}
+  }
+  const run = await meshExportOnce(outVtp, () => runMeshSectionExport(caseDir, axis, frac, outVtp, metaPath));
+  if (!run.out_exists) {
+    return { ok: false, error: 'mesh-section export failed', run };
+  }
+  let meta = null;
+  try { meta = JSON.parse(readFileSync(metaPath, 'utf8')); } catch { meta = { out: outVtp }; }
+  return { ok: true, path: outVtp, meta, cached: false, run };
+}
+
+
+export function getCaseFieldApi() {
+  return {
+    sendJson,
+    readJsonBody,
+    parseUrl,
+    resolveCaseDir,
+    requestProjectId,
+    caseSnapshot,
+    attachCaseDir,
+    resetActiveCaseIdle,
+    applyKickUpdate,
+    hydrateActiveMeshCase,
+    syncActiveCaseToActiveProject,
+    listCaseTimes,
+    caseShownFields,
+    caseRegions,
+    caseResultFieldRows,
+    listCaseSeedFaces,
+    foamFieldPath,
+    ensureSeriesRange,
+    inspectParamsFromUrl,
+    cutParamsFromUrl,
+    isoParamsFromUrl,
+    isoVolParamsFromUrl,
+    popParamsFromUrl,
+    ptParamsFromUrl,
+    ensureExported,
+    ensureCutPlane,
+    warmVolume,
+    releaseVolume,
+    ensureIsoSurface,
+    ensureIsoVolume,
+    ensurePlotOverPath,
+    ensureParticleTrace,
+    ensureInspect,
+    ensureMeshSurface,
+    ensureMeshSection,
+    meshSurfaceCacheKey,
+    polyMeshCacheToken,
+    isFieldName,
+    DEFAULT_TIME,
+    ACTIVE_PROJECT_PATH,
+  };
+}

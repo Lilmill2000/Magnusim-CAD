@@ -1,0 +1,1065 @@
+// @ts-check
+/**
+ * Tree-aligned project folders.
+ * projects/<id>/geometries/Geometry_<file>/simulations/<study>/meshes/<mesh>/case
+ *                                          └─ simulation_runs/<run>/case
+ * Isolation: a writer for study/mesh/run N may only touch that folder.
+ */
+import {
+  cpSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import { pathIsWithin } from './safe-path.js';
+import { removeTreeSync } from './remove-tree.js';
+import { baseRevOf, checkBaseRev, stampRev } from './record-rev.js';
+import { basename, dirname, join, resolve } from 'node:path';
+
+export const LAYOUT_VERSION = 2;
+
+export function sanitizeFolderName(name, fallback = 'item') {
+  const s = String(name || '')
+    .replace(/[<>:"/\\|?*\x00-\x1f]/g, '_')
+    .replace(/\s+/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_|_$/g, '')
+    .slice(0, 80)
+    .replace(/[. ]+$/g, '');
+  if (!s || /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(s)) return fallback;
+  return s;
+}
+
+export function geometryFolderName(filenameOrName) {
+  const raw = String(filenameOrName || 'Geometry');
+  const stem = raw.replace(/\.[^.\\/]+$/, '');
+  return 'Geometry_' + sanitizeFolderName(stem, 'Geometry');
+}
+
+// Windows refuses to rename over a file another process has open (the worker
+// reads these JSON files constantly). Retry briefly, as web_writes.atomic_write does.
+const RENAME_LOCK_CODES = new Set(['EPERM', 'EACCES', 'EBUSY']);
+const sleepCell = new Int32Array(new SharedArrayBuffer(4));
+let atomicSerial = 0;
+
+export function writeJsonAtomic(filePath, doc) {
+  mkdirSync(dirname(filePath), { recursive: true });
+  // Unique per write so two writers of the same file never share a temp file.
+  atomicSerial = (atomicSerial + 1) % 1e9;
+  const tmp = `${filePath}.${process.pid}.${atomicSerial}.tmp`;
+  writeFileSync(tmp, JSON.stringify(doc, null, 2), 'utf8');
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      renameSync(tmp, filePath);
+      return filePath;
+    } catch (err) {
+      if (!RENAME_LOCK_CODES.has(err && err.code) || attempt >= 7) {
+        try {
+          unlinkSync(tmp);
+        } catch {
+          /* already gone */
+        }
+        throw err;
+      }
+      Atomics.wait(sleepCell, 0, 0, 50 * (attempt + 1));
+    }
+  }
+}
+
+export function readJsonFile(filePath) {
+  if (!filePath || !existsSync(filePath)) return null;
+  try {
+    const raw = readFileSync(filePath, 'utf8').replace(/^\uFEFF/, '');
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+export function writeIdFile(dir, rec) {
+  mkdirSync(dir, { recursive: true });
+  writeJsonAtomic(join(dir, 'id.json'), rec);
+  return join(dir, 'id.json');
+}
+
+export function uniqueChildDir(parent, wantedName) {
+  mkdirSync(parent, { recursive: true });
+  let name = wantedName;
+  let n = 2;
+  while (existsSync(join(parent, name))) {
+    name = wantedName + '_' + n;
+    n += 1;
+  }
+  return { name, path: join(parent, name) };
+}
+
+export function geometriesRoot(projectDirPath) {
+  return join(projectDirPath, 'geometries');
+}
+
+function listDirFolders(dir) {
+  if (!dir || !existsSync(dir)) return [];
+  try {
+    return readdirSync(dir)
+      .filter((n) => {
+        if (!n || n.startsWith('.')) return false;
+        try {
+          return statSync(join(dir, n)).isDirectory();
+        } catch {
+          return false;
+        }
+      })
+      .sort();
+  } catch {
+    return [];
+  }
+}
+
+export function walkGeometries(projectDirPath) {
+  const root = geometriesRoot(projectDirPath);
+  const out = [];
+  for (const name of listDirFolders(root)) {
+    const dir = join(root, name);
+    const id = readJsonFile(join(dir, 'id.json'));
+    if (!id || !id.id) continue;
+    out.push({ ...id, folder: name, dir });
+  }
+  return out;
+}
+
+export function findGeometry(projectDirPath, geomId) {
+  const want = String(geomId || '').trim();
+  if (!want) return null;
+  return walkGeometries(projectDirPath).find((g) => String(g.id) === want) || null;
+}
+
+export function walkStudies(projectDirPath, geomId) {
+  const geoms = geomId
+    ? [findGeometry(projectDirPath, geomId)].filter(Boolean)
+    : walkGeometries(projectDirPath);
+  const out = [];
+  for (const g of geoms) {
+    const simsRoot = join(g.dir, 'simulations');
+    for (const name of listDirFolders(simsRoot)) {
+      const dir = join(simsRoot, name);
+      const id = readJsonFile(join(dir, 'id.json'));
+      if (!id || !id.id) continue;
+      out.push({
+        ...id,
+        folder: name,
+        dir,
+        geometry_id: id.geometry_id || g.id,
+        geometry_dir: g.dir,
+        geometry_folder: g.folder,
+      });
+    }
+  }
+  out.sort((a, b) => {
+    const ai = Number(a && a.sort_index);
+    const bi = Number(b && b.sort_index);
+    if (Number.isFinite(ai) && Number.isFinite(bi) && ai !== bi) return ai - bi;
+    if (Number.isFinite(ai) && !Number.isFinite(bi)) return -1;
+    if (!Number.isFinite(ai) && Number.isFinite(bi)) return 1;
+    return 0;
+  });
+  return out;
+}
+
+export function findStudy(projectDirPath, simId) {
+  const want = String(simId || '').trim();
+  if (!want) return null;
+  return walkStudies(projectDirPath).find((s) => String(s.id) === want) || null;
+}
+
+export function bindMeshCasePaths(rec, dir) {
+  if (!rec || !dir) return rec;
+  const caseDir = join(dir, 'case');
+  rec.case_dir = caseDir;
+  const live = rec.live_mesh_result;
+  if (live) {
+    const poly = join(caseDir, 'constant', 'polyMesh');
+    const fp = live.fingerprint_after && typeof live.fingerprint_after === 'object' ? live.fingerprint_after : null;
+    rec.live_mesh_result = {
+      ...live,
+      case_dir: caseDir,
+      mesh_path: poly,
+      ...(fp
+        ? {
+            fingerprint_after: {
+              ...fp,
+              points_path: join(poly, 'points'),
+              owner_path: join(poly, 'owner'),
+            },
+          }
+        : {}),
+    };
+  }
+  return rec;
+}
+
+const FOAM_TIME_DIR = /^\d+(?:\.\d+)?(?:[eE][+-]?\d+)?$/;
+
+export function foamTimeHasField(base, field) {
+  return existsSync(join(base, field)) || existsSync(join(base, field + '.gz'));
+}
+
+/**
+ * The frame fields of a case written before API 1.1 (by the default
+ * analysis): its sidecar lists no frame_fields of its own. The same pair as
+ * LEGACY_FRAME_FIELDS in python/cfddesk/registry/contract.py; see
+ * docs/plugins/compatibility.md, section 1.1.
+ * @type {readonly string[]}
+ */
+export const LEGACY_FRAME_FIELDS = Object.freeze(['U', 'p']);
+const FRAME_FIELD_RE = /^[A-Za-z_][A-Za-z0-9_.]*$/;
+/** caseDir|sidecar mtime → frame fields (a sidecar is rewritten only when its case is). */
+const frameFieldsCache = new Map();
+
+/**
+ * The fields whose files mark a written result frame in this case: the case
+ * sidecar's frame_fields (its analysis's launch spec, stamped by prepare_run),
+ * else LEGACY_FRAME_FIELDS.
+ * @param {string} caseDir
+ * @returns {readonly string[]}
+ */
+export function caseFrameFields(caseDir) {
+  const sidecar = join(caseDir, 'w27-case.json');
+  let mtime = 0;
+  try {
+    mtime = statSync(sidecar).mtimeMs;
+  } catch {
+    return LEGACY_FRAME_FIELDS;
+  }
+  const key = caseDir + '|' + mtime;
+  const hit = frameFieldsCache.get(key);
+  if (hit) return hit;
+  /** @type {readonly string[]} */
+  let fields = LEGACY_FRAME_FIELDS;
+  try {
+    const doc = JSON.parse(readFileSync(sidecar, 'utf8'));
+    const list = Array.isArray(doc && doc.frame_fields)
+      ? doc.frame_fields.map(String).filter((f) => FRAME_FIELD_RE.test(f))
+      : [];
+    if (list.length) fields = Object.freeze(list);
+  } catch {
+    /* unreadable: the legacy pair */
+  }
+  if (frameFieldsCache.size > 500) frameFieldsCache.clear();
+  frameFieldsCache.set(key, fields);
+  return fields;
+}
+
+const REGION_NAME_RE = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
+const MAX_REGIONS = 32;
+/** Names a region may not take (in any case): python/cfddesk/wsl/region_rule.py RESERVED. */
+const NOT_REGIONS = new Set(
+  [
+    'polyMesh', 'uniform', 'regionProperties', 'cellToRegion', 'triSurface', 'extendedFeatureEdgeMesh',
+    'g', 'hRef', 'pRef', 'controlDict', 'fvSchemes', 'fvSolution', 'fvOptions', 'fvConstraints', 'fvModels',
+    'decomposeParDict', 'transportProperties', 'thermophysicalProperties', 'physicalProperties',
+    'turbulenceProperties', 'momentumTransport', 'radiationProperties', 'dynamicMeshDict',
+    'blockMeshDict', 'snappyHexMeshDict', 'surfaceFeatureExtractDict', 'extrudeMeshDict',
+    'changeDictionaryDict', 'createPatchDict', 'topoSetDict', 'include',
+    'constant', 'system', 'lagrangian', 'VTK', 'postProcessing', 'dynamicCode', 'MRFProperties',
+    'thermophysicalTransport', 'combustionProperties',
+    'T', 'U', 'p', 'p_rgh', 'k', 'epsilon', 'omega', 'nut', 'alphat', 'rho', 'phi', 'h', 'qr',
+  ].map((n) => n.toLowerCase()),
+);
+/** caseDir|sidecar mtime → regions (a sidecar is rewritten only when its case is). */
+const regionNamesCache = new Map();
+
+/**
+ * A multi-region case's regions (host API 1.8): the rows its sidecar lists in
+ * `regions` ({name, role}, written by its analysis's case writer), in order;
+ * [] for a case of one region or a list that is not valid (the runner refuses
+ * such a case; two names that differ only in case are one folder on Windows).
+ * Other keys in a row are ignored. The same reading as
+ * python/cfddesk/results/regions.case_regions.
+ * @param {string} caseDir
+ * @returns {ReadonlyArray<{ name: string, role: string }>}
+ */
+export function caseRegions(caseDir) {
+  const sidecar = join(String(caseDir || ''), 'w27-case.json');
+  let mtime = 0;
+  try {
+    mtime = statSync(sidecar).mtimeMs;
+  } catch {
+    return [];
+  }
+  const key = caseDir + '|' + mtime;
+  const hit = regionNamesCache.get(key);
+  if (hit) return hit;
+  /** @type {Array<{ name: string, role: string }>} */
+  let out = [];
+  try {
+    const rows = JSON.parse(readFileSync(sidecar, 'utf8')).regions;
+    if (Array.isArray(rows) && rows.length <= MAX_REGIONS) {
+      for (const row of rows) {
+        const name = row && typeof row === 'object' ? row.name : null;
+        const ok =
+          typeof name === 'string' &&
+          REGION_NAME_RE.test(name) &&
+          !NOT_REGIONS.has(name.toLowerCase()) &&
+          !name.toLowerCase().startsWith('processor') &&
+          (row.role === 'fluid' || row.role === 'solid') &&
+          !out.some((r) => r.name.toLowerCase() === name.toLowerCase());
+        if (!ok) {
+          out = [];
+          break;
+        }
+        out.push(Object.freeze({ name, role: String(row.role) }));
+      }
+    }
+  } catch {
+    out = [];
+  }
+  if (regionNamesCache.size > 500) regionNamesCache.clear();
+  const frozen = Object.freeze(out);
+  regionNamesCache.set(key, frozen);
+  return frozen;
+}
+
+/**
+ * The names of caseRegions, in order ([] for a case of one region).
+ * @param {string} caseDir
+ * @returns {string[]}
+ */
+export function caseRegionNames(caseDir) {
+  return caseRegions(caseDir).map((r) => r.name);
+}
+
+/**
+ * The folders a saved time's field files are in: `<case>/<time>`, or in a
+ * multi-region case each `<case>/<time>/<region>`.
+ * @param {string} caseDir
+ * @param {string | number} time
+ * @returns {string[]}
+ */
+export function timeFieldDirs(caseDir, time) {
+  const base = join(String(caseDir), String(time));
+  const regions = caseRegionNames(caseDir);
+  return regions.length ? regions.map((r) => join(base, r)) : [base];
+}
+
+/**
+ * Viewer/API times need every frame field, so a half-copied live write is skipped.
+ * A multi-region time needs a frame field in every region: the rule solve.sh
+ * copies a frame back by and the runner's case check holds a case to
+ * (python/cfddesk/wsl/foam_case.region_without_frame_field).
+ */
+export function foamTimeDirIsComplete(caseDir, name) {
+  const base = join(caseDir, String(name));
+  const fields = caseFrameFields(caseDir);
+  const regions = caseRegionNames(caseDir);
+  if (!regions.length) return fields.every((f) => foamTimeHasField(base, f));
+  return regions.every((r) => fields.some((f) => foamTimeHasField(join(base, r), f)));
+}
+
+export function listFoamTimeDirs(caseDir, opts) {
+  if (!caseDir || !existsSync(caseDir)) return [];
+  let ents;
+  try {
+    ents = readdirSync(caseDir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const needComplete = !!(opts && opts.complete);
+  const times = [];
+  for (const ent of ents) {
+    const name = ent.name;
+    let isDir = ent.isDirectory();
+    if (!isDir && ent.isSymbolicLink()) {
+      try {
+        isDir = statSync(join(caseDir, name)).isDirectory();
+      } catch {
+        isDir = false;
+      }
+    }
+    if (!isDir) continue;
+    if (!FOAM_TIME_DIR.test(name)) continue;
+    const ok = needComplete
+      ? foamTimeDirIsComplete(caseDir, name)
+      : timeFieldDirs(caseDir, name).some((d) => caseFrameFields(caseDir).some((f) => foamTimeHasField(d, f)));
+    if (ok) times.push(name);
+  }
+  times.sort((a, b) => Number(a) - Number(b));
+  return times;
+}
+
+function addCaseCandidate(out, path) {
+  const s = String(path || '').trim();
+  if (!s || out.includes(s)) return;
+  out.push(s);
+}
+
+export function runCaseDirCandidates(rec, dir) {
+  const out = [];
+  if (dir) addCaseCandidate(out, join(dir, 'case'));
+  if (rec) {
+    addCaseCandidate(out, rec.case_dir);
+    addCaseCandidate(out, rec.prepare_run && rec.prepare_run.case_dir);
+    const argv = rec.argv;
+    if (Array.isArray(argv)) {
+      const i = argv.indexOf('--case-dir');
+      if (i >= 0) addCaseCandidate(out, argv[i + 1]);
+    }
+  }
+  return out;
+}
+
+export function resolveRunResultsCaseDir(rec, dir) {
+  return assembleReadableRunCase(rec, dir);
+}
+
+export function foamCaseHasMesh(caseDir) {
+  if (!caseDir || !existsSync(caseDir)) return false;
+  return (
+    existsSync(join(caseDir, 'constant', 'polyMesh', 'points')) ||
+    existsSync(join(caseDir, 'constant', 'polyMesh', 'points.gz')) ||
+    existsSync(join(caseDir, '.cfddesk-prepared.vtu'))
+  );
+}
+
+function sameResolvedPath(a, b) {
+  if (!a || !b) return false;
+  try {
+    return resolve(String(a)) === resolve(String(b));
+  } catch {
+    return String(a) === String(b);
+  }
+}
+
+/** Settings-copy can leave times in one folder and constant/polyMesh in another. */
+export function healRunResultsCase(destCase, sourceCase) {
+  if (!destCase || !sourceCase || sameResolvedPath(destCase, sourceCase)) return destCase;
+  if (!existsSync(destCase) || !existsSync(sourceCase)) return destCase;
+  const destTimes = new Set(listFoamTimeDirs(destCase));
+  for (const t of listFoamTimeDirs(sourceCase)) {
+    if (destTimes.has(t)) continue;
+    const from = join(sourceCase, t);
+    const to = join(destCase, t);
+    if (existsSync(to)) continue;
+    try {
+      symlinkSync(resolve(from), to, process.platform === 'win32' ? 'junction' : 'dir');
+    } catch {
+      try {
+        cpSync(from, to, { recursive: true });
+      } catch {
+        /* keep going; a later attach can retry */
+      }
+    }
+  }
+  return destCase;
+}
+
+export function assembleReadableRunCase(rec, dir) {
+  const candidates = runCaseDirCandidates(rec, dir);
+  const local = dir ? join(dir, 'case') : null;
+  const meshCase =
+    (local && foamCaseHasMesh(local) && local) ||
+    candidates.find((c) => foamCaseHasMesh(c)) ||
+    null;
+  let timesCase = null;
+  let timesN = -1;
+  for (const c of candidates) {
+    const n = listFoamTimeDirs(c).length;
+    if (n > timesN) {
+      timesN = n;
+      timesCase = c;
+    }
+  }
+  if (meshCase && timesCase && !sameResolvedPath(meshCase, timesCase)) {
+    healRunResultsCase(meshCase, timesCase);
+  }
+  if (meshCase && listFoamTimeDirs(meshCase).length) return meshCase;
+  if (timesCase && foamCaseHasMesh(timesCase)) return timesCase;
+  return meshCase || timesCase || local || (rec && rec.case_dir) || null;
+}
+
+export function bindRunCasePaths(rec, dir) {
+  if (!rec || !dir) return rec;
+  rec.case_dir = assembleReadableRunCase(rec, dir);
+  return rec;
+}
+
+/** Listing a run must stay a JSON read. Healing/copying times is attach-only. */
+export function bindListedRunCaseDir(rec, dir) {
+  if (!rec || !dir) return rec;
+  rec.case_dir = join(dir, 'case');
+  return rec;
+}
+
+function loadMeshRecord(dir, study) {
+  const id = readJsonFile(join(dir, 'id.json'));
+  const mesh = readJsonFile(join(dir, 'mesh.json'));
+  if (!id && !mesh) return null;
+  const rec = { ...(mesh || {}), ...(id || {}), folder: basename(dir), dir };
+  rec.id = rec.id || (id && id.id);
+  rec.simulation_id = rec.simulation_id || (study && study.id) || rec.simulation_id;
+  rec.geometry_id = rec.geometry_id || (study && study.geometry_id) || rec.geometry_id;
+  return bindMeshCasePaths(rec, dir);
+}
+
+export function walkMeshes(projectDirPath, simId) {
+  const study = findStudy(projectDirPath, simId);
+  if (!study) return [];
+  const root = join(study.dir, 'meshes');
+  const out = [];
+  for (const name of listDirFolders(root)) {
+    const rec = loadMeshRecord(join(root, name), study);
+    if (rec) out.push(rec);
+  }
+  return out;
+}
+
+export function walkAllMeshes(projectDirPath) {
+  const out = [];
+  for (const s of walkStudies(projectDirPath)) out.push(...walkMeshes(projectDirPath, s.id));
+  return out;
+}
+
+export function findMesh(projectDirPath, meshId, simId) {
+  const want = String(meshId || '').trim();
+  if (!want) return null;
+  if (simId) {
+    return walkMeshes(projectDirPath, simId).find((m) => String(m.id) === want) || null;
+  }
+  for (const s of walkStudies(projectDirPath)) {
+    const m = walkMeshes(projectDirPath, s.id).find((x) => String(x.id) === want);
+    if (m) return m;
+  }
+  return null;
+}
+
+function stripDirMeta(rec) {
+  if (!rec || typeof rec !== 'object') return rec;
+  const next = { ...rec };
+  delete next.dir;
+  delete next.folder;
+  delete next.kind;
+  return next;
+}
+
+export function mergeChildRows(folderRows, legacyList) {
+  const have = new Set((folderRows || []).map((r) => String(r && r.id)));
+  const extra = (legacyList || []).filter((r) => r && r.id != null && !have.has(String(r.id)));
+  return [...(folderRows || []).map(stripDirMeta), ...extra];
+}
+
+function assembleRunResultControls(dir, rec) {
+  const rows = walkChildItems(join(dir, 'result_controls'), 'result_control.json');
+  rec.result_controls = mergeChildRows(rows, rec.result_controls);
+  return rec;
+}
+
+function loadRunRecord(dir, study) {
+  const id = readJsonFile(join(dir, 'id.json'));
+  const run = readJsonFile(join(dir, 'run.json'));
+  if (!id && !run) return null;
+  const rec = { ...(run || {}), ...(id || {}), folder: basename(dir), dir };
+  rec.id = rec.id || rec.run_id || (id && id.id);
+  rec.run_id = rec.run_id || rec.id;
+  rec.simulation_id = rec.simulation_id || (study && study.id) || rec.simulation_id;
+  assembleRunResultControls(dir, rec);
+  return bindListedRunCaseDir(rec, dir);
+}
+
+export function walkRuns(projectDirPath, simId) {
+  const study = findStudy(projectDirPath, simId);
+  if (!study) return [];
+  const root = join(study.dir, 'simulation_runs');
+  const out = [];
+  for (const name of listDirFolders(root)) {
+    const rec = loadRunRecord(join(root, name), study);
+    if (rec) out.push(rec);
+  }
+  return out;
+}
+
+export function walkAllRuns(projectDirPath) {
+  const out = [];
+  for (const s of walkStudies(projectDirPath)) out.push(...walkRuns(projectDirPath, s.id));
+  return out;
+}
+
+export function findRun(projectDirPath, runId, simId) {
+  const want = String(runId || '').trim();
+  if (!want) return null;
+  if (simId) {
+    return walkRuns(projectDirPath, simId).find((r) => String(r.id) === want || String(r.run_id) === want) || null;
+  }
+  for (const s of walkStudies(projectDirPath)) {
+    const r = walkRuns(projectDirPath, s.id).find((x) => String(x.id) === want || String(x.run_id) === want);
+    if (r) return r;
+  }
+  return null;
+}
+
+export function createGeometryFolder(projectDirPath, rec) {
+  const root = geometriesRoot(projectDirPath);
+  mkdirSync(root, { recursive: true });
+  const wanted = geometryFolderName(rec.original_filename || rec.name || rec.id);
+  const { name: folder, path: dir } = uniqueChildDir(root, wanted);
+  writeIdFile(dir, {
+    id: rec.id,
+    name: rec.name || folder,
+    original_filename: rec.original_filename || null,
+    kind: 'geometry',
+  });
+  mkdirSync(join(dir, 'simulations'), { recursive: true });
+  return { id: rec.id, folder, dir, name: rec.name || folder };
+}
+
+export function createStudyFolder(projectDirPath, geomId, sim) {
+  const geom = findGeometry(projectDirPath, geomId);
+  if (!geom) throw new Error('geometry folder missing for ' + geomId);
+  const simsRoot = join(geom.dir, 'simulations');
+  mkdirSync(simsRoot, { recursive: true });
+  const wanted = sanitizeFolderName(sim.name || 'Study', 'Study');
+  const { name: folder, path: dir } = uniqueChildDir(simsRoot, wanted);
+  writeIdFile(dir, {
+    id: sim.id,
+    name: sim.name,
+    geometry_id: geomId,
+    kind: 'simulation',
+    analysis: sim.analysis,
+    analysis_type: sim.analysis_type,
+    time_dependency: sim.time_dependency,
+    algorithm: sim.algorithm,
+    created_at: sim.created_at,
+    updated_at: sim.updated_at,
+  });
+  mkdirSync(join(dir, 'meshes'), { recursive: true });
+  mkdirSync(join(dir, 'simulation_runs'), { recursive: true });
+  mkdirSync(join(dir, 'materials'), { recursive: true });
+  mkdirSync(join(dir, 'boundary_conditions'), { recursive: true });
+  mkdirSync(join(dir, 'result_controls'), { recursive: true });
+  return { ...sim, folder, dir, geometry_dir: geom.dir, geometry_id: geomId };
+}
+
+export function createMeshFolder(projectDirPath, simId, mesh) {
+  const study = findStudy(projectDirPath, simId);
+  if (!study) throw new Error('study folder missing for ' + simId);
+  const root = join(study.dir, 'meshes');
+  mkdirSync(root, { recursive: true });
+  const wanted = sanitizeFolderName(mesh.name || 'Mesh_1', 'Mesh_1');
+  const { name: folder, path: dir } = uniqueChildDir(root, wanted);
+  writeIdFile(dir, {
+    id: mesh.id,
+    name: mesh.name || folder,
+    simulation_id: simId,
+    kind: 'mesh',
+  });
+  mkdirSync(join(dir, 'refinements'), { recursive: true });
+  return { ...mesh, folder, dir, case_dir: join(dir, 'case') };
+}
+
+export function createRunFolder(projectDirPath, simId, run) {
+  const study = findStudy(projectDirPath, simId);
+  if (!study) throw new Error('study folder missing for ' + simId);
+  const root = join(study.dir, 'simulation_runs');
+  mkdirSync(root, { recursive: true });
+  const wanted = sanitizeFolderName(run.name || 'Run_1', 'Run_1');
+  const { name: folder, path: dir } = uniqueChildDir(root, wanted);
+  writeIdFile(dir, {
+    id: run.id,
+    name: run.name || folder,
+    simulation_id: simId,
+    mesh_id: run.mesh_id || null,
+    kind: 'run',
+  });
+  mkdirSync(join(dir, 'result_controls'), { recursive: true });
+  return { ...run, folder, dir, case_dir: join(dir, 'case') };
+}
+
+function pathPrefixVariants(dir) {
+  const win = String(dir || '').replace(/\//g, '\\');
+  const posix = String(dir || '').replace(/\\/g, '/');
+  return [win, posix, win.replace(/\\/g, '\\\\')].filter(Boolean);
+}
+
+export function replacePathPrefix(text, fromDir, toDir) {
+  if (!text || !fromDir || !toDir || fromDir === toDir) return text;
+  const froms = pathPrefixVariants(fromDir);
+  const tos = pathPrefixVariants(toDir);
+  let out = String(text);
+  for (let i = 0; i < froms.length; i += 1) {
+    const from = froms[i];
+    const to = tos[i];
+    if (!from || from === to) continue;
+    let next = '';
+    let idx = 0;
+    while (idx < out.length) {
+      const at = out.indexOf(from, idx);
+      if (at < 0) {
+        next += out.slice(idx);
+        break;
+      }
+      const after = out[at + from.length] || '';
+      const boundary = after === '' || after === '/' || after === '\\' || after === '"';
+      next += out.slice(idx, at) + (boundary ? to : from);
+      idx = at + from.length;
+    }
+    out = next;
+  }
+  return out;
+}
+
+function rewritePathPrefixInJsonTree(rootDir, fromDir, toDir) {
+  if (!rootDir || !existsSync(rootDir) || fromDir === toDir) return;
+  const stack = [rootDir];
+  while (stack.length) {
+    const dir = stack.pop();
+    let names = [];
+    try {
+      names = readdirSync(dir);
+    } catch {
+      continue;
+    }
+    for (const name of names) {
+      const p = join(dir, name);
+      let st;
+      try {
+        st = statSync(p);
+      } catch {
+        continue;
+      }
+      if (st.isDirectory()) {
+        stack.push(p);
+        continue;
+      }
+      if (!name.endsWith('.json')) continue;
+      let raw = '';
+      try {
+        raw = readFileSync(p, 'utf8');
+      } catch {
+        continue;
+      }
+      const next = replacePathPrefix(raw, fromDir, toDir);
+      if (next !== raw) writeFileSync(p, next, 'utf8');
+    }
+  }
+}
+
+function persistBoundRecords(studyDir) {
+  if (!studyDir || !existsSync(studyDir)) return;
+  const meshRoot = join(studyDir, 'meshes');
+  for (const name of listDirFolders(meshRoot)) {
+    const dir = join(meshRoot, name);
+    const mesh = readJsonFile(join(dir, 'mesh.json'));
+    if (!mesh) continue;
+    bindMeshCasePaths(mesh, dir);
+    delete mesh.dir;
+    delete mesh.folder;
+    writeJsonAtomic(join(dir, 'mesh.json'), mesh);
+  }
+  const runRoot = join(studyDir, 'simulation_runs');
+  for (const name of listDirFolders(runRoot)) {
+    const dir = join(runRoot, name);
+    const run = readJsonFile(join(dir, 'run.json'));
+    if (!run) continue;
+    bindRunCasePaths(run, dir);
+    delete run.dir;
+    delete run.folder;
+    writeJsonAtomic(join(dir, 'run.json'), run);
+  }
+}
+
+// A folder named <wanted>_<n> already is the name uniqueChildDir gives on a clash.
+// Asking again counted the folder itself as taken: studies whose names sanitize alike
+// ("Run A", "Run A?") moved between _2 and _3 on every catalog save, breaking every
+// path held into them.
+function holdsClashSuffix(folder, wanted) {
+  if (!folder.startsWith(wanted + '_')) return false;
+  const n = folder.slice(wanted.length + 1);
+  return /^[1-9][0-9]*$/.test(n) && Number(n) >= 2;
+}
+
+export function renameFolderTo(dir, parent, newName) {
+  const wanted = sanitizeFolderName(newName, basename(dir));
+  if (basename(dir) === wanted || holdsClashSuffix(basename(dir), wanted)) return dir;
+  const dest = uniqueChildDir(parent, wanted);
+  renameSync(dir, dest.path);
+  rewritePathPrefixInJsonTree(dest.path, dir, dest.path);
+  const projectRoot = dirname(dirname(dirname(parent)));
+  for (const name of ['project.json', 'simulations.json', 'simulation.json']) {
+    const p = join(projectRoot, name);
+    if (!existsSync(p)) continue;
+    try {
+      const raw = readFileSync(p, 'utf8');
+      const next = replacePathPrefix(raw, dir, dest.path);
+      if (next !== raw) writeFileSync(p, next, 'utf8');
+    } catch {
+      /* ignore */
+    }
+  }
+  persistBoundRecords(dest.path);
+  return dest.path;
+}
+
+const ITEM_KIND = {
+  material: { prefix: 'Material_', json: 'material.json', fallback: 'Material' },
+  bc: { prefix: 'BC_', json: 'bc.json', fallback: 'BC' },
+  rc: { prefix: 'RC_', json: 'result_control.json', fallback: 'RC' },
+  refinement: { prefix: 'Ref_', json: 'refinement.json', fallback: 'Ref' },
+};
+
+export function itemFolderName(kind, name, fallback) {
+  const spec = ITEM_KIND[kind] || { prefix: '', fallback: fallback || 'item' };
+  return spec.prefix + sanitizeFolderName(name || fallback, spec.fallback);
+}
+
+export function walkChildItems(parentDir, jsonFile) {
+  const out = [];
+  for (const name of listDirFolders(parentDir)) {
+    const dir = join(parentDir, name);
+    const rec = readJsonFile(join(dir, jsonFile));
+    if (!rec || rec.id == null) continue;
+    const ident = readJsonFile(join(dir, 'id.json')) || {};
+    const row = { ...ident, ...rec, folder: name, dir };
+    delete row.kind;
+    out.push(row);
+  }
+  return out;
+}
+
+export function findChildItem(parentDir, jsonFile, id) {
+  const want = String(id || '').trim();
+  if (!want) return null;
+  return walkChildItems(parentDir, jsonFile).find((x) => String(x.id) === want) || null;
+}
+
+/**
+ * Keep a linked geometry's own keys as a record writer must (host API 1.5):
+ * `lost_faces` from the file on disk, whatever the save sent (only the link writes
+ * it); `geometry_rev` set to the rev the save's stamp check passed with, else kept
+ * from disk. A record with no file yet keeps neither, unless it is a legacy row given
+ * its own folder (`keepRow`), which keeps the row's.
+ * @param {Record<string, any>} bound the record about to be written (changed in place)
+ * @param {Record<string, any> | null} onDisk
+ * @param {{ geometryRev?: number | null, keepRow?: boolean }} [opts]
+ */
+export function keepLinkKeys(bound, onDisk, opts = {}) {
+  for (const key of ['lost_faces', 'geometry_rev']) {
+    if (key === 'geometry_rev' && opts.geometryRev !== undefined && opts.geometryRev !== null) {
+      bound[key] = Number(opts.geometryRev);
+    } else if (onDisk) {
+      if (Object.prototype.hasOwnProperty.call(onDisk, key)) bound[key] = onDisk[key];
+      else delete bound[key];
+    } else if (!opts.keepRow) {
+      delete bound[key];
+    }
+  }
+  return bound;
+}
+
+/**
+ * Write one record into its own folder (bc.json and its id.json in a BC_ folder), atomically.
+ * `opts.geometryRev` is the rev the save's stamp check passed with; the link's keys
+ * follow keepLinkKeys. The record's `rev` follows record-rev.js stampRev: a record that
+ * carries `base_rev` other than the stored rev is refused (StaleRecord) before anything is
+ * written. A legacy row or a copy given its own folder (`keepRow`) counts on from its own rev.
+ * @param {{ geometryRev?: number | null, keepRow?: boolean }} [opts]
+ */
+export function persistChildItem(parentDir, kind, rec, opts = {}) {
+  const spec = ITEM_KIND[kind];
+  if (!spec) throw new Error('unknown item kind ' + kind);
+  if (!rec || rec.id == null) throw new Error(kind + ' id required');
+  let folder = findChildItem(parentDir, spec.json, rec.id);
+  const onDisk = folder ? readJsonFile(join(folder.dir, spec.json)) : null;
+  checkBaseRev(kind, rec.id, onDisk, baseRevOf(rec));
+  mkdirSync(parentDir, { recursive: true });
+  if (!folder) {
+    const wanted = itemFolderName(kind, rec.name, rec.id);
+    const created = uniqueChildDir(parentDir, wanted);
+    folder = { dir: created.path, folder: created.name };
+  }
+  writeIdFile(folder.dir, {
+    id: rec.id,
+    name: rec.name || folder.folder,
+    simulation_id: rec.simulation_id || null,
+    mesh_id: rec.mesh_id || null,
+    run_id: rec.run_id || null,
+    kind,
+  });
+  const bound = { ...rec };
+  delete bound.dir;
+  delete bound.folder;
+  keepLinkKeys(bound, onDisk && typeof onDisk === 'object' ? onDisk : null, opts);
+  stampRev(bound, onDisk && typeof onDisk === 'object' ? onDisk : opts.keepRow ? { rev: rec.rev } : null);
+  writeJsonAtomic(join(folder.dir, spec.json), bound);
+  return { ...bound, folder: folder.folder || basename(folder.dir), dir: folder.dir };
+}
+
+export function removeChildItem(parentDir, jsonFile, id) {
+  const folder = findChildItem(parentDir, jsonFile, id);
+  if (!folder || !folder.dir) return false;
+  removeTreeSync(folder.dir, { maxRetries: 8, retryDelay: 50 });
+  return true;
+}
+
+/**
+ * Wipe child folders and persist each record into its own folder. Never share a list file as SoT.
+ * The records are whole (a study copy rewrites them): they keep their own `lost_faces`
+ * and `geometry_rev` (keepLinkKeys' `keepRow`).
+ */
+export function replaceChildItems(parentDir, kind, recs) {
+  const spec = ITEM_KIND[kind];
+  if (!spec) throw new Error('unknown item kind ' + kind);
+  mkdirSync(parentDir, { recursive: true });
+  for (const name of listDirFolders(parentDir)) {
+    const dir = join(parentDir, name);
+    if (existsSync(join(dir, spec.json)) || existsSync(join(dir, 'id.json'))) {
+      try {
+        rmSync(dir, { recursive: true, force: true });
+      } catch {
+        /* best-effort */
+      }
+    }
+  }
+  const out = [];
+  for (const rec of recs || []) {
+    if (rec && rec.id != null) out.push(persistChildItem(parentDir, kind, rec, { keepRow: true }));
+  }
+  return out;
+}
+
+export function collectChildRecs(parentDir, jsonFile, legacyList) {
+  return mergeChildRows(walkChildItems(parentDir, jsonFile), legacyList);
+}
+
+export function studyMaterialsDir(studyDir) {
+  return join(studyDir, 'materials');
+}
+
+export function studyBcsDir(studyDir) {
+  return join(studyDir, 'boundary_conditions');
+}
+
+export function studyRcsDir(studyDir) {
+  return join(studyDir, 'result_controls');
+}
+
+export function meshRefsDir(meshDir) {
+  return join(meshDir, 'refinements');
+}
+
+export function runRcsDir(runDir) {
+  return join(runDir, 'result_controls');
+}
+
+export function studyMaterialsPath(studyDir) {
+  return join(studyDir, 'materials.json');
+}
+
+export function studyBcsPath(studyDir) {
+  return join(studyDir, 'boundary_conditions.json');
+}
+
+export function studyResultControlsPath(studyDir) {
+  return join(studyDir, 'result_controls.json');
+}
+
+export function studyControlPath(studyDir) {
+  return join(studyDir, 'simulation_control.json');
+}
+
+export function meshSettingsPath(meshDir) {
+  return join(meshDir, 'mesh.json');
+}
+
+export function meshRefinementsPath(meshDir) {
+  return join(meshDir, 'refinements.json');
+}
+
+export function meshCaseDir(meshDir) {
+  return join(meshDir, 'case');
+}
+
+export function runSettingsPath(runDir) {
+  return join(runDir, 'run.json');
+}
+
+export function runCaseDir(runDir) {
+  return join(runDir, 'case');
+}
+
+export function caseUnderOwner(casePath, ownerDir) {
+  if (!casePath || !ownerDir) return false;
+  return pathIsWithin(casePath, ownerDir);
+}
+
+export function removeStudyFolder(projectDirPath, simId) {
+  const study = findStudy(projectDirPath, simId);
+  if (!study || !study.dir) return false;
+  removeTreeSync(study.dir, { maxRetries: 8, retryDelay: 50 });
+  return true;
+}
+
+export function copyStudyTree(srcStudyDir, destParent, newName, { cloneCases }) {
+  const wanted = sanitizeFolderName(newName, 'Study');
+  const dest = uniqueChildDir(destParent, wanted);
+  cpSync(srcStudyDir, dest.path, {
+    recursive: true,
+    filter(src) {
+      if (cloneCases) return true;
+      const n = String(src).replace(/\\/g, '/');
+      if (/(^|\/)case(\/|$)/i.test(n)) return false;
+      if (/(^|\/)simulation_runs(\/|$)/i.test(n)) return false;
+      return true;
+    },
+  });
+  if (!cloneCases) mkdirSync(join(dest.path, 'simulation_runs'), { recursive: true });
+  return dest.path;
+}
+
+/** What walkStudies adds to a study's id.json, and the folder kind: never study fields. */
+const WALK_ONLY_KEYS = new Set(['folder', 'dir', 'geometry_dir', 'geometry_folder', 'kind']);
+
+export function catalogFromWalk(projectDirPath, activeId) {
+  // A study under a new linked geometry that has not committed yet (link/pending.json,
+  // host API 1.5) is not listed: the geometry and its copied studies appear together.
+  const simulations = walkStudies(projectDirPath)
+    .filter((s) => !existsSync(join(s.geometry_dir, 'link', 'pending.json')))
+    .map((s) => {
+    // Any other scalar the folder's id.json holds comes along and wins over the index:
+    // settings older versions wrote there, until the read moves them into the index
+    // (w17-sim-catalog foldLegacyIdSettings).
+    /** @type {Record<string, unknown>} */
+    const extra = {};
+    for (const [key, value] of Object.entries(s)) {
+      if (WALK_ONLY_KEYS.has(key)) continue;
+      if (value !== null && typeof value === 'object') continue;
+      extra[key] = value;
+    }
+    return {
+      ...extra,
+      id: s.id,
+      name: s.name,
+      geometry_id: s.geometry_id,
+      folder: s.folder,
+      dir: s.dir,
+      analysis: s.analysis,
+      analysis_type: s.analysis_type,
+      time_dependency: s.time_dependency,
+      algorithm: s.algorithm,
+      created_at: s.created_at,
+      updated_at: s.updated_at,
+      sort_index: Number.isFinite(Number(s.sort_index)) ? Number(s.sort_index) : undefined,
+    };
+  });
+  const active_id =
+    activeId && simulations.some((s) => s.id === activeId)
+      ? activeId
+      : simulations[0]
+        ? simulations[0].id
+        : null;
+  return { active_id, simulations, updated_at: new Date().toISOString() };
+}

@@ -1,0 +1,11 @@
+# Every text file is LF, in the repository and in every checkout: the CAD workspace's
+# build check (npm run build:cad:check) compares bytes, and a CRLF checkout fails it.
+* text=auto eol=lf
+# Never converted.
+*.wasm binary
+*.bin binary
+*.webp binary
+*.png binary
+*.ico binary
+# The vendored Analysis Situs files, byte for byte (kernel-build/asi/FILES.sha256 checks them).
+magnusim-web/bundled-plugins/cad/kernel-build/asi/upstream/** -text

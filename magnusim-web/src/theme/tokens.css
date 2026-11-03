@@ -1,0 +1,374 @@
+/*
+ * Design tokens (Plugin Host H13). The one set of colour roles, type, spacing,
+ * radii, shadows, layers and motion. Values are the dominant ones the app
+ * already uses; the core imports this file without rewriting its own
+ * selectors (no visual change), and plugin workspaces get it as
+ * /plugin-sdk/theme.css with base styles. Primary #1570ef is the app's primary
+ * blue (Daniel, 2026-10-02): the core panel buttons use it too.
+ *
+ * Appearance (Settings): html[data-theme="dark"] takes the dark set below; [data-theme="light"]
+ * keeps the light one inside a dark page (the parts not dark yet: the viewport and charts).
+ * --mg-text-scale and --mg-icon-scale size text and icons; the size tokens are declared again on
+ * [data-appearance-scope], so a preview with its own scales shows them (a var() in a custom
+ * property resolves where the property is declared).
+ */
+:root,
+[data-theme="light"] {
+  color-scheme: light;
+  /* Colour roles */
+  --mg-text: #101828;
+  --mg-text-strong: #1a1d24;
+  --mg-text-muted: #667085;
+  --mg-text-subtle: #98a2b3;
+  --mg-bg: #ffffff;
+  --mg-surface: #f9fafb;
+  --mg-surface-muted: #f2f4f7;
+  --mg-border: #d0d5dd;
+  --mg-border-subtle: #eaecf0;
+  --mg-header-border: #d5d8de;
+  --mg-primary: #1570ef;
+  --mg-primary-hover: #175cd3;
+  --mg-primary-text: #ffffff;
+  /* The primary blue as text or an icon (in dark, lighter than the primary fill) */
+  --mg-primary-ink: #1570ef;
+  --mg-selected-bg: #eff4ff;
+  --mg-selected-border: #b2ccff;
+  --mg-danger: #b42318;
+  --mg-danger-bg: #fef3f2;
+  --mg-danger-border: #fda29b;
+  --mg-success: #027a48;
+  --mg-success-bg: #ecfdf3;
+  --mg-warning: #b54708;
+  --mg-warning-bg: #fffaeb;
+  --mg-focus: rgba(21, 112, 239, 0.35);
+
+  /* Type */
+  --mg-font: "Segoe UI", system-ui, -apple-system, Roboto, sans-serif;
+  --mg-font-mono: ui-monospace, Consolas, monospace;
+  --mg-weight-regular: 400;
+  --mg-weight-medium: 500;
+  --mg-weight-semibold: 600;
+  --mg-line: 1.45;
+
+  /* Spacing (4 px steps) */
+  --mg-space-1: 4px;
+  --mg-space-2: 8px;
+  --mg-space-3: 12px;
+  --mg-space-4: 16px;
+  --mg-space-5: 20px;
+  --mg-space-6: 24px;
+  --mg-space-8: 32px;
+
+  /* Radii */
+  --mg-radius-sm: 4px;
+  --mg-radius-md: 6px;
+  --mg-radius-lg: 8px;
+  --mg-radius-pill: 999px;
+
+  /* Shadows */
+  --mg-shadow-sm: 0 4px 14px rgba(16, 24, 40, 0.08);
+  --mg-shadow-md: 0 8px 24px rgba(20, 24, 40, 0.12);
+
+  /* Layers (the app's own: dropdowns, the workspace overlay, dialogs, Settings) */
+  --mg-z-dropdown: 1000;
+  --mg-z-workspace: 1500;
+  --mg-z-modal: 9999;
+  --mg-z-settings: 10050;
+  --mg-z-confirm: 10100;
+
+  /* Motion */
+  --mg-duration-fast: 120ms;
+  --mg-duration: 200ms;
+  --mg-ease: cubic-bezier(0.2, 0, 0, 1);
+
+  /* Chrome */
+  --mg-header-height: 44px;
+
+  /* H14: values the core already uses, named for the kit */
+  --mg-info: #1570ef;
+  --mg-text-body: #344054;
+  --mg-text-secondary: #475467;
+  --mg-divider: #e8ebf0;
+  --mg-card-border: #cfd3db;
+  --mg-control-border: #c9ced6;
+  --mg-btn-neutral-bg: #eef1f6;
+  --mg-btn-neutral-hover: #e2e6ee;
+  --mg-btn-neutral-border: #9aa3b2;
+  --mg-btn-disabled-bg: #9aa3b5;
+  --mg-link: #175cd3;
+  --mg-link-strong: #155eef;
+  --mg-link-strong-hover: #1849a9;
+  --mg-danger-solid: #c62828;
+  --mg-danger-solid-hover: #9b1c1c;
+  --mg-switch-off: #c5cad3;
+  /* Text fields, checkboxes and sliders the app leaves to the browser: the browser's own in light. */
+  --mg-field-bg: #ffffff;
+  --mg-field-text: #000000;
+  --mg-check-accent: auto;
+  --mg-tooltip-bg: #1f2430;
+  --mg-tooltip-text: #f5f6f8;
+  --mg-plot-bg: #f8fafc;
+  --mg-plot-tip-bg: rgba(255, 255, 255, 0.96);
+  --mg-series-1: #1570ef;
+  --mg-series-2: #6941c6;
+  --mg-series-3: #099250;
+  --mg-series-4: #b54708;
+  --mg-series-5: #0086c9;
+  --mg-series-6: #dd2590;
+  --mg-series-7: #667085;
+  --mg-weight-bold: 700;
+  --mg-line-tight: 1.35;
+  --mg-radius-2xs: 2px;
+  --mg-radius-xs: 3px;
+  --mg-radius-tip: 5px;
+  --mg-radius-round: 50%;
+  --mg-shadow-xs: 0 1px 3px rgba(16, 24, 40, 0.12);
+  --mg-shadow-tooltip: 0 6px 18px rgba(16, 24, 40, 0.25);
+  --mg-disabled-opacity: 0.45;
+  --mg-duration-switch: 150ms;
+  --mg-z-tooltip: 40;
+  --mg-z-toast: 2000;
+  /* The Assistant's dock: above toasts, under every dialog (modal 9999, Settings, confirm). */
+  --mg-z-assistant: 2100;
+
+  /* Appearance: colours the core uses most that had no token (their light values) */
+  --mg-app-bg: #e8eaee;
+  --mg-surface-2: #eef0f4;
+  --mg-surface-3: #e4e7ec;
+  --mg-surface-hover: #eef1f5;
+  --mg-text-tertiary: #5b6575;
+  --mg-text-dim: #4a5160;
+  --mg-text-slate: #4b5563;
+  --mg-text-faint: #8a93a3;
+  --mg-primary-strong: #1a4fbf;
+  --mg-primary-deep: #1d4ed8;
+  --mg-shadow-color: rgba(20, 24, 40, 0.12);
+  --mg-viewport-bg: #f0f2f7;
+  --mg-axis-x: #d42828;
+  --mg-axis-y: #1f9a3a;
+  --mg-axis-z: #2a5bd7;
+
+  /* Appearance: the rest of the chrome's colours that had no token (their light values) */
+  --mg-text-ink: #1f2430;
+  --mg-overlay-bg: rgba(20, 24, 32, 0.5);
+  --mg-info-bg: #eef3fd;
+  --mg-info-border: #c5d4f5;
+  --mg-active-bg: #d7e8ff;
+  --mg-active-border: #9bc2f0;
+  --mg-pressed-border: #6ea3ea;
+  --mg-pressed-text: #143a6b;
+  --mg-success-border: #abefc6;
+  --mg-success-bg-strong: #d1fadf;
+  --mg-success-muted: #3f6b4a;
+  --mg-warning-border: #fedf89;
+  --mg-accent-purple-bg: #ebe9fe;
+  --mg-running: #12b76a;
+  --mg-legend-lo: #2438d6;
+  --mg-legend-hi: #c01818;
+  --mg-pin: #c026d3;
+  --mg-pin-text: #a21caf;
+  --mg-btn-solid-bg: #1a1d24;
+  --mg-btn-solid-hover: #2a3140;
+  --mg-btn-solid-text: #ffffff;
+  --mg-inverse-hover: #1d2939;
+  --mg-border-soft: #dde1e8;
+  --mg-shadow-lg: 0 12px 40px rgba(0, 0, 0, 0.25);
+  /* Edges only dark needs (a tooltip's outline, a gradient's inset ring): none in light */
+  --mg-tooltip-edge: transparent;
+  --mg-gradient-edge: transparent;
+
+  /* Charts: grid, axes and their text; series past the seven above. A series colour with no
+     token is mixed toward white by --mg-series-lift (src/theme/series.ts): none in light. */
+  --mg-chart-grid: #e6e9ef;
+  --mg-chart-axis: #98a2b3;
+  --mg-chart-text: #667085;
+  --mg-series-8: #d92d20;
+  --mg-series-9: #7a5af8;
+  --mg-series-10: #0e9384;
+  --mg-series-11: #dc6803;
+  --mg-series-default: #3884e6;
+  --mg-series-lift: 0%;
+
+  /*
+   * The 3D view's colours, and the boundary-condition, refinement and analysis-area colours its
+   * faces share with the chrome's swatches. vtk reads them through themeColor
+   * (src/theme/themeColor.ts), so each is plain hex or rgb in every block. They have no dark
+   * value yet: they turn dark with the 3D view, so a swatch always matches its face paint.
+   */
+  --mg-viewport-ink: #141a29;
+  --mg-viewport-edge: #0a0b0e;
+  --mg-viewport-mesh-edge: #42474f;
+  --mg-viewport-face: #bdc9db;
+  --mg-viewport-face-dim: #bcc4d0;
+  --mg-viewport-mesh-face: #dbe0e8;
+  --mg-viewport-slice-face: #d1d9e3;
+  --mg-viewport-selected: #4884eb;
+  --mg-viewport-pick: #2ec47e;
+  --mg-viewport-pick-strong: #1ad675;
+  --mg-viewport-candidate: #7688a2;
+  --mg-viewport-region: #fab81f;
+  --mg-viewport-marker: #ff00ff;
+  --mg-viewport-flash: #ff8c14;
+  --mg-viewport-halo: #ffffff;
+  --mg-capture-mask: rgba(18, 22, 32, 0.42);
+  --mg-bc-inlet: #3884e6;
+  --mg-bc-outlet: #ea7024;
+  --mg-bc-pressure: #9333ea;
+  --mg-bc-freestream: #16a34a;
+  --mg-bc-wall: #5f6b7a;
+  --mg-bc-symmetry: #0891b2;
+  --mg-bc-other: #db2777;
+  --mg-bc-default: #d6be8c;
+  --mg-ref-surface: #0d9488;
+  --mg-ref-inflate: #d97706;
+  --mg-accent-purple: #6941c6;
+}
+
+/* Text and icon sizes: scaled by Settings > Appearance (1 = as designed). */
+:root {
+  --mg-text-scale: 1;
+  --mg-icon-scale: 1;
+}
+
+:root,
+[data-appearance-scope] {
+  --mg-text-3xs: calc(9px * var(--mg-text-scale));
+  --mg-text-micro: calc(10px * var(--mg-text-scale));
+  --mg-text-2xs: calc(10.5px * var(--mg-text-scale));
+  --mg-text-xs: calc(11px * var(--mg-text-scale));
+  --mg-text-sm: calc(12px * var(--mg-text-scale));
+  --mg-text-md: calc(13px * var(--mg-text-scale));
+  --mg-text-lg: calc(14px * var(--mg-text-scale));
+  --mg-text-xl: calc(16px * var(--mg-text-scale));
+  --mg-text-2xl: calc(18px * var(--mg-text-scale));
+  --mg-icon-sm: calc(14px * var(--mg-icon-scale));
+  --mg-icon-md: calc(18px * var(--mg-icon-scale));
+  --mg-icon-lg: calc(20px * var(--mg-icon-scale));
+  --mg-icon-xl: calc(28px * var(--mg-icon-scale));
+}
+
+/*
+ * Dark: every colour token's dark value (the rest of the tokens are the same in both).
+ * Surfaces step up in lightness from the app background to raised cards; text on them is at
+ * least 4.5:1, or as readable as in light where light is below that (src/theme/tokens.test.ts).
+ * The primary fill stays dark enough for white text; blue text takes --mg-primary-ink.
+ */
+[data-theme="dark"] {
+  color-scheme: dark;
+  --mg-text: #e6e9ef;
+  --mg-text-strong: #f2f4f7;
+  --mg-text-muted: #9aa4b2;
+  --mg-text-subtle: #7b8494;
+  --mg-bg: #1b1f27;
+  --mg-surface: #20252e;
+  --mg-surface-muted: #262c36;
+  --mg-border: #3a414e;
+  --mg-border-subtle: #2c323d;
+  --mg-header-border: #323946;
+  --mg-primary: #2f6fde;
+  --mg-primary-hover: #2563d0;
+  --mg-primary-text: #ffffff;
+  --mg-primary-ink: #7aa7ff;
+  --mg-selected-bg: #1f3355;
+  --mg-selected-border: #3f6db8;
+  --mg-danger: #f97066;
+  --mg-danger-bg: #3b1f1d;
+  --mg-danger-border: #8a3a33;
+  --mg-success: #47cd89;
+  --mg-success-bg: #133224;
+  --mg-warning: #fdb022;
+  --mg-warning-bg: #3a2b12;
+  --mg-focus: rgba(75, 141, 255, 0.45);
+  --mg-info: #6aa1ff;
+  --mg-text-body: #d0d5dd;
+  --mg-text-secondary: #b3bbc7;
+  --mg-divider: #2c323d;
+  --mg-card-border: #3a414e;
+  --mg-control-border: #444c5a;
+  --mg-btn-neutral-bg: #2a303b;
+  --mg-btn-neutral-hover: #333a46;
+  --mg-btn-neutral-border: #4f5866;
+  --mg-btn-disabled-bg: #3a414e;
+  --mg-link: #7aa7ff;
+  --mg-link-strong: #8fb5ff;
+  --mg-link-strong-hover: #b3cdff;
+  --mg-danger-solid: #d92d20;
+  --mg-danger-solid-hover: #f04438;
+  --mg-switch-off: #4a5262;
+  /* A field as a select is (--mg-bg, --mg-text), not the browser's dark grey; the ticks on the primary. */
+  --mg-field-bg: #1b1f27;
+  --mg-field-text: #e6e9ef;
+  --mg-check-accent: #2f6fde;
+  --mg-tooltip-bg: #0d1016;
+  --mg-tooltip-text: #f2f4f7;
+  --mg-plot-bg: #1b1f27;
+  --mg-plot-tip-bg: rgba(32, 37, 46, 0.96);
+  --mg-series-1: #4b8dff;
+  --mg-series-2: #9b7bf0;
+  --mg-series-3: #32d583;
+  --mg-series-4: #fdb022;
+  --mg-series-5: #36bffa;
+  --mg-series-6: #f670c7;
+  --mg-series-7: #9aa4b2;
+  --mg-app-bg: #12151b;
+  --mg-surface-2: #232934;
+  --mg-surface-3: #2b313c;
+  --mg-surface-hover: #283040;
+  --mg-text-tertiary: #a3acba;
+  --mg-text-dim: #b0b8c4;
+  --mg-text-slate: #aab2bf;
+  --mg-text-faint: #7f8898;
+  --mg-primary-strong: #8fb5ff;
+  --mg-primary-deep: #7aa7ff;
+  --mg-shadow-color: rgba(0, 0, 0, 0.45);
+  --mg-viewport-bg: #1b1f27;
+  /* On the dark 3D view: lines and points light, edges a mid grey that shows on the background and
+     on the light faces, the mesh edges dark on their light faces, the labels' glow the background. */
+  --mg-viewport-ink: #e6e9ef;
+  --mg-viewport-edge: #6b7382;
+  --mg-viewport-mesh-edge: #5b6472;
+  --mg-viewport-halo: #1b1f27;
+  --mg-axis-x: #ff6b6b;
+  --mg-axis-y: #4cd07d;
+  --mg-axis-z: #6f9bff;
+  --mg-shadow-sm: 0 4px 14px rgba(0, 0, 0, 0.35);
+  --mg-shadow-md: 0 8px 24px rgba(0, 0, 0, 0.45);
+  --mg-shadow-xs: 0 1px 3px rgba(0, 0, 0, 0.4);
+  --mg-shadow-tooltip: 0 6px 18px rgba(0, 0, 0, 0.5);
+  --mg-text-ink: #e6e9ef;
+  --mg-overlay-bg: rgba(0, 0, 0, 0.6);
+  --mg-info-bg: #1c2c47;
+  --mg-info-border: #2c4a7a;
+  --mg-active-bg: #1f3a66;
+  --mg-active-border: #3f6db8;
+  --mg-pressed-border: #5b8fe0;
+  --mg-pressed-text: #b3cdff;
+  --mg-success-border: #2b6e4a;
+  --mg-success-bg-strong: #1a4a33;
+  --mg-success-muted: #7fc79a;
+  --mg-warning-border: #7a5a17;
+  --mg-accent-purple-bg: #2e2650;
+  --mg-running: #32d583;
+  --mg-legend-lo: #8b95ff;
+  --mg-legend-hi: #ff7070;
+  --mg-pin: #e879f9;
+  --mg-pin-text: #f0abfc;
+  --mg-btn-solid-bg: #e6e9ef;
+  /* The solid button lightens on hover, as in light */
+  --mg-btn-solid-hover: #ffffff;
+  --mg-btn-solid-text: #1a1d24;
+  --mg-inverse-hover: #ffffff;
+  --mg-border-soft: #343b47;
+  --mg-shadow-lg: 0 12px 40px rgba(0, 0, 0, 0.6);
+  --mg-tooltip-edge: #3a414e;
+  --mg-gradient-edge: #3a414e;
+  --mg-chart-grid: #2c323d;
+  --mg-chart-axis: #6b7382;
+  --mg-chart-text: #9aa4b2;
+  --mg-series-8: #f97066;
+  --mg-series-9: #a48afb;
+  --mg-series-10: #2ed3b7;
+  --mg-series-11: #f38744;
+  --mg-series-default: #6aa6f8;
+  --mg-series-lift: 30%;
+}

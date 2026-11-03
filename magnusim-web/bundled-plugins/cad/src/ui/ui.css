@@ -1,0 +1,1802 @@
+/*
+ * UI shell recipes, re-created from the core (research/design-language.md §5;
+ * style.css line numbers cited per block). Class names follow the core's
+ * (tree-row, geo-head, tb-btn, ...) so parity checks can compare like with
+ * like. Panels, fields, buttons and inputs come from the host's UI kit
+ * (/plugin-sdk/plugin-ui.css, mgk-* classes); this file only adds to them.
+ * Colours only through var(--mg-*) / var(--cad-*) (src/styles/tokens.css).
+ * Owner: UI-SHELL.
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
+/* The core page has no line-height rule (normal); base.css sets 1.45. */
+.left-tree,
+.tree-detail,
+.toolbar,
+.cad-dock,
+.cad-ctx-menu {
+  line-height: normal;
+}
+
+/* ---- toolbar (style.css:133-224, 3746-3761) ---- */
+.toolbar {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  padding: 4px 10px;
+  background: var(--cad-toolbar-bg);
+  border-bottom: 1px solid var(--cad-toolbar-sep);
+  overflow-x: auto;
+  flex-shrink: 0;
+}
+
+.tb-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-right: 8px;
+  border-right: 1px solid var(--cad-toolbar-sep);
+}
+
+.tb-group:last-child {
+  border-right: none;
+}
+
+/* EDIT (Undo, Redo) sits at the right end. */
+.tb-group.is-end {
+  margin-left: auto;
+  padding-left: 8px;
+  padding-right: 0;
+  border-left: 1px solid var(--cad-toolbar-sep);
+  border-right: none;
+}
+
+.tb-group-label {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--cad-toolbar-label);
+}
+
+.tb-items {
+  display: flex;
+  gap: 2px;
+  align-items: stretch;
+}
+
+.tb-btn {
+  position: relative;
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  min-width: 64px;
+  max-width: 120px;
+  padding: 4px 6px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--mg-text-strong);
+  font-size: 10px;
+  line-height: 1.15;
+  cursor: default;
+}
+
+.tb-btn:hover {
+  background: var(--cad-toolbar-hover-bg);
+}
+
+.tb-btn.is-active {
+  background: var(--cad-toolbar-active-bg);
+  border-color: var(--cad-toolbar-active-border);
+}
+
+.tb-btn.is-disabled {
+  opacity: 0.45;
+  color: var(--cad-disabled-text);
+}
+
+.tb-btn.is-disabled:hover {
+  background: transparent;
+}
+
+/* The mode's primary action (sketch mode: Finish sketch), as the core's primary button. */
+.tb-btn.is-primary,
+.tb-btn.is-primary:hover {
+  background: var(--mg-primary);
+  border-color: var(--mg-primary);
+  color: var(--mg-primary-text);
+}
+
+.tb-btn.is-primary .tb-ico {
+  color: var(--mg-primary-text);
+}
+
+.tb-btn .tb-ico {
+  display: inline-flex;
+  width: 20px;
+  height: 20px;
+  align-items: center;
+  justify-content: center;
+  color: var(--mg-text-strong);
+}
+
+.tb-btn.is-active .tb-ico {
+  color: var(--cad-toolbar-active-icon);
+}
+
+.tb-btn .tb-svg {
+  display: block;
+  width: 18px;
+  height: 18px;
+}
+
+.tb-btn .tb-txt {
+  text-align: center;
+  /* One line (P4b fix round 1, sketch review P3: "Control-point spline" wrapped to two lines and
+     the buttons had uneven heights); a long label widens its button instead. */
+  white-space: nowrap;
+}
+
+/* Rearranging the toolbar (P4b fix round 1): the dragged command, and where it would land. */
+.tb-btn.is-dragging {
+  opacity: 0.5;
+}
+.tb-btn.is-drop-before {
+  box-shadow: inset 2px 0 0 var(--mg-primary);
+}
+.tb-btn.is-drop-after {
+  box-shadow: inset -2px 0 0 var(--mg-primary);
+}
+
+/* ---- UX 0.1.0 (TOOLBAR builder): dragging between a group's More and its bar (Toolbar.tsx
+   useToolbarDrag). Kept in this block. ---- */
+/* The insertion mark: a bar in the gap where the dragged command lands (drawn over the 2 px gap,
+   so it shows beside a highlighted command too). */
+.tb-btn.is-drop-before::after,
+.tb-btn.is-drop-after::after {
+  content: '';
+  position: absolute;
+  top: -2px;
+  bottom: -2px;
+  width: 3px;
+  border-radius: 2px;
+  background: var(--mg-primary);
+  pointer-events: none;
+}
+.tb-btn.is-drop-before::after {
+  left: -3px;
+}
+.tb-btn.is-drop-after::after {
+  right: -3px;
+}
+/* The command a drop from More would send to More: highlighted, its name in the note. */
+.tb-btn.is-displaced {
+  background: var(--mg-danger-bg);
+  border: 1px dashed var(--mg-danger);
+}
+/* A bar command over its group's More (the button or the open menu): it goes in there. */
+.cad-toolbar .tb-btn.tb-more.is-drop-into,
+.face-ctx-menu[data-drop-into] {
+  box-shadow: 0 0 0 2px var(--mg-primary);
+}
+/* Over another group: refused (a command stays in its own group). */
+.tb-group.is-drop-refused {
+  background: var(--mg-danger-bg);
+  border-radius: 4px;
+}
+html.cad-tb-drag,
+html.cad-tb-drag * {
+  cursor: grabbing !important;
+  user-select: none;
+}
+html.cad-tb-drag-refused,
+html.cad-tb-drag-refused * {
+  cursor: not-allowed !important;
+}
+/* The dragged command under the pointer, and the note on where it goes. */
+.tb-drag-ghost {
+  position: fixed;
+  z-index: 41;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  pointer-events: none;
+}
+.tb-drag-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border: 1px solid var(--cad-toolbar-active-border);
+  border-radius: 4px;
+  background: var(--mg-bg);
+  color: var(--mg-text-strong);
+  font: 600 12px/1.3 var(--mg-font);
+  box-shadow: var(--cad-menu-shadow);
+}
+.tb-drag-ico {
+  display: inline-flex;
+  width: 16px;
+  height: 16px;
+}
+.tb-drag-ghost.is-refused .tb-drag-chip {
+  border-color: var(--mg-danger);
+}
+/* Not allowed: a circle with a slash. */
+.tb-drag-no {
+  position: relative;
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--mg-danger);
+  border-radius: 50%;
+}
+.tb-drag-no::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: -1px;
+  width: 2px;
+  height: 12px;
+  margin-left: -1px;
+  background: var(--mg-danger);
+  transform: rotate(45deg);
+}
+.tb-drag-note {
+  padding: 4px 8px;
+  border-radius: 5px;
+  background: var(--mg-tooltip-bg);
+  color: var(--mg-tooltip-text);
+  font: 400 12px/1.45 var(--mg-font);
+  box-shadow: var(--mg-shadow-tooltip);
+  /* The host tooltip's edge (style.css .mat-k-tip): none in light, a line in dark, where its shadow
+     is lost on the dark view and toolbar. */
+  outline: 1px solid var(--mg-tooltip-edge, transparent);
+  white-space: nowrap;
+}
+/* SCALE MODELS' two-word heading stays on one line. */
+.tb-group[data-group='scale'] .tb-group-label {
+  white-space: nowrap;
+}
+/* ---- end UX 0.1.0 (TOOLBAR) ---- */
+
+/* ---- v0.5.0 ribbon (Toolbar.tsx; Daniel: the buttons stacked as SolidWorks's CommandManager,
+   resizable as Excel's). Each group's buttons sit in rows (three by default; the person drags the
+   bottom edge for one to four), column by column: a large button (the group's key tool, the
+   primary action; three rows or more) is the rows tall, a 28 px icon with its name under it; a
+   small button is one row, an 18 px icon with its name beside it, or its icon alone (CONSTRAIN; a
+   group whose names went for the width, is-icons). Every size follows one scale factor,
+   --cad-toolbar-scale (tokens.css, 1; Toolbar.tsx setToolbarScale is where the host's appearance
+   setting is to be wired in). ---- */
+.cad-toolbar.is-ribbon {
+  --tb-s: var(--cad-toolbar-scale, 1);
+  --tb-row: calc(22px * var(--tb-s));
+  --tb-ico-small: calc(18px * var(--tb-s));
+  --tb-ico-large: calc(28px * var(--tb-s));
+  --tb-font: calc(11px * var(--tb-s));
+  --tb-head: calc(10px * var(--tb-s));
+  --tb-line: calc(13px * var(--tb-s));
+  position: relative;
+  gap: calc(6px * var(--tb-s));
+  padding: calc(3px * var(--tb-s)) calc(8px * var(--tb-s)) calc(5px * var(--tb-s));
+  align-items: stretch;
+}
+.cad-toolbar.is-ribbon .tb-group {
+  position: relative;
+  gap: calc(2px * var(--tb-s));
+  padding-right: calc(6px * var(--tb-s));
+}
+.cad-toolbar.is-ribbon .tb-group.is-end {
+  padding-left: calc(6px * var(--tb-s));
+  padding-right: 0;
+}
+.cad-toolbar.is-ribbon .tb-group-label {
+  height: calc(12px * var(--tb-s));
+  line-height: calc(12px * var(--tb-s));
+  font-size: var(--tb-head);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cad-toolbar.is-ribbon .tb-items {
+  display: grid;
+  grid-template-rows: repeat(var(--tb-rows, 3), var(--tb-row));
+  grid-auto-flow: column;
+  grid-auto-columns: max-content;
+  gap: 1px calc(2px * var(--tb-s));
+  align-items: stretch;
+}
+/* A group the person narrowed (its width set): what does not fit went into its More. */
+.cad-toolbar.is-ribbon .tb-items.is-sized {
+  overflow: hidden;
+}
+/* Every button of the ribbon (the core's .tb-btn sizes are for its one-line toolbar). */
+.cad-toolbar.is-ribbon .tb-btn {
+  min-width: 0;
+  max-width: none;
+  font-size: var(--tb-font);
+  line-height: 1.15;
+}
+/* A large button: the rows tall, the icon over its name (two lines at most). */
+.cad-toolbar.is-ribbon .tb-btn.is-large {
+  grid-row: span var(--tb-rows, 3);
+  justify-content: flex-start;
+  gap: calc(2px * var(--tb-s));
+  min-width: calc(46px * var(--tb-s));
+  /* Narrow enough that a two-word name breaks into two short lines with little room beside them
+     ("Linear / pattern", "Import / STEP"). */
+  max-width: calc(60px * var(--tb-s));
+  padding: calc(4px * var(--tb-s)) calc(3px * var(--tb-s)) calc(2px * var(--tb-s));
+}
+.cad-toolbar.is-ribbon .tb-btn.is-large .tb-ico {
+  width: calc(var(--tb-ico-large) + 2px);
+  height: calc(var(--tb-ico-large) + 2px);
+  flex: none;
+}
+.cad-toolbar.is-ribbon .tb-btn.is-large .tb-svg {
+  width: var(--tb-ico-large);
+  height: var(--tb-ico-large);
+}
+.cad-toolbar.is-ribbon .tb-btn.is-large .tb-txt {
+  white-space: normal;
+  overflow-wrap: normal;
+  text-wrap: balance;
+  line-height: var(--tb-line);
+}
+/* A small button: one row, the icon and its name side by side. */
+.cad-toolbar.is-ribbon .tb-btn.is-small {
+  flex-direction: row;
+  justify-content: flex-start;
+  gap: calc(4px * var(--tb-s));
+  height: var(--tb-row);
+  min-width: var(--tb-row);
+  padding: 0 calc(6px * var(--tb-s)) 0 calc(2px * var(--tb-s));
+  border-radius: 3px;
+}
+.cad-toolbar.is-ribbon .tb-btn.is-small .tb-ico {
+  width: var(--tb-ico-small);
+  height: var(--tb-ico-small);
+  flex: none;
+}
+.cad-toolbar.is-ribbon .tb-btn.is-small .tb-svg {
+  width: var(--tb-ico-small);
+  height: var(--tb-ico-small);
+}
+/* Small buttons as icons alone: CONSTRAIN (its glyphs, by design), a group whose names went for the
+   width, VIEW and EDIT once the frame is narrow. The name stays the tooltip and the accessible name. */
+.cad-toolbar.is-ribbon .tb-group.is-icons .tb-btn.is-small {
+  width: var(--tb-row);
+  padding: 0 calc(2px * var(--tb-s));
+  justify-content: center;
+}
+.cad-toolbar.is-ribbon .tb-group.is-icons .tb-btn.is-small .tb-txt {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+/* A flyout (src/ui/flyouts.ts): its button and arrow as one item, the arrow beside a small button
+   and under a large one (a strip across it), as SolidWorks's split buttons. */
+.cad-toolbar.is-ribbon .tb-split {
+  display: flex;
+  min-width: 0;
+}
+.cad-toolbar.is-ribbon .tb-split.is-large {
+  grid-row: span var(--tb-rows, 3);
+  flex-direction: column;
+}
+.cad-toolbar.is-ribbon .tb-split.is-large > .tb-btn.is-large {
+  flex: 1 1 auto;
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+}
+.cad-toolbar.is-ribbon .tb-split.is-small > .tb-btn.is-small {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+  padding-right: calc(3px * var(--tb-s));
+}
+.cad-toolbar.is-ribbon .tb-group.is-icons .tb-split.is-small > .tb-btn.is-small {
+  padding-right: calc(2px * var(--tb-s));
+}
+.cad-toolbar.is-ribbon .tb-btn.tb-flyout-arrow {
+  flex: none;
+  min-width: 0;
+  padding: 0;
+  font-size: calc(10px * var(--tb-s));
+  color: var(--mg-text-muted);
+}
+.cad-toolbar.is-ribbon .tb-split.is-small > .tb-flyout-arrow {
+  width: calc(12px * var(--tb-s));
+  height: var(--tb-row);
+  border-radius: 0 3px 3px 0;
+}
+.cad-toolbar.is-ribbon .tb-split.is-large > .tb-flyout-arrow {
+  width: 100%;
+  height: calc(12px * var(--tb-s));
+  border-radius: 0 0 4px 4px;
+}
+.tb-flyout-arrow .tb-caret {
+  line-height: 1;
+}
+/* Hovering either half shows the pair as one control. */
+.cad-toolbar.is-ribbon .tb-split:hover > .tb-btn:not(.is-disabled):not(.is-active) {
+  background: var(--cad-toolbar-hover-bg);
+}
+.cad-toolbar .tb-btn.tb-flyout-arrow.is-open {
+  background: var(--cad-toolbar-hover-bg);
+}
+
+/* A group's "More ▾" (FOLD_ORDER, or a narrowed group): its folded commands, in a menu; one of the
+   small buttons. */
+.cad-toolbar .tb-btn.tb-more.is-open,
+.cad-toolbar .tb-btn.tb-group-menu.is-open {
+  background: var(--cad-toolbar-hover-bg);
+}
+.tb-btn.tb-more .tb-txt,
+.tb-btn.tb-group-menu .tb-txt {
+  white-space: nowrap;
+}
+.tb-btn.tb-more .tb-caret,
+.tb-btn.tb-group-menu .tb-caret {
+  font-size: calc(10px * var(--cad-toolbar-scale, 1));
+  line-height: 1;
+}
+
+/* The line between two groups (the group's right separator): a col-resize handle over it, as
+   Excel's ribbon; the toolbar's bottom edge: a row-resize handle. */
+.cad-toolbar.is-ribbon .tb-resize {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  right: calc(-3px * var(--tb-s) - 3px);
+  width: 7px;
+  z-index: 1;
+  cursor: col-resize;
+  touch-action: none;
+}
+.cad-toolbar.is-ribbon .tb-group.is-end .tb-resize {
+  right: auto;
+  left: -4px;
+}
+.cad-toolbar.is-ribbon .tb-resize:hover,
+.cad-toolbar.is-ribbon .tb-resize:focus-visible {
+  background: linear-gradient(to right, transparent 2px, var(--cad-toolbar-active-border) 2px, var(--cad-toolbar-active-border) 5px, transparent 5px);
+  outline: none;
+}
+.cad-toolbar.is-ribbon .tb-rows-handle {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 5px;
+  cursor: row-resize;
+  touch-action: none;
+}
+.cad-toolbar.is-ribbon .tb-rows-handle:hover,
+.cad-toolbar.is-ribbon .tb-rows-handle:focus-visible {
+  background: var(--cad-toolbar-active-border);
+  outline: none;
+}
+html.cad-tb-resizing,
+html.cad-tb-resizing * {
+  cursor: col-resize !important;
+  user-select: none;
+}
+html.cad-tb-resizing-rows,
+html.cad-tb-resizing-rows * {
+  cursor: row-resize !important;
+  user-select: none;
+}
+
+/* Where a dragged command lands among small buttons (stacked in a column): a bar over or under it. */
+.cad-toolbar.is-ribbon .tb-btn.is-small.is-drop-before::after,
+.cad-toolbar.is-ribbon .tb-btn.is-small.is-drop-after::after {
+  left: 0;
+  right: 0;
+  width: auto;
+  height: 3px;
+}
+.cad-toolbar.is-ribbon .tb-btn.is-small.is-drop-before::after {
+  top: -2px;
+  bottom: auto;
+}
+.cad-toolbar.is-ribbon .tb-btn.is-small.is-drop-after::after {
+  top: auto;
+  bottom: -2px;
+}
+
+/* Wider text than measured, or a narrow frame (Toolbar useFitLevel): once every foldable command
+   is folded the groups sit closer, then collapse into one dropdown each (is-collapsed: a button
+   with the group's name, SolidWorks at narrow widths). */
+.cad-toolbar.is-ribbon.is-fit-tight {
+  gap: calc(3px * var(--tb-s));
+  padding-left: calc(4px * var(--tb-s));
+  padding-right: calc(4px * var(--tb-s));
+}
+.cad-toolbar.is-ribbon.is-fit-tight .tb-group {
+  padding-right: calc(4px * var(--tb-s));
+}
+.cad-toolbar.is-ribbon.is-fit-tight .tb-group.is-end {
+  padding-left: calc(4px * var(--tb-s));
+  padding-right: 0;
+}
+
+/* A command in a menu (the toolbar's More menus): icon, label, and its shortcut at the right. */
+.face-ctx-menu button.cad-menu-cmd {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.face-ctx-menu .cad-menu-ico {
+  display: inline-flex;
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  color: var(--mg-text-strong);
+}
+.face-ctx-menu button[aria-disabled] .cad-menu-ico {
+  color: var(--mg-text-subtle);
+}
+.face-ctx-menu .cad-menu-key {
+  margin-left: auto;
+  padding-left: 18px;
+  font: 500 11px/1 var(--mg-font);
+  color: var(--mg-text-subtle);
+}
+.face-ctx-menu button.cad-menu-cmd.is-active {
+  background: var(--cad-toolbar-active-bg);
+}
+
+/* ---- tree card (style.css:437-457, 665-805, 829-837, 2531-2540, 2634-2639) ---- */
+/* One width, whatever the rows hold: a long name ends in an ellipsis, and a glyph that comes
+   (a warning in History) moves nothing beside the card. Review P2/P3 round 4: it followed its
+   content and grew from 232 to 250 px, pushing the open panel 18 px right. */
+.left-tree {
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+  width: 240px;
+  min-width: 220px;
+  max-width: min(320px, 38vw);
+  flex: 0 0 auto;
+  max-height: 100%;
+  overflow: auto;
+  padding: 4px 0 8px;
+  font-size: 12px;
+  background: var(--mg-bg);
+  border: 1px solid var(--mg-card-border);
+  border-radius: var(--mg-radius-md);
+  box-shadow: var(--mg-shadow-md);
+}
+
+/* Sections are divided as the core's SIMULATIONS / STUDIES sections are
+   (style.css:2624-2633, 3829-3834, 4996-5003): a light line above, a firmer one
+   below; the card's first section has no line above (2527-2530). */
+.tree-section {
+  padding: 8px 10px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--cad-tree-section);
+  border-top: 1px solid var(--cad-tree-section-top);
+  border-bottom: 1px solid var(--cad-tree-section-bottom);
+}
+
+.left-tree > .tree-section:first-child {
+  border-top: none;
+}
+
+.geo-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--cad-tree-head);
+  margin-bottom: 6px;
+}
+
+.tree-root,
+.tree-root ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+/* The list starts 6px below the head, as in the core's sections (style.css:2629-2633). */
+.tree-section > .tree-root {
+  margin-top: 6px;
+}
+
+.tree-root ul {
+  padding-left: 18px;
+}
+
+.tree-node:not(.expanded) > ul {
+  display: none;
+}
+
+/* Rows take their text from .tree-section (11px / 600 / #4a5160), as in the
+   core, where every tree row sits in a .tree-section (style.css:829-837): the
+   core page computes exactly that (e2e/cad-p1-document.spec.js compares). */
+.tree-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  min-height: 24px;
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.tree-row:hover {
+  background: var(--mg-surface-muted);
+}
+
+.tree-node.selected > .tree-row {
+  background: var(--cad-tree-selected);
+}
+
+.tw {
+  width: 18px;
+  min-height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--cad-tree-twisty);
+  flex-shrink: 0;
+}
+
+/* A leaf's empty twisty column keeps icons in line without making the row taller. */
+.tw:empty {
+  min-height: 0;
+}
+
+/* A long name ends in an ellipsis inside the card (the core's plugin-study rows
+   do the same, style.css:5012); the row's badge, sub text and buttons keep
+   their size beside it. The full name is the label's tooltip when it is cut. */
+.tl {
+  white-space: nowrap;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tree-row .tree-ico {
+  color: var(--mg-text-secondary);
+}
+
+.tree-row .tree-sub {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--mg-text-muted);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.tree-row .tree-acts {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+  flex-shrink: 0;
+}
+
+.tree-row .tree-sub + .tree-acts {
+  margin-left: 4px;
+}
+
+.sim-empty {
+  color: var(--cad-tree-empty);
+  font-size: 11px;
+  list-style: none;
+  padding: 2px 0;
+}
+
+.cad-tree-error {
+  list-style: none;
+  padding: 2px 0;
+  font-weight: 400;
+  white-space: normal;
+}
+
+/* In a folder: under the children's icons (row padding 8 + twisty column 18 + gap 6). */
+.tree-root ul > .sim-empty {
+  padding-left: 32px;
+}
+
+.cad-icon {
+  flex-shrink: 0;
+}
+
+/* The part's own row: a heading, not a control. */
+.tree-node.is-part > .tree-row {
+  font-weight: 650;
+  cursor: default;
+}
+
+.tree-node.is-part > .tree-row:hover {
+  background: transparent;
+}
+
+/* History row states (proposal §3.1). */
+.tree-node.is-rolled-back > .tree-row {
+  opacity: var(--cad-tree-dim);
+}
+
+.tree-node.is-suppressed > .tree-row .tl,
+.tree-node.is-suppressed > .tree-row .tree-ico {
+  color: var(--mg-text-subtle);
+}
+
+.tree-node.is-suppressed > .tree-row .tl {
+  text-decoration: line-through;
+}
+
+.tree-node.is-error > .tree-row .tl {
+  color: var(--mg-danger);
+}
+
+.tree-node.is-warning > .tree-row .tl {
+  color: var(--mg-warning);
+}
+
+.tree-node.is-related > .tree-row {
+  background: var(--mg-selected-bg);
+}
+
+.tree-node.is-hidden-body > .tree-row .cad-body-name,
+.tree-node.is-hidden-body > .tree-row .cad-swatch {
+  opacity: var(--cad-tree-dim);
+}
+
+/* A hidden sketch or reference (its eye closed): name and icon dimmed, as a hidden body's. */
+.tree-node.is-hidden-feature > .tree-row .tl,
+.tree-node.is-hidden-feature > .tree-row .tree-ico {
+  opacity: var(--cad-tree-dim);
+}
+
+.cad-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+
+.cad-badge:hover {
+  background: transparent;
+}
+
+.cad-badge.is-warning {
+  color: var(--mg-warning);
+}
+
+/* A note (a Join's pieces left apart): said, not wrong, so quieter than a warning. */
+.cad-badge.is-note {
+  color: var(--mg-text-muted);
+}
+
+.cad-badge.is-note:hover,
+.cad-badge.is-note:focus-visible {
+  color: var(--mg-text);
+}
+
+/* A see-through body (INSPECT > See-through, an Enclosure's air): a quiet mark of its own, not a
+   hidden body's dimmed name (a hidden body can be see-through too). It says so; the menu acts. */
+.cad-badge.is-see-through {
+  color: var(--mg-text-muted);
+  cursor: default;
+}
+
+.cad-badge.is-see-through:hover,
+.cad-badge.is-see-through:focus-visible {
+  color: var(--mg-text);
+}
+
+.cad-badge-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--mg-danger);
+}
+
+.cad-swatch {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  margin-right: 6px;
+  border: 1px solid var(--cad-body-swatch-border);
+  border-radius: 2px;
+  vertical-align: -1px;
+}
+
+/* The swatch opens the body's colour picker: the input sits over it, invisible, so a click opens it. */
+.cad-swatch-pick {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  cursor: pointer;
+}
+
+.cad-swatch-pick .cad-swatch-input {
+  position: absolute;
+  inset: 0;
+  width: 10px;
+  height: 10px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.cad-swatch-pick .cad-swatch-input:disabled {
+  cursor: default;
+}
+
+.cad-swatch-pick:focus-within .cad-swatch {
+  outline: 2px solid var(--mg-primary);
+  outline-offset: 1px;
+}
+
+/* A feature row dragged in the history: where it goes (before or after the row under the pointer). */
+.tree-node.is-drop-before > .tree-row {
+  box-shadow: inset 0 2px 0 var(--mg-primary);
+}
+
+.tree-node.is-drop-after > .tree-row {
+  box-shadow: inset 0 -2px 0 var(--mg-primary);
+}
+
+.tree-node.is-dragged > .tree-row {
+  opacity: 0.5;
+}
+
+/* Rollback bar: 2 px #3d6fd6 line with a grab handle (drag-reorder styling, style.css:2891-2897). */
+.cad-rollback {
+  display: flex;
+  align-items: center;
+  height: 10px;
+  margin: 1px 0;
+  padding: 0 8px 0 4px;
+  list-style: none;
+  cursor: grab;
+  outline: none;
+  touch-action: none;
+}
+
+.cad-rollback.is-dragging {
+  cursor: grabbing;
+}
+
+.cad-rollback-grip {
+  flex-shrink: 0;
+  width: 18px;
+  height: 8px;
+  margin-right: 2px;
+  border: 1.5px solid var(--cad-rollback);
+  border-radius: var(--mg-radius-pill);
+  background: var(--cad-rollback-handle-bg);
+}
+
+.cad-rollback-line {
+  flex: 1;
+  height: 2px;
+  border-radius: 1px;
+  background: var(--cad-rollback);
+}
+
+.cad-rollback:hover .cad-rollback-line,
+.cad-rollback.is-dragging .cad-rollback-line,
+.cad-rollback:focus-visible .cad-rollback-line {
+  height: 3px;
+}
+
+.cad-rollback:focus-visible {
+  outline: 2px solid var(--mg-focus);
+  outline-offset: 1px;
+  border-radius: 3px;
+}
+
+/* ---- icon buttons, rename (style.css:2971-3000) ---- */
+.mesh-rename {
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--cad-icon-btn);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.mesh-rename.is-row {
+  width: 20px;
+  height: 20px;
+}
+
+.mesh-rename:hover,
+.mesh-rename:focus-visible {
+  background: var(--cad-icon-btn-hover-bg);
+  color: var(--mg-text-strong);
+  outline: none;
+}
+
+.mesh-rename.is-disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.mesh-title-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.mesh-title-row .mgk-panel-title {
+  min-width: 0;
+}
+
+/* A panel the Assistant fills: its badge after the title (the panel is read-only for the person). */
+.cad-panel-badge {
+  flex: none;
+  padding: 1px 6px;
+  border: 1px solid var(--mg-selected-border);
+  border-radius: var(--mg-radius-pill);
+  background: var(--mg-selected-bg);
+  color: var(--mg-primary-ink, #1570ef);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 14px;
+}
+
+.mesh-rename-input {
+  width: 160px;
+  max-width: 70%;
+  border: 1px solid var(--mg-control-border);
+  border-radius: 4px;
+  padding: 3px 6px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--mg-text);
+}
+
+.cad-rename-wrap {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.cad-rename-wrap .mesh-rename-input {
+  max-width: none;
+}
+
+.cad-row-rename {
+  width: 150px;
+  padding: 1px 4px;
+  border: 1px solid var(--mg-control-border);
+  border-radius: 3px;
+  font-size: 12px;
+  color: var(--mg-text);
+}
+
+.mesh-rename-input.is-invalid,
+.cad-row-rename.is-invalid {
+  border-color: var(--mg-danger);
+}
+
+.cad-rename-err {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--mg-danger);
+  white-space: normal;
+}
+
+/* In a tree row the reason wraps to the input's width: it must not widen the
+   tree card (review round 2: 231 -> 252 px while it showed). */
+.cad-rename-wrap.is-inline .cad-rename-err {
+  width: 0;
+  min-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+/* ---- flyout panel (style.css:459-512, 2899-2906, 2948-3081) ---- */
+.tree-detail {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  width: max-content;
+  min-width: 260px;
+  max-width: min(360px, 40vw);
+  height: max-content;
+  max-height: 100%;
+  padding: 0;
+  overflow: visible;
+  font-size: 12px;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  pointer-events: none;
+}
+
+.tree-detail.is-wide {
+  max-width: min(520px, 60vw);
+}
+
+.tree-detail > * {
+  pointer-events: auto;
+}
+
+/* ---- panels, fields, buttons, inputs: the host's UI kit ----
+ * PanelChrome, Field, Select, Hint, DisabledReason, EmptyState, Toggle, the
+ * buttons and the number fields are drawn by /plugin-sdk/plugin-ui.css (the
+ * kit's mgk-* classes, held equal to the core by the kit's parity gate). Only
+ * what CAD adds is here. */
+
+/* The flyout's panel: as tall as the stage allows (the column above the dock, however tall the
+   dock's chips are), its head and its foot (Delete, Done) always in view; the body (and the note
+   above the foot) scroll between them. The whole panel used to scroll, so Done ran off the
+   bottom when the content was taller than the room: Linux CI's wider DejaVu Sans at 1280 x 800
+   left 30 % of Done out of view (SD review 2's Enclosure). */
+.tree-detail > .cad-panel {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  min-height: 0;
+  max-height: calc(100vh - 120px);
+  overflow: hidden;
+}
+
+.tree-detail > .cad-panel > .mgk-panel-head,
+.tree-detail > .cad-panel > .mgk-panel-foot {
+  flex: none;
+}
+
+/* The fields' wrapper (inert on a panel the Assistant fills) lays out as if it were not there. */
+.cad-panel-fields {
+  display: contents;
+}
+
+/* The body scrolls; a 3 px pad (given back by the margins) keeps the inputs' focus rings whole at its edges. */
+.tree-detail > .cad-panel > .mgk-panel-body {
+  flex: 0 1 auto;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding: 3px;
+  margin: -3px;
+}
+
+.tree-detail > .cad-panel > .cad-panel-note {
+  flex: 0 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+/* A feature or tool panel is the core's fixed 360 px (style.css: .tree-detail > #panel-mesh-form),
+   whatever its content (SD review round 1: Extrude 310, Combine 330, Enclosure 360 px).
+   Parameters (is-wide) sizes to its table. */
+.tree-detail:not(.is-wide) > .cad-panel {
+  width: min(360px, 40vw);
+  box-sizing: border-box;
+}
+
+/* The 3 px accent bar (feature / sketch panels). */
+.cad-panel.is-accent-feature {
+  border-left: 3px solid var(--cad-panel-accent-feature);
+}
+
+.cad-panel.is-accent-sketch {
+  border-left: 3px solid var(--cad-panel-accent-sketch);
+}
+
+.cad-field-group + .cad-field-group,
+.cad-field-group + .cad-field {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--mg-divider);
+}
+
+.cad-field-group-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--cad-tree-head);
+  margin-bottom: 2px;
+}
+
+.cad-not-applied {
+  color: var(--mg-warning);
+}
+
+/* The note line above the foot: reasons, warnings, "Not applied". */
+.cad-panel-note {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 10px;
+}
+
+/* A destructive text action (Delete a constraint): the kit's link, in red. */
+button.mgk-btn.cad-btn-danger,
+button.mgk-btn.cad-btn-danger:hover {
+  color: var(--mg-danger);
+}
+
+/* A link that looks as the kit's button (the Picture panel's Save PNG, a download): the kit styles
+   only button.mgk-btn (magnusim-web/src/plugin-ui/styles/button.css), so an <a> took the browser's
+   link blue and underline. Its base rule (a button in the browser's button font, which the kit
+   reverts to) and its secondary variant, for an <a>; visited, under the pointer, pressed and
+   focused as the button is. */
+a.mgk-btn {
+  display: inline-block;
+  margin: 0;
+  font: -webkit-small-control;
+  font-size: var(--mg-text-sm);
+  text-align: center;
+  text-decoration: none;
+  cursor: pointer;
+}
+/* The browser's focus ring, as the kit's button has it (the browser sets a link's 1 px out). */
+a.mgk-btn:focus-visible {
+  outline: revert;
+  outline-offset: 0;
+}
+a.mgk-btn--secondary,
+a.mgk-btn--secondary:hover,
+a.mgk-btn--secondary:active {
+  border: 1px solid var(--mg-control-border);
+  border-radius: var(--mg-radius-sm);
+  padding: 4px 8px;
+  background: var(--mg-bg);
+  color: var(--mg-text-strong);
+}
+a.mgk-btn--secondary:visited {
+  color: var(--mg-text-strong);
+}
+
+/* A button that cannot act stays focusable (aria-disabled) so its reason can be
+   read; it looks as the kit's disabled buttons do. */
+button.mgk-btn[aria-disabled="true"] {
+  opacity: var(--mg-disabled-opacity);
+  cursor: not-allowed;
+}
+
+button.mgk-btn--primary[aria-disabled="true"] {
+  border-color: var(--mg-btn-disabled-bg);
+  background: var(--mg-btn-disabled-bg);
+}
+
+button.mgk-btn--neutral[aria-disabled="true"] {
+  background: var(--mg-btn-neutral-bg);
+  /* The kit's Done keeps the browser's button text colour, which is dimmed when disabled. */
+  color: var(--cad-disabled-button-text);
+}
+
+button.mgk-btn--link[aria-disabled="true"]:hover {
+  text-decoration: none;
+}
+
+/* NumberUnitInput: an expression field is wider than the kit's 72 px, its unit
+   keeps the fields in line, and "= 12.5 mm" or the reason sits after or under it. */
+.nui {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+}
+
+.nui .mgk-input {
+  width: 96px;
+}
+
+.nui .mgk-unit {
+  min-width: 18px;
+  text-align: left;
+}
+
+.nui-eq {
+  color: var(--mg-text-muted);
+  font-size: 11px;
+  font-weight: 400;
+  white-space: nowrap;
+}
+
+.nui.is-invalid .mgk-input {
+  border-color: var(--mg-danger);
+  background: var(--mg-danger-bg);
+}
+
+/* Under a reason the row's label stays level with its input (the kit centres it on the input and
+   the reason together: SD review round 2, "−X" sat half a line below its field). */
+.cad-field > .mgk-field:has(.nui-error) {
+  align-items: baseline;
+}
+
+.nui-error {
+  max-width: 220px;
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--mg-danger);
+  text-align: right;
+  white-space: normal;
+}
+
+/* A reason's bracketed bound stays on one line ("(x ≥ 40 mm)"; SD final review: "(x" then "≥ 40 mm)"). */
+.nui-keep {
+  white-space: nowrap;
+}
+
+/* ---- parameters table ---- */
+.cad-params {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.cad-params th {
+  padding: 0 4px 4px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--mg-text-muted);
+  text-align: left;
+}
+
+.cad-params td {
+  padding: 2px 4px;
+  vertical-align: middle;
+}
+
+.cad-params .nui {
+  align-items: flex-start;
+}
+
+.cad-params .nui .mgk-input,
+input.mgk-input.cad-param-expr {
+  width: 130px;
+}
+
+.cad-params .nui-error {
+  max-width: 150px;
+  text-align: left;
+}
+
+input.mgk-input.cad-param-name {
+  width: 96px;
+}
+
+.cad-param-value {
+  min-width: 64px;
+  color: var(--mg-text);
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.cad-param-value.is-error {
+  color: var(--mg-danger);
+}
+
+.cad-params td.cad-param-err {
+  padding-top: 0;
+  font-size: 11px;
+  color: var(--mg-danger);
+  white-space: normal;
+}
+
+/* A parameter's comment, under its row. */
+.cad-params tr.cad-param-comment-row > td {
+  padding-top: 0;
+}
+
+input.mgk-input.cad-param-comment {
+  width: 100%;
+  box-sizing: border-box;
+  font-size: 11px;
+  color: var(--mg-text-muted);
+}
+
+.cad-param-add td {
+  padding-top: 8px;
+  border-top: 1px solid var(--mg-divider);
+}
+
+/* A row an Assistant step just changed (ParametersPanel FLASH_MS). */
+.cad-params tr[data-param-changed] > td {
+  background: var(--mg-selected-bg);
+}
+
+.cad-param-add-actions td {
+  padding-top: 6px;
+}
+
+.cad-sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+/* ---- context menu (.face-ctx-menu, style.css:994-1031) ---- */
+.face-ctx-menu {
+  position: fixed;
+  z-index: 40;
+  min-width: 148px;
+  padding: 4px;
+  background: var(--mg-bg);
+  border: 1px solid var(--mg-border);
+  border-radius: 6px;
+  box-shadow: var(--cad-menu-shadow);
+  font: 600 12px/1.3 var(--mg-font);
+}
+
+/* The menu takes the keyboard while a disabled item is hovered: no ring on it. */
+.face-ctx-menu:focus {
+  outline: none;
+}
+.face-ctx-menu button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: 0;
+  background: transparent;
+  color: var(--mg-text);
+  padding: 7px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  font: inherit;
+}
+
+.face-ctx-menu button:hover:not([aria-disabled]),
+.face-ctx-menu button:focus-visible:not([aria-disabled]) {
+  background: var(--cad-menu-hover);
+  outline: none;
+}
+
+.face-ctx-menu button[aria-disabled] {
+  color: var(--mg-text-subtle);
+  cursor: default;
+}
+
+.face-ctx-menu button[aria-disabled]:hover {
+  background: transparent;
+}
+
+.face-ctx-menu button.is-danger:not([aria-disabled]) {
+  color: var(--mg-danger);
+}
+
+.face-ctx-sep {
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--cad-menu-sep);
+}
+
+/* ---- tooltip (.mat-k-tip, style.css:2932-2941) ---- */
+.cad-tip {
+  position: fixed;
+  z-index: 40;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 8px;
+  max-width: 260px;
+  padding: 7px 9px;
+  border-radius: 5px;
+  background: var(--mg-tooltip-bg);
+  color: var(--mg-tooltip-text);
+  font: 400 12px/1.45 var(--mg-font);
+  box-shadow: var(--mg-shadow-tooltip);
+  /* The host tooltip's edge, as .mat-k-tip has it: transparent in light, a line in dark. */
+  outline: 1px solid var(--mg-tooltip-edge, transparent);
+  pointer-events: none;
+}
+
+.cad-tip-key {
+  padding: 0 4px;
+  border: 1px solid var(--cad-tip-key-border);
+  border-radius: 3px;
+  font: 600 11px/1.4 var(--mg-font);
+}
+
+.cad-tip-detail {
+  flex-basis: 100%;
+  color: var(--cad-tip-detail);
+  /* Lines of their own (a warning, then the row's note). */
+  white-space: pre-line;
+}
+
+/* ---- chips (style.css:1070-1140) ---- */
+/* The core's .measure-chip (style.css:1093-1106): 8/10/8/12 padding, 600 12px/1.35 Segoe UI. */
+.cad-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px 8px 12px;
+  background: var(--mg-bg);
+  border: 1px solid var(--mg-border);
+  border-radius: 6px;
+  box-shadow: var(--mg-shadow-sm);
+  font: 600 12px/1.35 "Segoe UI", system-ui, sans-serif;
+  color: var(--mg-text-body);
+}
+
+.cad-chip.is-error {
+  color: var(--mg-danger);
+  border-color: var(--mg-danger-border);
+  background: var(--mg-danger-bg);
+}
+
+.cad-chip.is-warning {
+  color: var(--mg-warning);
+  border-color: var(--cad-warning-border);
+  background: var(--mg-warning-bg);
+}
+
+.cad-chip-k {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--mg-text-muted);
+}
+
+.cad-chip-v {
+  color: var(--mg-text);
+}
+
+.cad-chip.is-error .cad-chip-v,
+.cad-chip.is-warning .cad-chip-v {
+  color: inherit;
+}
+
+.cad-chip-which {
+  color: var(--mg-text-body);
+}
+
+/* A long body name ends in an ellipsis (the full name is the tooltip), so the
+   dock never reaches the viewport buttons on the right (review round 2). */
+.cad-chip-name {
+  display: inline-block;
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+}
+
+/* P4a: several bodies, each with its own volume (never added together): shorter names. */
+.cad-chip-list .cad-chip-name {
+  max-width: 120px;
+}
+
+.cad-chip-hidden {
+  color: var(--mg-text-muted);
+}
+
+/* The volume chip has its own cap, so its width never depends on the font a platform falls back
+   to (Linux draws "Segoe UI" as DejaVu Sans, which is wider): the name gives way first. */
+.cad-chip[data-chip="volume"] {
+  max-width: 320px;
+}
+
+.cad-chip[data-chip="volume"] .cad-chip-v {
+  display: flex;
+  align-items: baseline;
+  min-width: 0;
+  white-space: pre;
+}
+
+.cad-chip[data-chip="volume"] .cad-chip-which {
+  display: flex;
+  min-width: 0;
+  flex: 0 1 auto;
+}
+
+.cad-chip[data-chip="volume"] .cad-chip-name {
+  min-width: 0;
+  flex: 0 1 auto;
+}
+
+.cad-chip-link {
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--mg-link-strong);
+  font: inherit;
+  font-weight: 600;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+/* The Assistant's chip: its words wrap within the dock; its actions are 24 px targets, Stop set
+   apart from Pause (an irreversible action beside a reversible one). */
+.cad-assistant-chip {
+  max-width: 100%;
+  flex-wrap: wrap;
+  row-gap: 2px;
+}
+
+.cad-assistant-chip .cad-chip-v {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.cad-assistant-chip .cad-chip-link {
+  min-height: 24px;
+  padding: 0 4px;
+}
+
+.cad-assistant-chip [data-assistant-action="stop"] {
+  margin-left: 8px;
+}
+
+.cad-chip-link:hover {
+  background: none;
+  color: var(--mg-link-strong-hover);
+}
+
+.tree-spin {
+  width: 11px;
+  height: 11px;
+  border: 1.5px solid var(--cad-spin-track);
+  border-top-color: var(--cad-rollback);
+  border-radius: 50%;
+  animation: cad-spin 0.7s linear infinite;
+  flex-shrink: 0;
+}
+
+@keyframes cad-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tree-spin {
+    animation: none;
+    border-right-color: var(--cad-rollback);
+  }
+}
+
+/* Renaming in place: the field and its error are not cut by the label's ellipsis. */
+.tl:has(> .cad-rename-wrap) {
+  overflow: visible;
+}
+
+/* P4b SELECT: a state item of a context menu (menuitemcheckbox): its check mark column. */
+.face-ctx-menu .cad-menu-check {
+  display: inline-block;
+  width: 14px;
+  margin-right: 4px;
+  text-align: center;
+  font-weight: 700;
+}
+.face-ctx-menu .cad-menu-check[data-on]::before {
+  content: '\2713';
+}
+
+/* ==== ux010 PANELS (begin): the tree card and the Sketch panel collapse sideways into slim rails
+   at the left edge of the view (src/ui/left-rails.ts, src/ui/tree/TreeRail.tsx, src/sketch/rail.tsx). ==== */
+
+/* Only rails in the column: one above the other at the left edge. On a short frame they shrink (their
+   labels take the cut) and never run under the dock's chips (review 5). */
+.cad-float-stack.is-rails {
+  flex-direction: column;
+}
+
+.cad-float-stack.is-rails > * {
+  flex: 0 1 auto;
+  min-height: 0;
+}
+
+/* Until the prefs are read the column is not drawn (review 6: a stored rail showed the card first). */
+.cad-float-stack.is-pending {
+  visibility: hidden;
+}
+
+.tree-detail.is-rail {
+  min-width: 0;
+  height: auto;
+  min-height: 0;
+}
+
+.cad-rail {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  box-sizing: border-box;
+  min-height: 0;
+  max-height: 100%;
+  overflow: hidden;
+  width: 32px;
+  margin: 0;
+  padding: 7px 0;
+  font: inherit;
+  font-size: 12px;
+  line-height: normal;
+  color: var(--cad-icon-btn);
+  background: var(--mg-bg);
+  border: 1px solid var(--mg-card-border);
+  border-radius: var(--mg-radius-md);
+  box-shadow: var(--mg-shadow-md);
+  animation: cad-rail-in 140ms ease-out;
+}
+
+button.cad-rail {
+  cursor: pointer;
+}
+
+button.cad-rail:hover,
+button.cad-rail:focus-visible,
+.cad-rail-open:hover,
+.cad-rail-open:focus-visible,
+.cad-rail-done:hover,
+.cad-rail-done:focus-visible {
+  background: var(--cad-icon-btn-hover-bg);
+  color: var(--mg-text-strong);
+  outline: none;
+}
+
+button.cad-rail:focus-visible,
+.cad-rail-open:focus-visible,
+.cad-rail-done:focus-visible {
+  box-shadow: 0 0 0 2px var(--mg-focus);
+}
+
+/* The name reads upward, cut with an ellipsis (the full name is the tooltip). */
+.cad-rail-label {
+  flex: 0 1 auto;
+  min-height: 0;
+  writing-mode: vertical-rl;
+  transform: rotate(180deg);
+  max-height: 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+  color: var(--cad-tree-head);
+}
+
+/* A sketch the Assistant draws: its mark reads upward under the name, in the panel badge's colours. */
+.cad-rail-owner {
+  flex: none;
+  writing-mode: vertical-rl;
+  transform: rotate(180deg);
+  padding: 6px 1px;
+  border: 1px solid var(--mg-selected-border);
+  border-radius: var(--mg-radius-pill);
+  background: var(--mg-selected-bg);
+  color: var(--mg-primary-ink, #1570ef);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 14px;
+  white-space: nowrap;
+}
+
+/* Its Finish waits for the Assistant (the panel's Done does too): there, but not offered. */
+.cad-rail-done.is-disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.cad-rail-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 3px;
+  box-sizing: border-box;
+  border-radius: var(--mg-radius-pill);
+  background: var(--mg-danger);
+  color: var(--mg-bg);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+/* The Sketch panel's rail: its accent, the open button over most of it, Finish sketch at the foot. */
+.cad-rail.is-sketch {
+  padding: 0 0 4px;
+  gap: 2px;
+  border-left: 3px solid var(--cad-panel-accent-sketch);
+}
+
+.cad-rail-open {
+  flex: 0 1 auto;
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  margin: 0;
+  padding: 7px 0 8px;
+  font: inherit;
+  color: inherit;
+  background: transparent;
+  border: none;
+  border-radius: var(--mg-radius-md) var(--mg-radius-md) 0 0;
+  cursor: pointer;
+}
+
+.cad-rail-done {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  margin: 0;
+  padding: 0;
+  color: var(--cad-panel-accent-sketch);
+  background: transparent;
+  border: none;
+  border-top: 1px solid var(--mg-divider);
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+/* The collapse chevron: the tree card's head (PART) and the Sketch panel's head. It never makes the head taller. */
+.cad-collapse-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 20px;
+  height: 20px;
+  margin: -3px -4px -3px 0;
+  padding: 0;
+  color: var(--cad-icon-btn);
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.cad-collapse-btn:hover,
+.cad-collapse-btn:focus-visible {
+  background: var(--cad-icon-btn-hover-bg);
+  color: var(--mg-text-strong);
+  outline: none;
+}
+
+/* The kit's focus ring (as the rails'), review 7. */
+.cad-collapse-btn:focus-visible {
+  box-shadow: 0 0 0 2px var(--mg-focus);
+}
+
+@keyframes cad-rail-in {
+  from {
+    opacity: 0;
+    transform: translateX(-8px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cad-rail {
+    animation: none;
+  }
+}
+/* ==== ux010 PANELS (end) ==== */

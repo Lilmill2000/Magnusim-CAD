@@ -1,0 +1,277 @@
+/**
+ * The app's own confirm dialog and name prompt (#modal-confirm and #modal-prompt
+ * in shell.html), for the workbench and the plugin workspace bridge.
+ *
+ * One at a time: a dialog opens only after the one before it closed, on a new
+ * task, so whatever its answer set off has run first. opts.skipIf() is asked
+ * when its turn comes; true drops it unseen (confirm false, prompt null).
+ * A key press answers one dialog only: Enter and Escape are handled once.
+ */
+import { guardYes, YES_GUARD_MS } from './guardedYes';
+
+/** What every dialog takes besides its text. */
+export interface DialogOpts {
+  /** Asked when the dialog's turn comes: true drops it unseen. */
+  skipIf?: () => boolean;
+  /** Its asker is gone: dropped unseen while it waits, closed as Cancel while it is open. */
+  signal?: AbortSignal;
+}
+
+export interface ConfirmOpts extends DialogOpts {
+  title?: string;
+  copy?: string;
+  yes?: string;
+  /** The Cancel button's label for this dialog (Cancel by default). */
+  no?: string;
+  /**
+   * Yes discards work: the Cancel button has the focus and Enter answers Cancel
+   * (Escape too), so only a click on Yes says yes. Not on a notice (its one button keeps Enter).
+   */
+  safe?: boolean;
+  /** An information dialog with one button (no Cancel). */
+  notice?: boolean;
+  /**
+   * Yes takes only a deliberate click (the Assistant's questions, which a model can ask one
+   * right after another, each in the same place): it is disabled for its first
+   * YES_GUARD_MS on screen, and then counts a click only when the press began on it after
+   * that, never the second click of a double-click. So the second click of a double-click
+   * on the dialog before it, or a press that began there, never answers this one. Not on a
+   * notice.
+   */
+  guard?: boolean;
+}
+
+/** How long a guarded dialog's Yes stays disabled once it is shown (guardedYes.ts, shared with the dock's question card). */
+export { YES_GUARD_MS };
+
+export interface PromptOpts extends DialogOpts {
+  title?: string;
+  copy?: string;
+  label?: string;
+  value?: string;
+  yes?: string;
+}
+
+interface Waiting {
+  opts: DialogOpts;
+  show: () => Promise<unknown>;
+  dropped: unknown;
+  resolve: (value: unknown) => void;
+}
+
+const waiting: Waiting[] = [];
+// A dialog is open, or the next one's turn has not come yet.
+let open = false;
+
+function queue<O extends DialogOpts, T>(opts: O | undefined, show: (o: O) => Promise<T>, dropped: T): Promise<T> {
+  const o = (opts || {}) as O;
+  return new Promise<T>((resolve) => {
+    waiting.push({ opts: o, show: () => show(o), dropped, resolve: resolve as (value: unknown) => void });
+    next();
+  });
+}
+
+function skipped(d: Waiting): boolean {
+  if (d.opts.signal?.aborted) return true;
+  try {
+    return typeof d.opts.skipIf === 'function' && !!d.opts.skipIf();
+  } catch (e) {
+    console.warn('[CFD] dialog skipIf', e);
+    return false;
+  }
+}
+
+function next(): void {
+  while (!open && waiting.length) {
+    const d = waiting.shift() as Waiting;
+    if (skipped(d)) {
+      d.resolve(d.dropped);
+      continue;
+    }
+    open = true;
+    let shown: Promise<unknown>;
+    try {
+      shown = Promise.resolve(d.show());
+    } catch (e) {
+      shown = Promise.reject(e);
+    }
+    shown.then(
+      (v) => settle(d, v),
+      (e) => {
+        console.warn('[CFD] dialog', e);
+        settle(d, d.dropped);
+      },
+    );
+  }
+}
+
+function settle(d: Waiting, value: unknown): void {
+  d.resolve(value);
+  // The next one's turn is a new task: the answer's follow-up (a leave the user
+  // just approved) runs first, and so does the rest of the key press that gave it.
+  setTimeout(() => {
+    open = false;
+    next();
+  }, 0);
+}
+
+/**
+ * One more dialog kind in the same one-at-a-time queue (host API 1.5: the linked
+ * geometry's question, src/workspace/linkChoice.ts): `show` runs when its turn comes and
+ * its answer settles the call; `dropped` is the answer when it is skipped or aborted.
+ */
+export function queueDialog<O extends DialogOpts, T>(opts: O | undefined, show: (o: O) => Promise<T>, dropped: T): Promise<T> {
+  return queue(opts, show, dropped);
+}
+
+/** A confirm or name prompt is open or waiting its turn. */
+export function dialogBusy(): boolean {
+  return open || waiting.length > 0;
+}
+
+/** Resolve true when confirmed. Used before any filter / view is deleted. */
+export function confirmAction(opts?: ConfirmOpts): Promise<boolean> {
+  return queue(opts, showConfirm, false);
+}
+
+/** Resolve with the entered (trimmed) text, or null when cancelled. */
+export function promptName(opts?: PromptOpts): Promise<string | null> {
+  return queue<PromptOpts, string | null>(opts, showPromptName, null);
+}
+
+/** The Cancel button's label in shell.html, which every dialog without `no` shows. */
+const NO_LABEL = 'Cancel';
+
+function showConfirm(o: ConfirmOpts): Promise<boolean> {
+  const modal = document.getElementById('modal-confirm');
+  if (!modal) return Promise.resolve(window.confirm(o.copy || o.title || 'Delete?'));
+  const heading = document.getElementById('cf-heading');
+  const copy = document.getElementById('cf-copy');
+  const yes = document.getElementById('cf-confirm');
+  const no = document.getElementById('cf-cancel');
+  const backdrop = document.getElementById('cf-backdrop');
+  // A notice has no Cancel to fall back on.
+  const safe = !!o.safe && !o.notice;
+  const guard = !!o.guard && !o.notice;
+  if (heading) heading.textContent = o.title || 'Delete?';
+  if (copy) copy.textContent = o.copy || '';
+  if (yes) yes.textContent = o.yes || 'Delete';
+  if (no) {
+    // notice: an information dialog with one button (no Cancel).
+    no.hidden = !!o.notice;
+    no.textContent = o.no || NO_LABEL;
+  }
+  modal.hidden = false;
+  return new Promise<boolean>((resolve) => {
+    // A guarded Yes: disabled at first; then only a press that began on it once it was enabled.
+    const guarded = guard ? guardYes(yes instanceof HTMLButtonElement ? yes : null) : null;
+    const done = (ok: boolean) => {
+      modal.hidden = true;
+      // The same button serves the next dialog.
+      guarded?.dispose();
+      if (no) {
+        no.hidden = false;
+        no.textContent = NO_LABEL;
+      }
+      yes?.removeEventListener('click', onYes);
+      no?.removeEventListener('click', onNo);
+      backdrop?.removeEventListener('click', onNo);
+      document.removeEventListener('keydown', onKey);
+      o.signal?.removeEventListener('abort', onNo);
+      resolve(ok);
+    };
+    const onYes = (e?: MouseEvent) => {
+      // Guarded (guardedYes.ts): a deliberate click only; Enter has no click here.
+      if (guarded && !guarded.accepts(e)) return;
+      done(true);
+    };
+    const onNo = () => done(false);
+    const onKey = (e: KeyboardEvent) => {
+      // A key the dialog before this one already took is not an answer here.
+      if (e.defaultPrevented) return;
+      if (e.key !== 'Escape' && e.key !== 'Enter') return;
+      // Handled: no keypress follows to click the button that has focus now.
+      e.preventDefault();
+      // Enter keeps the work on a question whose Yes discards it.
+      if (e.key === 'Escape' || safe) onNo();
+      else onYes();
+    };
+    yes?.addEventListener('click', onYes);
+    no?.addEventListener('click', onNo);
+    backdrop?.addEventListener('click', onNo);
+    document.addEventListener('keydown', onKey);
+    o.signal?.addEventListener('abort', onNo);
+    try {
+      (safe ? no : yes)?.focus();
+    } catch {
+      /* not focusable */
+    }
+  });
+}
+
+function showPromptName(o: PromptOpts): Promise<string | null> {
+  const modal = document.getElementById('modal-prompt');
+  if (!modal) return Promise.resolve(window.prompt(o.title || 'Name', o.value || ''));
+  const heading = document.getElementById('pm-heading');
+  const copy = document.getElementById('pm-copy');
+  const label = document.getElementById('pm-label');
+  const input = document.getElementById('pm-input') as HTMLInputElement | null;
+  const yes = document.getElementById('pm-confirm');
+  const no = document.getElementById('pm-cancel');
+  const backdrop = document.getElementById('pm-backdrop');
+  if (heading) heading.textContent = o.title || 'Name';
+  if (copy) copy.textContent = o.copy || '';
+  if (label) label.textContent = o.label || 'Name';
+  if (yes) yes.textContent = o.yes || 'Save';
+  if (input) input.value = o.value || '';
+  modal.hidden = false;
+  return new Promise<string | null>((resolve) => {
+    const done = (val: string | null) => {
+      modal.hidden = true;
+      yes?.removeEventListener('click', onYes);
+      no?.removeEventListener('click', onNo);
+      backdrop?.removeEventListener('click', onNo);
+      input?.removeEventListener('keydown', onKey);
+      document.removeEventListener('keydown', onEsc);
+      o.signal?.removeEventListener('abort', onNo);
+      resolve(val);
+    };
+    const onYes = () => {
+      const v = String(input ? input.value : '').trim();
+      if (!v) {
+        try {
+          input?.focus();
+        } catch {
+          /* not focusable */
+        }
+        return;
+      }
+      done(v);
+    };
+    const onNo = () => done(null);
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Enter' && !e.defaultPrevented) {
+        e.preventDefault();
+        onYes();
+      }
+    };
+    const onEsc = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !e.defaultPrevented) {
+        e.preventDefault();
+        onNo();
+      }
+    };
+    yes?.addEventListener('click', onYes);
+    no?.addEventListener('click', onNo);
+    backdrop?.addEventListener('click', onNo);
+    input?.addEventListener('keydown', onKey);
+    document.addEventListener('keydown', onEsc);
+    o.signal?.addEventListener('abort', onNo);
+    try {
+      input?.focus();
+      input?.select();
+    } catch {
+      /* not focusable */
+    }
+  });
+}

@@ -1,0 +1,83 @@
+// The viewport's commands: Fit (F), the standard views (1-8; 8 the back isometric) and Normal to (N).
+// They have no toolbar group: the keys and the views menu reach them.
+// Ctrl+1..8 would be SOLIDWORKS' keys, but browsers keep those for tabs.
+// Owner: VIEWPORT.
+// SPDX-License-Identifier: GPL-3.0-or-later
+import type { AppServices } from '../types/app';
+import type { CommandDef } from '../types/commands';
+import type { Vec3 } from '../types/doc';
+import type { Selection } from '../types/selection';
+import type { StandardView, ViewportHandle } from '../types/viewport';
+import type { DocState } from '../types/doc-service';
+import { normalTarget } from './normal';
+
+/** The standard views, in the views menu's order; their keys (1-8 by default) are the keybinding registry's (src/app/keymap.ts). */
+export const VIEW_COMMANDS: { view: StandardView; label: string }[] = [
+  { view: 'front', label: 'Front' },
+  { view: 'back', label: 'Back' },
+  { view: 'left', label: 'Left' },
+  { view: 'right', label: 'Right' },
+  { view: 'top', label: 'Top' },
+  { view: 'bottom', label: 'Bottom' },
+  { view: 'iso', label: 'Isometric' },
+  { view: 'iso_back', label: 'Back isometric' },
+];
+
+const NO_VIEWPORT = 'The viewport is not ready';
+
+/**
+ * What Normal to would look at: the first selected flat face, origin plane, CONSTRUCT plane or
+ * sketch (P4b SELECT: src/viewport/normal.ts; without the document state, faces and planes only),
+ * or why not.
+ */
+export function normalToTarget(sel: Pick<Selection, 'items'>, handle: Pick<ViewportHandle, 'planeNormal'>, state?: Pick<DocState, 'doc' | 'rebuild'>): { normal: Vec3; up: Vec3 } | { reason: string } {
+  return normalTarget(state ?? NO_DOC, handle, sel.items);
+}
+
+const NO_DOC = { doc: { features: [] }, rebuild: { outputs: {} } } as unknown as Pick<DocState, 'doc' | 'rebuild'>;
+
+function viewport(s: AppServices): ViewportHandle | null {
+  return s.viewport.get().handle;
+}
+
+export function viewportCommands(): CommandDef[] {
+  const ready = (s: AppServices) => (viewport(s) ? true : NO_VIEWPORT);
+  return [
+    {
+      id: 'view.fit',
+      label: 'Fit',
+      hint: 'Frame the visible bodies, keeping the view direction',
+      // Fit and the standard views work the same in sketch mode (the VIEW group stays).
+      mode: 'any',
+      enabled: ready,
+      run: (s) => viewport(s)?.fit(),
+    },
+    ...VIEW_COMMANDS.map(
+      (v): CommandDef => ({
+        id: `view.${v.view}`,
+        label: `${v.label} view`,
+        mode: 'any',
+        enabled: ready,
+        run: (s) => viewport(s)?.setView(v.view),
+      }),
+    ),
+    {
+      id: 'view.normal-to',
+      label: 'Normal to',
+      hint: 'Look straight at the selected flat face, plane or sketch',
+      explainRefusal: true,
+      enabled: (s) => {
+        const h = viewport(s);
+        if (!h) return NO_VIEWPORT;
+        const t = normalToTarget(s.selection.get(), h, s.doc.state.get());
+        return 'reason' in t ? t.reason : true;
+      },
+      run: (s) => {
+        const h = viewport(s);
+        if (!h) return;
+        const t = normalToTarget(s.selection.get(), h, s.doc.state.get());
+        if (!('reason' in t)) h.lookAt(t.normal, t.up);
+      },
+    },
+  ];
+}

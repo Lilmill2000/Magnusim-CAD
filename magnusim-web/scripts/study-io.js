@@ -1,0 +1,705 @@
+// @ts-check
+/**
+ * Study / mesh / run file I/O. Writers for study N may only touch that folder.
+ */
+import { rmSync } from 'node:fs';
+import { basename, join } from 'node:path';
+import { matchesStudy } from './w16-geometry-scope.js';
+import { baseRevOf, checkBaseRev, stampRev } from './record-rev.js';
+import { firstLegacySimId, projectDir } from './w17-sim-catalog.js';
+import {
+  caseUnderOwner,
+  bindMeshCasePaths,
+  createMeshFolder,
+  createRunFolder,
+  findMesh,
+  findRun,
+  findStudy,
+  keepLinkKeys,
+  meshRefinementsPath,
+  meshRefsDir,
+  persistChildItem,
+  readJsonFile,
+  removeChildItem,
+  runRcsDir,
+  studyBcsDir,
+  studyBcsPath,
+  studyControlPath,
+  studyMaterialsDir,
+  studyMaterialsPath,
+  studyRcsDir,
+  studyResultControlsPath,
+  walkAllMeshes,
+  walkAllRuns,
+  walkChildItems,
+  walkMeshes,
+  walkRuns,
+  walkStudies,
+  writeIdFile,
+  writeJsonAtomic,
+  listFoamTimeDirs,
+} from './project-layout.js';
+
+export function studyOf(projectId, simId) {
+  if (!projectId || !simId) return null;
+  return findStudy(projectDir(projectId), String(simId));
+}
+
+function studyPath(projectId, simId, which) {
+  const s = studyOf(projectId, simId);
+  if (!s) return null;
+  if (which === 'materials') return studyMaterialsPath(s.dir);
+  if (which === 'bcs') return studyBcsPath(s.dir);
+  if (which === 'result_controls') return studyResultControlsPath(s.dir);
+  if (which === 'control') return studyControlPath(s.dir);
+  if (which === 'runs') return join(s.dir, 'simulation_runs', 'catalog.json');
+  return null;
+}
+
+function stripDirMeta(rec) {
+  if (!rec || typeof rec !== 'object') return rec;
+  const next = { ...rec };
+  delete next.dir;
+  delete next.folder;
+  return next;
+}
+
+/**
+ * Stable id for an id-less BC row in a leftover aggregate file: its 1-based
+ * position in that list. Matches cfddesk/project/paths.py legacy_bc_id, so the
+ * tree, hydrate, GET /api/bcs and the adopted BC_* folder all agree on one id.
+ */
+export function legacyBcId(index) {
+  return `bc-legacy-${index + 1}`;
+}
+
+function aggregateBcRows(doc) {
+  if (!doc || typeof doc !== 'object') return [];
+  for (const key of ['boundary_conditions', 'bcs', 'bcs_all']) {
+    if (Array.isArray(doc[key])) return doc[key];
+  }
+  return [];
+}
+
+/**
+ * BC rows of one study that live only in a leftover aggregate file (no BC_*
+ * folder yet). The study's own boundary_conditions.json first. A project from
+ * before study folders keeps its BCs in the root boundary_conditions.json; that
+ * file counts only while the study has neither an aggregate nor a BC_* folder,
+ * and only for rows matchesStudy gives this study (untagged rows need a single
+ * study — the rule migrate_root_siblings copies by).
+ */
+function legacyBcRowsAt(projectDirPath, s, haveFolders) {
+  const withIds = (list) =>
+    list
+      .map((r, i) => (r && typeof r === 'object' && r.id == null ? { ...r, id: legacyBcId(i) } : r))
+      .filter((r) => r && typeof r === 'object');
+  const own = readJsonFile(studyBcsPath(s.dir));
+  if (own) {
+    return withIds(aggregateBcRows(own)).map((r) => (r.simulation_id ? r : { ...r, simulation_id: s.id }));
+  }
+  if (haveFolders) return [];
+  const rootDoc = readJsonFile(join(projectDirPath, 'boundary_conditions.json'));
+  if (!rootDoc) return [];
+  const legacySimId =
+    firstLegacySimId(basename(projectDirPath), null) || (walkStudies(projectDirPath).length === 1 ? s.id : null);
+  return withIds(aggregateBcRows(rootDoc))
+    .filter((r) => matchesStudy(r, s.id, legacySimId))
+    .map((r) => ({ ...r, simulation_id: s.id }));
+}
+
+/**
+ * Give each leftover-aggregate BC row of this study its own BC_* folder before a
+ * write rebuilds boundary_conditions.json from the folders. Without this the
+ * first POST /api/bcs create wiped every legacy BC the tree was showing.
+ */
+function adoptLegacyBcsAt(projectDirPath, s) {
+  const parent = studyBcsDir(s.dir);
+  const folders = walkChildItems(parent, 'bc.json');
+  const have = new Set(folders.map((r) => String(r.id)));
+  let adopted = 0;
+  for (const rec of legacyBcRowsAt(projectDirPath, s, folders.length > 0)) {
+    if (have.has(String(rec.id)) || String(rec.simulation_id) !== String(s.id)) continue;
+    // The row's own lost faces and stamp come with it (a linked geometry's keys).
+    persistChildItem(parent, 'bc', rec, { keepRow: true });
+    adopted += 1;
+  }
+  return adopted;
+}
+
+function mergeFolderRows(folderRows, legacyList) {
+  const have = new Set((folderRows || []).map((r) => String(r && r.id)));
+  const extra = (legacyList || []).filter((r) => r && r.id != null && !have.has(String(r.id)));
+  return [...(folderRows || []).map(stripDirMeta), ...extra];
+}
+
+function assembleStudyCollection(projectId, simId, which) {
+  const s = studyOf(projectId, simId);
+  if (!s) return null;
+  if (which === 'materials') {
+    const legacy = readJsonFile(studyMaterialsPath(s.dir));
+    const rows = walkChildItems(studyMaterialsDir(s.dir), 'material.json');
+    return {
+      ...(legacy || {}),
+      materials: mergeFolderRows(rows, legacy && legacy.materials),
+      air: (rows[0] && stripDirMeta(rows[0])) || (legacy && legacy.air) || null,
+      simulation_id: simId,
+    };
+  }
+  if (which === 'bcs') {
+    const legacy = readJsonFile(studyBcsPath(s.dir));
+    const rows = walkChildItems(studyBcsDir(s.dir), 'bc.json');
+    const defaultsDoc = readJsonFile(join(studyBcsDir(s.dir), 'defaults.json'));
+    return {
+      ...(legacy || {}),
+      boundary_conditions: mergeFolderRows(rows, legacyBcRowsAt(projectDir(projectId), s, rows.length > 0)),
+      defaults: (defaultsDoc && defaultsDoc.defaults) || (legacy && legacy.defaults) || null,
+      defaults_by_simulation:
+        (defaultsDoc && defaultsDoc.defaults_by_simulation) ||
+        (legacy && legacy.defaults_by_simulation) ||
+        {},
+      defaults_rev: Number(defaultsDoc && defaultsDoc.defaults_rev) || 0,
+      simulation_id: simId,
+    };
+  }
+  if (which === 'result_controls') {
+    const legacy = readJsonFile(studyResultControlsPath(s.dir));
+    const rows = walkChildItems(studyRcsDir(s.dir), 'result_control.json');
+    const items = mergeFolderRows(rows, legacy && legacy.result_controls);
+    return {
+      ...(legacy || {}),
+      result_controls: items,
+      area_average_1: items[0] || (legacy && legacy.area_average_1) || null,
+      simulation_id: simId,
+    };
+  }
+  const p = studyPath(projectId, simId, which);
+  return p ? readJsonFile(p) : null;
+}
+
+export function readStudyJson(projectId, simId, which) {
+  return assembleStudyCollection(projectId, simId, which);
+}
+
+/**
+ * The record writers below take `opts.geometryRev`: the rev a save's stamp check passed
+ * with on a linked geometry (link-stamp.js); the record is stamped with it. Without it
+ * the stamp and `lost_faces` stay as they are on disk (project-layout.js keepLinkKeys).
+ */
+export function persistOneMaterialAt(projectDirPath, simId, rec, opts) {
+  const s = findStudy(projectDirPath, String(simId));
+  if (!s) throw new Error('study folder missing for ' + simId);
+  return persistChildItem(studyMaterialsDir(s.dir), 'material', { ...rec, simulation_id: simId }, opts);
+}
+
+export function persistOneMaterial(projectId, simId, rec, opts) {
+  return persistOneMaterialAt(projectDir(projectId), simId, rec, opts);
+}
+
+function mirrorStudyBcsJson(studyDir, simId) {
+  const rows = walkChildItems(studyBcsDir(studyDir), 'bc.json').map(stripDirMeta);
+  const legacy = readJsonFile(studyBcsPath(studyDir)) || {};
+  const have = new Set(rows.map((r) => String(r.id)));
+  // Rows tagged for another study are never adopted here; keep them on disk rather than drop them unseen.
+  const foreign = aggregateBcRows(legacy).filter(
+    (r) =>
+      r &&
+      r.simulation_id &&
+      String(r.simulation_id) !== String(simId) &&
+      !(r.id != null && have.has(String(r.id)))
+  );
+  writeJsonAtomic(studyBcsPath(studyDir), {
+    ...legacy,
+    boundary_conditions: [...rows, ...foreign],
+    simulation_id: simId || legacy.simulation_id || null,
+    updated_at: new Date().toISOString(),
+  });
+}
+
+export function persistOneBcAt(projectDirPath, simId, rec, opts) {
+  const s = findStudy(projectDirPath, String(simId));
+  if (!s) throw new Error('study folder missing for ' + simId);
+  adoptLegacyBcsAt(projectDirPath, s);
+  const out = persistChildItem(studyBcsDir(s.dir), 'bc', { ...rec, simulation_id: simId }, opts);
+  mirrorStudyBcsJson(s.dir, simId);
+  return out;
+}
+
+export function persistOneBc(projectId, simId, rec, opts) {
+  return persistOneBcAt(projectDir(projectId), simId, rec, opts);
+}
+
+/**
+ * The study's BC defaults (defaults.json). `defaults_rev` is their rev (record-rev.js): + 1 when
+ * the study's defaults change, kept otherwise. `opts.baseRev`: the rev the save read, refused
+ * (StaleRecord, kind 'bc_defaults') when it is not the stored one.
+ */
+export function persistBcDefaultsAt(projectDirPath, simId, defaults, defaultsBySimulation, opts) {
+  const s = findStudy(projectDirPath, String(simId));
+  if (!s) throw new Error('study folder missing for ' + simId);
+  const path = join(studyBcsDir(s.dir), 'defaults.json');
+  const onDisk = readJsonFile(path);
+  const stored = { rev: Number(onDisk && onDisk.defaults_rev) || 0 };
+  const base = opts && Number.isInteger(opts.baseRev) ? opts.baseRev : null;
+  checkBaseRev('bc_defaults', simId, stored, base);
+  const mine = (doc) => JSON.stringify((doc && ((doc.defaults_by_simulation || {})[simId] || doc.defaults)) || null);
+  const next = { defaults: defaults || null, defaults_by_simulation: defaultsBySimulation || {} };
+  const changed = !onDisk || mine(onDisk) !== mine(next);
+  writeJsonAtomic(path, {
+    ...next,
+    simulation_id: simId,
+    defaults_rev: changed ? stored.rev + 1 : stored.rev,
+  });
+  return path;
+}
+
+export function persistBcDefaults(projectId, simId, defaults, defaultsBySimulation, opts) {
+  return persistBcDefaultsAt(projectDir(projectId), simId, defaults, defaultsBySimulation, opts);
+}
+
+export function persistOneResultControlAt(projectDirPath, simId, rec, opts) {
+  const s = findStudy(projectDirPath, String(simId));
+  if (!s) throw new Error('study folder missing for ' + simId);
+  return persistChildItem(studyRcsDir(s.dir), 'rc', { ...rec, simulation_id: simId }, opts);
+}
+
+export function persistOneResultControl(projectId, simId, rec, opts) {
+  return persistOneResultControlAt(projectDir(projectId), simId, rec, opts);
+}
+
+export function persistOneRefinementAt(projectDirPath, meshId, simId, rec, opts) {
+  const mesh = findMesh(projectDirPath, String(meshId), String(simId));
+  if (!mesh) throw new Error('mesh folder missing for ' + meshId);
+  return persistChildItem(
+    meshRefsDir(mesh.dir),
+    'refinement',
+    {
+      ...rec,
+      mesh_id: meshId,
+      simulation_id: simId,
+    },
+    opts,
+  );
+}
+
+export function persistOneRefinement(projectId, meshId, simId, rec, opts) {
+  return persistOneRefinementAt(projectDir(projectId), meshId, simId, rec, opts);
+}
+
+export function persistOneRunResultControlAt(projectDirPath, simId, runId, rec, opts) {
+  const run = findRun(projectDirPath, String(runId), String(simId));
+  if (!run) throw new Error('run folder missing for ' + runId);
+  return persistChildItem(
+    runRcsDir(run.dir),
+    'rc',
+    {
+      ...rec,
+      run_id: runId,
+      simulation_id: simId,
+    },
+    opts,
+  );
+}
+
+export function persistOneRunResultControl(projectId, simId, runId, rec, opts) {
+  return persistOneRunResultControlAt(projectDir(projectId), simId, runId, rec, opts);
+}
+
+export function deleteOneRunResultControl(projectId, simId, runId, id) {
+  const run = findRun(projectDir(projectId), String(runId), simId ? String(simId) : undefined);
+  return !!(run && removeChildItem(runRcsDir(run.dir), 'result_control.json', id));
+}
+
+export function deleteOneMaterial(projectId, simId, id) {
+  const s = studyOf(projectId, simId);
+  return !!(s && removeChildItem(studyMaterialsDir(s.dir), 'material.json', id));
+}
+
+export function deleteOneBc(projectId, simId, id) {
+  const s = studyOf(projectId, simId);
+  if (!s) return false;
+  const adopted = adoptLegacyBcsAt(projectDir(projectId), s);
+  const ok = removeChildItem(studyBcsDir(s.dir), 'bc.json', id);
+  if (ok || adopted) mirrorStudyBcsJson(s.dir, simId);
+  return ok;
+}
+
+export function deleteOneRefinement(projectId, meshId, simId, id) {
+  const mesh = meshFolderOf(projectId, meshId, simId);
+  return !!(mesh && removeChildItem(meshRefsDir(mesh.dir), 'refinement.json', id));
+}
+
+export function writeStudyJson(projectId, simId, which, doc) {
+  const s = studyOf(projectId, simId);
+  if (!s) throw new Error('study folder missing for ' + simId);
+  if (which === 'materials') {
+    for (const rec of (doc && doc.materials) || []) {
+      if (rec && rec.id) persistOneMaterial(projectId, simId, rec);
+    }
+    return studyMaterialsDir(s.dir);
+  }
+  if (which === 'bcs') {
+    for (const rec of (doc && doc.boundary_conditions) || []) {
+      if (rec && rec.id) persistOneBc(projectId, simId, rec);
+    }
+    persistBcDefaults(projectId, simId, doc && doc.defaults, doc && doc.defaults_by_simulation);
+    return studyBcsDir(s.dir);
+  }
+  if (which === 'result_controls') {
+    for (const rec of (doc && doc.result_controls) || []) {
+      if (rec && rec.id) persistOneResultControl(projectId, simId, rec);
+    }
+    return studyRcsDir(s.dir);
+  }
+  const p = studyPath(projectId, simId, which);
+  if (!p) throw new Error('study folder missing for ' + simId);
+  writeJsonAtomic(p, { ...(doc || {}), simulation_id: simId });
+  return p;
+}
+
+export function studyFilePath(projectId, simId, which) {
+  return studyPath(projectId, simId, which);
+}
+
+export function assembleMeshDocAt(projectDirPath, simId, wantId) {
+  if (!projectDirPath || !simId) {
+    return {
+      meshes: [],
+      active_id: null,
+      id: null,
+      name: null,
+      settings: null,
+      generated: false,
+      live_mesh_result: null,
+      simulation_id: simId || null,
+    };
+  }
+  const meshes = walkMeshes(projectDirPath, String(simId));
+  const want = wantId != null && String(wantId) !== '' ? String(wantId) : '';
+  const active = want ? meshes.find((m) => String(m.id) === want) || null : null;
+  return {
+    meshes,
+    active_id: active ? active.id : null,
+    id: active ? active.id : null,
+    name: active ? active.name : null,
+    settings: active ? active.settings : null,
+    generated: !!(active && active.generated),
+    live_mesh_result: active ? active.live_mesh_result || null : null,
+    simulation_id: simId,
+    updated_at: new Date().toISOString(),
+    persistence: 'filesystem',
+    increment: 'W20',
+  };
+}
+
+export function assembleMeshDoc(projectId, simId, wantId) {
+  if (!projectId || !simId) {
+    return assembleMeshDocAt('', simId, wantId);
+  }
+  return assembleMeshDocAt(projectDir(projectId), simId, wantId);
+}
+
+/**
+ * A mesh's build stamp (host API 1.5, LINK proposal 5.15): only the generator sets
+ * `live_mesh_result.built_from_rev` (`opts.generator`); every other write keeps the one on
+ * disk. A write with no result leaves none (not generated says more than out of date).
+ * @param {Record<string, any>} bound @param {Record<string, any> | null} onDisk
+ */
+function keepBuildStamp(bound, onDisk) {
+  const live = bound.live_mesh_result;
+  if (!live || typeof live !== 'object') return;
+  const disk = onDisk && onDisk.live_mesh_result && typeof onDisk.live_mesh_result === 'object' ? onDisk.live_mesh_result : null;
+  const next = { ...live };
+  if (disk && Object.prototype.hasOwnProperty.call(disk, 'built_from_rev')) next.built_from_rev = disk.built_from_rev;
+  else delete next.built_from_rev;
+  bound.live_mesh_result = next;
+}
+
+function writeMeshFolder(root, sid, rec, folder, opts) {
+  const bound = bindMeshCasePaths({ ...rec, simulation_id: sid }, folder.dir);
+  delete bound.dir;
+  delete bound.folder;
+  const onDisk = readJsonFile(join(folder.dir, 'mesh.json'));
+  checkBaseRev('mesh', bound.id, onDisk, baseRevOf(bound));
+  keepLinkKeys(bound, onDisk, opts || {});
+  if (!(opts && opts.generator)) keepBuildStamp(bound, onDisk);
+  // Only the settings save (`opts.stampRev`) moves the mesh's rev; a generate's result keeps it.
+  stampRev(bound, onDisk, { bump: !!(opts && opts.stampRev) });
+  writeIdFile(folder.dir, {
+    id: bound.id,
+    name: bound.name,
+    simulation_id: sid,
+    kind: 'mesh',
+  });
+  writeJsonAtomic(join(folder.dir, 'mesh.json'), bound);
+  return bound;
+}
+
+/** Write one mesh folder only. Never rewrite or delete siblings. */
+export function persistOneMeshAt(projectDirPath, simId, rec, opts) {
+  const sid = String(simId || (rec && rec.simulation_id) || '');
+  if (!sid) throw new Error('simulation_id required to persist mesh');
+  if (!rec || !rec.id) throw new Error('mesh id required');
+  let folder = findMesh(projectDirPath, String(rec.id), sid);
+  if (!folder) folder = createMeshFolder(projectDirPath, sid, rec);
+  writeMeshFolder(projectDirPath, sid, rec, folder, opts);
+  return folder;
+}
+
+/**
+ * `opts.generator`: the generate's own result writes its build stamp (keepBuildStamp).
+ * `opts.stampRev`: a settings save, which moves the mesh's rev (record-rev.js); any other
+ * write keeps the stored rev.
+ */
+export function persistOneMesh(projectId, simId, rec, opts) {
+  persistOneMeshAt(projectDir(projectId), simId, rec, opts);
+  return assembleMeshDoc(projectId, String(simId || (rec && rec.simulation_id) || ''), rec.id);
+}
+
+export function persistMeshDoc(projectId, simId, doc, opts) {
+  const root = projectDir(projectId);
+  const sid = String(simId || (doc && doc.simulation_id) || '');
+  if (!sid) throw new Error('simulation_id required to persist meshes');
+  const existing = walkMeshes(root, sid);
+  const byId = new Map(existing.map((m) => [String(m.id), m]));
+  const meshes = Array.isArray(doc && doc.meshes) ? doc.meshes : [];
+  const keep = new Set();
+  for (const m of meshes) {
+    if (!m || !m.id) continue;
+    if (m.simulation_id && String(m.simulation_id) !== sid) continue;
+    keep.add(String(m.id));
+    let folder = byId.get(String(m.id));
+    if (!folder) folder = createMeshFolder(root, sid, m);
+    writeMeshFolder(root, sid, m, folder);
+  }
+  if (opts && opts.prune) {
+    for (const m of existing) {
+      if (!keep.has(String(m.id))) {
+        try {
+          rmSync(m.dir, { recursive: true, force: true });
+        } catch {
+          /* best-effort */
+        }
+      }
+    }
+  }
+  return assembleMeshDoc(projectId, sid, doc && (doc.active_id || doc.id));
+}
+
+export function meshFolderOf(projectId, meshId, simId) {
+  if (!projectId || !meshId) return null;
+  return findMesh(projectDir(projectId), String(meshId), simId ? String(simId) : undefined);
+}
+
+export function meshCasePath(projectId, meshId, simId) {
+  const m = meshFolderOf(projectId, meshId, simId);
+  return m ? join(m.dir, 'case') : null;
+}
+
+export function readMeshRefinements(projectId, meshId, simId) {
+  const m = meshFolderOf(projectId, meshId, simId);
+  if (!m) return null;
+  const legacy = readJsonFile(meshRefinementsPath(m.dir));
+  const rows = walkChildItems(meshRefsDir(m.dir), 'refinement.json');
+  const refinements = mergeFolderRows(rows, legacy && legacy.refinements).map((r) => ({
+    ...r,
+    mesh_id: (r && r.mesh_id) || meshId,
+    simulation_id: simId,
+  }));
+  return { ...(legacy || {}), refinements, mesh_id: meshId, simulation_id: simId };
+}
+
+export function writeMeshRefinements(projectId, meshId, simId, doc) {
+  const m = meshFolderOf(projectId, meshId, simId);
+  if (!m) throw new Error('mesh folder missing for ' + meshId);
+  for (const rec of (doc && doc.refinements) || []) {
+    if (rec && rec.id) persistOneRefinement(projectId, meshId, simId, rec);
+  }
+  return meshRefsDir(m.dir);
+}
+
+export function assembleRefinements(projectId, simId, meshId) {
+  const root = projectDir(projectId);
+  const meshes = simId ? walkMeshes(root, String(simId)) : [];
+  const want = meshId != null ? String(meshId) : '';
+  const refs = [];
+  for (const m of meshes) {
+    if (want && String(m.id) !== want) continue;
+    const doc = readMeshRefinements(projectId, m.id, simId);
+    for (const r of (doc && doc.refinements) || []) {
+      if (r) refs.push({ ...r, mesh_id: r.mesh_id || m.id, simulation_id: simId });
+    }
+  }
+  return { refinements: refs, simulation_id: simId, mesh_id: want || null };
+}
+
+/** Write one run folder only. case/ always stays under that run. */
+export function persistRunAt(projectDirPath, simId, run, opts) {
+  const sid = String(simId || (run && run.simulation_id) || '');
+  if (!sid) throw new Error('simulation_id required to persist run');
+  const rid = run && (run.id || run.run_id);
+  let folder = rid ? findRun(projectDirPath, String(rid), sid) : null;
+  if (!folder) folder = createRunFolder(projectDirPath, sid, run);
+  const onDisk = readJsonFile(join(folder.dir, 'run.json'));
+  const existing = onDisk || {};
+  const rec = {
+    ...existing,
+    ...run,
+    id: rid || folder.id,
+    run_id: rid || folder.id,
+    simulation_id: sid,
+    case_dir: join(folder.dir, 'case'),
+    mesh_id: run.mesh_id || existing.mesh_id || null,
+    mesh_name: run.mesh_name || existing.mesh_name || null,
+  };
+  const started = ['running', 'starting', 'done', 'failed', 'stopped'];
+  if (started.includes(String(existing.status || '')) && (!run.status || run.status === 'draft' || run.status === 'idle')) {
+    rec.status = existing.status;
+  }
+  const freshStart = (run.status === 'running' || run.status === 'starting') && run.has_results === false;
+  if (run.status === 'running' || run.status === 'starting') {
+    rec.stop_requested = run.stop_requested === true;
+    if (freshStart) {
+      rec.finished_at = null;
+      rec.exit_code = run.exit_code != null ? run.exit_code : null;
+      rec.signal = run.signal != null ? run.signal : null;
+      if (!run.stage || rec.stage === 'stopping' || rec.stage === 'copy' || rec.stage === 'reconstruct') {
+        rec.stage = run.stage || 'starting';
+      }
+    }
+  }
+  if (!freshStart) {
+    rec.has_results = !!(run.has_results || existing.has_results);
+    const nSaved = Math.max(Number(run.n_saved_times) || 0, Number(existing.n_saved_times) || 0);
+    if (nSaved) rec.n_saved_times = nSaved;
+    const lastRun = Number(run.last_saved_iteration);
+    const lastExist = Number(existing.last_saved_iteration);
+    if (Number.isFinite(lastRun) || Number.isFinite(lastExist)) {
+      rec.last_saved_iteration = Math.max(lastRun || 0, lastExist || 0);
+    }
+    try {
+      const times = listFoamTimeDirs(join(folder.dir, 'case'))
+        .map((t) => Number(t))
+        .filter((t) => Number.isFinite(t) && t > 0);
+      if (times.length) {
+        rec.has_results = true;
+        rec.n_saved_times = Math.max(Number(rec.n_saved_times) || 0, times.length);
+        rec.last_saved_iteration = Math.max(Number(rec.last_saved_iteration) || 0, times[times.length - 1]);
+      }
+    } catch (_) {}
+    const st = String(rec.stage || '');
+    // A continued run (F6) starting again: its frames are from before; it solves when it says so.
+    const from = rec.continued && typeof rec.continued === 'object' ? Number(rec.continued.from_time) || 0 : null;
+    const since = from === null ? 0 : from;
+    const progressed =
+      (from === null && Number(rec.n_saved_times) > 0) ||
+      Number(rec.last_saved_iteration) > since ||
+      Number(rec.sim_time) > since;
+    if (progressed && (st === 'starting' || st === 'decompose' || !st)) {
+      rec.stage = 'solve';
+    }
+  }
+  writeIdFile(folder.dir, {
+    id: rec.id,
+    name: rec.name,
+    simulation_id: sid,
+    mesh_id: rec.mesh_id || existing.mesh_id || null,
+    kind: 'run',
+  });
+  if (Array.isArray(run.result_controls)) {
+    const keep = new Set();
+    for (const rc of run.result_controls) {
+      if (!rc || rc.id == null) continue;
+      persistChildItem(
+        runRcsDir(folder.dir),
+        'rc',
+        {
+          ...rc,
+          run_id: rec.id,
+          simulation_id: sid,
+        },
+        opts,
+      );
+      keep.add(String(rc.id));
+    }
+    for (const row of walkChildItems(runRcsDir(folder.dir), 'result_control.json')) {
+      if (!keep.has(String(row.id))) removeChildItem(runRcsDir(folder.dir), 'result_control.json', row.id);
+    }
+    delete rec.result_controls;
+  } else if (!Array.isArray(existing.result_controls)) {
+    delete rec.result_controls;
+  } else {
+    rec.result_controls = existing.result_controls;
+  }
+  delete rec.dir;
+  delete rec.folder;
+  keepLinkKeys(rec, onDisk, opts || {});
+  // Only the run settings save (`opts.stampRev`) moves the run's rev; a status write keeps it,
+  // whatever rev the run object it was given had when it was read.
+  if (opts && opts.stampRev) checkBaseRev('run', rec.id, onDisk, baseRevOf(run));
+  stampRev(rec, onDisk, { bump: !!(opts && opts.stampRev), ignore: ['current_view'] });
+  // A run's build stamp (host API 1.5): only Start sets it (`opts.builtFrom`); every other
+  // write keeps the one on disk.
+  if (opts && opts.builtFrom) rec.built_from = { ...opts.builtFrom };
+  else if (existing && existing.built_from) rec.built_from = existing.built_from;
+  else delete rec.built_from;
+  writeJsonAtomic(join(folder.dir, 'run.json'), rec);
+  return { ...rec, dir: folder.dir, folder: folder.folder };
+}
+
+export function persistRun(projectId, simId, run, opts) {
+  return persistRunAt(projectDir(projectId), simId, run, opts);
+}
+
+export function assembleRuns(projectId, simId) {
+  if (!projectId || !simId) return [];
+  return walkRuns(projectDir(projectId), String(simId));
+}
+
+/** Tree catalog: every study's meshes. Generate/solve still use assembleMeshDoc(simId). */
+export function assembleAllMeshes(projectId) {
+  if (!projectId) return [];
+  return walkAllMeshes(projectDir(projectId));
+}
+
+/** Tree catalog: every study's runs. */
+export function assembleAllRuns(projectId) {
+  if (!projectId) return [];
+  return walkAllRuns(projectDir(projectId));
+}
+
+/** Tree catalog: every study's materials, tagged with simulation_id. */
+export function assembleAllMaterials(projectId) {
+  if (!projectId) return [];
+  const rows = [];
+  for (const s of walkStudies(projectDir(projectId))) {
+    const doc = readStudyJson(projectId, s.id, 'materials');
+    for (const m of (doc && doc.materials) || []) {
+      if (m) rows.push({ ...m, simulation_id: s.id });
+    }
+  }
+  return rows;
+}
+
+/** Tree catalog: every study's BCs, tagged with simulation_id. */
+export function assembleAllBcs(projectId) {
+  if (!projectId) return [];
+  const rows = [];
+  for (const s of walkStudies(projectDir(projectId))) {
+    const doc = readStudyJson(projectId, s.id, 'bcs');
+    for (const b of (doc && doc.boundary_conditions) || []) {
+      if (b) rows.push({ ...b, simulation_id: s.id });
+    }
+  }
+  return rows;
+}
+
+export function runFolderOf(projectId, runId, simId) {
+  if (!projectId || !runId) return null;
+  return findRun(projectDir(projectId), String(runId), simId ? String(simId) : undefined);
+}
+
+export function caseOwnedByMesh(casePath, projectId, meshId, simId) {
+  const m = meshFolderOf(projectId, meshId, simId);
+  return !!(m && caseUnderOwner(casePath, m.dir));
+}

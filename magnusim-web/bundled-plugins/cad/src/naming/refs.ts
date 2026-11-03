@@ -1,0 +1,59 @@
+// Making stored references from picks, and the kernel-backed lookup that
+// resolution uses. A panel that keeps a picked face calls refOfFace once, when
+// the user picks it (that is the re-anchoring point); a rebuild only resolves.
+// Owner: DOC-CORE (naming layer).
+// SPDX-License-Identifier: GPL-3.0-or-later
+import type { PersistentRef, RefSemantic } from '../types/doc';
+import type { KernelAdapter } from '../types/kernel';
+import type { ShapeId, TopoResult } from '../types/kernel-protocol';
+import type { FaceNames, NamingLookup } from '../types/naming';
+import { keptPlacement } from './placement';
+import { faceSignature } from './resolve';
+
+/** A body as a reference is made on: its shape, its faces' names and its placement (BodyInfo, BuiltBody, ...). */
+export interface RefBody {
+  shape: ShapeId;
+  names?: FaceNames | null;
+  placement?: readonly number[] | null;
+}
+
+/** The placement a new reference keeps (absent when none). */
+export function refPlacement(body: Pick<RefBody, 'placement'>): { placement?: number[] } {
+  const p = keptPlacement(body.placement);
+  return p ? { placement: p } : {};
+}
+
+/** A NamingLookup over the kernel's `topo` (face_mass on, fast face boxes; edges with their faces and ends; vertices with their faces). */
+export function kernelLookup(kernel: KernelAdapter): NamingLookup {
+  return {
+    async faces(shape: ShapeId, indices: number[] | 'all'): Promise<TopoResult['faces']> {
+      const r = await kernel.call('topo', { id: shape, faces: indices, edges: 'none', vertices: 'none', face_bbox: 'fast', face_mass: true });
+      return r.result.faces;
+    },
+    async edges(shape: ShapeId, indices: number[] | 'all'): Promise<TopoResult['edges']> {
+      const r = await kernel.call('topo', { id: shape, faces: 'none', edges: indices, vertices: 'none', edge_length: true, edge_ends: true });
+      return r.result.edges;
+    },
+    async vertices(shape: ShapeId, indices: number[] | 'all'): Promise<TopoResult['vertices']> {
+      const r = await kernel.call('topo', { id: shape, faces: 'none', edges: 'none', vertices: indices, vertex_faces: true });
+      return r.result.vertices;
+    },
+  };
+}
+
+/**
+ * The stored reference for face `index` of a body: its current name, a
+ * semantic hint read from the name, its signature now and the body's
+ * placement. Throws when the body has no names (a bug: every feature of P2/P3
+ * names its faces).
+ */
+export async function refOfFace(lookup: NamingLookup, body: RefBody, index: number): Promise<PersistentRef> {
+  const { shape, names } = body;
+  const name = names?.faces[index];
+  if (!name) throw new Error(`face ${index} of this body has no name`);
+  const [topo] = await lookup.faces(shape, [index]);
+  if (!topo) throw new Error(`face ${index} of this body is not there`);
+  const m = /^F:([^:|]+):([^:|#]+)/.exec(name);
+  const semantic: RefSemantic | undefined = m ? { feature: m[1], role: (['side', 'start', 'end', 'import', 'primitive', 'cut', 'heal', 'moved'].includes(m[2]) ? m[2] : 'other') as RefSemantic['role'] } : undefined;
+  return { name, ...(semantic ? { semantic } : {}), signature: faceSignature(topo), ...refPlacement(body) };
+}

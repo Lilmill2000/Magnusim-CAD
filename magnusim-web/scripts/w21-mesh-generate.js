@@ -1,0 +1,2293 @@
+/**
+ * Mesh Generate (POST /api/mesh/generate).
+ * Standard (default engine)      -> scripts/generate_standard.py: gmsh uniform surface +
+ *                                   hex element core + tet shell, OpenFOAM boundary layers.
+ * Standard, engine 'cfmesh'      -> scripts/generate_cfmesh_standard.py (legacy cartesianMesh,
+ *                                   only with Hex element core on; see hexcore-cfmesh-backup rule).
+ * Hex-dominant                   -> snappyHexMesh (isolated; not the Standard path).
+ * Cell/point counts always come from the produced polyMesh.
+ */
+import { spawn, spawnSync } from 'node:child_process';
+import { spawnJob } from './job-runner.js';
+import { meshGeneratorScript } from './test-compute.js';
+import { killProcessTreeAsync } from './proc-tree.js';
+import { runProbe } from './hardware-profile.js';
+import { projectIdOrActive } from './request-scope.js';
+import { createHash, randomBytes } from 'node:crypto';
+import {
+  appendFileSync,
+  closeSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readSync,
+  writeFileSync,
+  statSync,
+} from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { deferredMeshInput, ensureBody1Stl, geomFileExists, geometrySidecarPath } from './w16-project-geometry.js';
+import { activeGeometryId } from './w16-geometry-scope.js';
+import { PYTHON, pyTool, pythonFound } from './python-env.js';
+import { wslCasePath, wslDistro } from './wsl-env.js';
+import { createJobLogger } from './log.js';
+import { envGet } from './env-compat.js';
+import { writeJsonCli } from './py-json.js';
+import { MESH_ENGINES, mesherEngineOf, mesherKeys } from './registry-defaults.js';
+import { slimLiveMeshResult, slimMeshDoc } from './mesh-live-slim.js';
+import { plainMeshFailure } from './mesh-failure.js';
+import { assembleMeshDoc, persistMeshDoc, persistOneMesh, meshCasePath, meshFolderOf } from './study-io.js';
+import { buildStampOf, generateRev, linkStartRefusal, writeBuildStamp } from './link-build.js';
+import { findGeometry, findStudy, walkGeometries } from './project-layout.js';
+import { getActiveSimulation } from './w17-sim-catalog.js';
+import { scheduleComputeQueueKick } from './server/compute-queue.ts';
+import { polyMeshComplete } from './poly-mesh.js';
+import { computeSlotHolder, claimComputeSlot, releaseComputeSlot, slotRefusal } from './compute-slot.js';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const ROOT = resolve(__dirname, '..');
+/* Scratch for the Hex-dominant (snappyHexMesh) path: bash scripts, logs, WSL case copies. */
+const REPORT_DIR = join(ROOT, '.cache', 'jobs', 'snappy');
+const _projectsRoot = envGet('PROJECTS_ROOT');
+const PROJECTS_ROOT = _projectsRoot ? resolve(_projectsRoot) : join(ROOT, 'projects');
+const ACTIVE_PATH = join(PROJECTS_ROOT, 'active.json');
+const WSL_DISTRO = wslDistro();
+/** Case layout template only — geometry surfaces overwritten from project Body1. */
+const INCREMENT = 'W25';
+const MESH_SURFACE_EXPORT_SCRIPT = pyTool('export_mesh_surface_vtp.py');
+const MESH_SURFACE_CACHE_ROOT = join(ROOT, '.cache', 'mesh-surface');
+const CFMESH_GENERATE_SCRIPT = pyTool('generate_cfmesh_standard.py');
+/** SimScale-style Standard mesher (gmsh surface + hex core + tet shell + layers). */
+const STANDARD_GENERATE_SCRIPT = pyTool('generate_standard.py');
+const PATH_CFMESH = 'cartesianMesh';
+const PATH_STANDARD = 'standard';
+const PATH_SNAPPY = 'snappyHexMesh';
+const SNAPPY_GENERATE_SCRIPT = pyTool('generate_snappy.py');
+
+/**
+ * @typedef {object} LiveMeshJob
+ * @property {import('node:child_process').ChildProcess} child
+ * @property {string} generate_id
+ * @property {string} [path_kind]
+ * @property {string|null} [project_id]
+ * @property {number} [started_at]
+ * @property {string|null} [mesh_id]
+ * @property {string|null} [mesh_name]
+ * @property {string|null} [case_dir]
+ * @property {string|null} [wsl_dst]
+ * @property {string|null} [wsl_case]
+ * @property {Function} [onUpdate]
+ * @property {boolean} [stop_requested]
+ * @property {number} [stop_requested_at]
+ * @property {boolean} [cancelled_notified]
+ */
+/** @type {null | LiveMeshJob} */
+let liveJob = null;
+
+function stampId() {
+  return randomBytes(4).toString('hex');
+}
+
+function readActiveId() {
+  if (!existsSync(ACTIVE_PATH)) return null;
+  try {
+    return JSON.parse(readFileSync(ACTIVE_PATH, 'utf8')).project_id || null;
+  } catch {
+    return null;
+  }
+}
+
+function meshJsonPath(projectId) {
+  return join(PROJECTS_ROOT, projectId, 'mesh.json');
+}
+
+function projectJsonPath(projectId) {
+  return join(PROJECTS_ROOT, projectId, 'project.json');
+}
+
+/** Title for the queue chip / "queued behind" line; null when unreadable. */
+export function projectTitleOf(projectId) {
+  if (!projectId) return null;
+  try {
+    const doc = JSON.parse(readFileSync(projectJsonPath(projectId), 'utf8'));
+    return doc && doc.title ? String(doc.title) : null;
+  } catch {
+    return null;
+  }
+}
+
+function readMeshDoc(projectId, simId, meshId) {
+  if (!projectId || !simId) return null;
+  const doc = assembleMeshDoc(projectId, simId, meshId);
+  return doc && doc.meshes && doc.meshes.length ? doc : null;
+}
+
+/** Settings for meshId only. Never fall back to catalog/first-mesh settings. */
+export function settingsForMesh(meshDoc, meshId, posted) {
+  const meshes = (meshDoc && meshDoc.meshes) || [];
+  const rec = meshId ? meshes.find((m) => m && String(m.id) === String(meshId)) : null;
+  const disk = rec && rec.settings ? rec.settings : null;
+  if (posted && typeof posted === 'object' && !Array.isArray(posted)) {
+    return { ...(disk || {}), ...posted };
+  }
+  return disk;
+}
+
+function writeMeshDoc(projectId, doc) {
+  const simId = (doc && doc.simulation_id) || '';
+  persistMeshDoc(projectId, simId, slimMeshDoc(doc) || doc);
+  return meshJsonPath(projectId);
+}
+
+function winToWsl(winPath) {
+  const posix = String(winPath).replace(/\\/g, '/');
+  const m = posix.match(/^([A-Za-z]):\/(.*)$/);
+  return m ? `/mnt/${m[1].toLowerCase()}/${m[2]}` : posix;
+}
+
+function existingFile(p) {
+  return p && existsSync(p) ? p : null;
+}
+
+/**
+ * The shape hash when `Body1.json` says its `Body1.stl` is this shape's CAD-quality
+ * input (what `ensureBody1Stl` calls cached), else null. Reads only the small json.
+ * @param {string} jsonPath
+ * @param {string} shapeSha256
+ */
+function currentInputShape(jsonPath, shapeSha256) {
+  try {
+    const meta = JSON.parse(readFileSync(jsonPath, 'utf8'));
+    return meta && meta.cad_quality === true && shapeSha256 && String(meta.shape_sha256 || '') === shapeSha256 ? shapeSha256 : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Resolve the active geometry STEP under geometries/Geometry_*.
+ * Body1.stl is optional (STEP import no longer tessellates on the way in).
+ */
+export function resolveProjectGeometry(projectId, opts) {
+  const id = projectId || projectIdOrActive('', readActiveId);
+  if (!id) {
+    return { ok: false, error: 'no active project; create W16 project + import STEP first' };
+  }
+  const projPath = projectJsonPath(id);
+  if (!existsSync(projPath)) {
+    return { ok: false, error: 'project.json missing', project_id: id };
+  }
+  let proj;
+  try {
+    proj = JSON.parse(readFileSync(projPath, 'utf8'));
+  } catch (e) {
+    return { ok: false, error: 'project.json unreadable: ' + e, project_id: id };
+  }
+  const geom = proj.geometry || {};
+  const root = join(PROJECTS_ROOT, id);
+  const walked = walkGeometries(root);
+  const meshId = opts && opts.meshId;
+  let preferId = (opts && (opts.geometryId || opts.geomId)) || null;
+  if (!preferId && meshId) {
+    const simId = studyIdForMesh(id, meshId);
+    const study = simId ? findStudy(root, simId) : null;
+    if (study && study.geometry_id) preferId = String(study.geometry_id);
+  }
+  const part =
+    (proj.geometries || []).find((g) => g && g.id === (preferId || proj.active_geometry_id || (geom && geom.id))) ||
+    (proj.geometries || [])[0] ||
+    walked[0] ||
+    null;
+  const found = part && part.id ? findGeometry(root, part.id) : walked[0] || null;
+  const partDir = (found && found.dir) || null;
+  // A mesh import (STL/OBJ/PLY) has its binary BREP sidecar at once and writes
+  // source.step in the background; meshing reads the sidecar, so it need not wait.
+  const step_path =
+    [partDir && join(partDir, 'source.step'), part && part.step_path, geom.step_path].find(
+      (p) => p && geomFileExists(p),
+    ) || null;
+  const body1_path =
+    existingFile(partDir && join(partDir, 'Body1.stl')) ||
+    existingFile(part && part.stl_path) ||
+    existingFile(geom.stl_path);
+  if (!step_path) {
+    return {
+      ok: false,
+      error: 'W16 source.step missing — import geometry first',
+      project_id: id,
+      step_path: (part && part.step_path) || (partDir && join(partDir, 'source.step')) || geom.step_path || null,
+      body1_path,
+    };
+  }
+  const stepOnDisk = existsSync(step_path);
+  const geomFile = stepOnDisk ? step_path : geometrySidecarPath(step_path);
+  const stepSt = statSync(geomFile);
+  if (stepSt.size < 32) {
+    return {
+      ok: false,
+      error: 'geometry files too small / empty',
+      project_id: id,
+      step_path,
+      body1_path,
+      step_bytes: stepSt.size,
+    };
+  }
+  // Only a record in the mesh metadata: hash small STEPs, never read a large one
+  // (a 118k-triangle STL makes a ~290 MB STEP) just to fingerprint it.
+  const step_sha256 =
+    stepOnDisk && stepSt.size <= 32 * 1024 * 1024
+      ? createHash('sha256').update(readFileSync(step_path)).digest('hex')
+      : null;
+  const geometry_stamp = { file: geomFile, bytes: stepSt.size, mtime_ms: stepSt.mtimeMs };
+  let body1_bytes = 0;
+  let body1_sha256 = null;
+  // A linked or display-budgeted geometry (LINK 5.9): its Body1.stl, which can be
+  // hundreds of MB, is never read here. The Hex-dominant caller gives Body1.json's shape
+  // hash (null while the mesh job has yet to build the file); for any other caller
+  // (Standard, cfMesh) it is taken from Body1.json the same way.
+  const givenHash = opts && Object.prototype.hasOwnProperty.call(opts, 'body1Sha256');
+  const deferred = !givenHash && partDir ? deferredMeshInput(partDir) : null;
+  if (body1_path) {
+    const bodySt = statSync(body1_path);
+    body1_bytes = bodySt.size;
+    if (givenHash) {
+      body1_sha256 = opts.body1Sha256 || null;
+    } else if (deferred) {
+      body1_sha256 = currentInputShape(join(partDir, 'Body1.json'), deferred.shapeSha256);
+    } else if (bodySt.size >= 100) {
+      body1_sha256 = createHash('sha256').update(readFileSync(body1_path)).digest('hex');
+    }
+  }
+  return {
+    ok: true,
+    project_id: id,
+    step_path,
+    body1_path,
+    step_bytes: stepSt.size,
+    body1_bytes,
+    step_sha256,
+    geometry_stamp,
+    body1_sha256,
+    geometry_name: (part && part.name) || geom.name || null,
+    wsl_step: winToWsl(step_path),
+    wsl_body1: body1_path ? winToWsl(body1_path) : null,
+    cad_faces_path: partDir ? join(partDir, 'cad_faces.vtp') : null,
+    bounds:
+      (geom.fingerprint && geom.fingerprint.bounds) ||
+      (geom.fingerprint &&
+        geom.fingerprint.convert_meta &&
+        geom.fingerprint.convert_meta.bounds) ||
+      null,
+  };
+}
+
+function clampFineness(fineness) {
+  const f = Math.round(Number(fineness));
+  if (!Number.isFinite(f)) return 5;
+  return Math.max(1, Math.min(10, f));
+}
+
+/** Leading bytes of a file as latin1 text (one char per byte), or '' when unreadable. */
+function readFileHead(path, bytes = 8192) {
+  let fd = null;
+  try {
+    fd = openSync(path, 'r');
+    const buf = Buffer.alloc(bytes);
+    const n = readSync(fd, buf, 0, bytes, 0);
+    return buf.subarray(0, n).toString('latin1');
+  } catch {
+    return '';
+  } finally {
+    if (fd != null) closeSync(fd);
+  }
+}
+
+/** Offset just past the "(" that opens a FoamFile's list, and its declared length. */
+function foamListStart(head) {
+  const close = head.indexOf('}');
+  if (close < 0) return null;
+  const re = /(\d+)\s*\(/g;
+  re.lastIndex = close;
+  const m = re.exec(head);
+  return m ? { count: Number(m[1]), offset: m.index + m[0].length } : null;
+}
+
+/**
+ * Point/cell/face counts of a polyMesh. OpenFOAM's header note has all three
+ * (checkMesh-free); otherwise the owner list is read in its own format. Mesh
+ * writers here use binary, which a text parse got wrong (8 cells for 677k).
+ */
+export function readPolyMeshCounts(polyMeshDir) {
+  const pointsPath = join(polyMeshDir, 'points');
+  const ownerPath = join(polyMeshDir, 'owner');
+  if (!existsSync(pointsPath) || !existsSync(ownerPath)) {
+    return {
+      n_points: null,
+      n_cells: null,
+      n_faces: null,
+      points_path: pointsPath,
+      owner_path: ownerPath,
+    };
+  }
+  const ownerHead = readFileHead(ownerPath);
+  const note = /nPoints:\s*(\d+)\s+nCells:\s*(\d+)\s+nFaces:\s*(\d+)/.exec(ownerHead);
+  if (note) {
+    return {
+      n_points: Number(note[1]),
+      n_cells: Number(note[2]),
+      n_faces: Number(note[3]),
+      points_path: pointsPath,
+      owner_path: ownerPath,
+      source: 'polyMesh/owner note',
+    };
+  }
+  const pointsList = foamListStart(readFileHead(pointsPath));
+  const n_points = pointsList ? pointsList.count : null;
+  let n_faces = null;
+  let n_cells = null;
+  const list = foamListStart(ownerHead);
+  if (list) {
+    n_faces = list.count;
+    const buf = readFileSync(ownerPath);
+    let maxOwner = -1;
+    if (/format\s+binary/.test(ownerHead)) {
+      const wide = /label\s*=\s*64/.test(ownerHead);
+      const size = wide ? 8 : 4;
+      const end = Math.min(buf.length, list.offset + list.count * size);
+      for (let at = list.offset; at + size <= end; at += size) {
+        const v = wide ? Number(buf.readBigInt64LE(at)) : buf.readInt32LE(at);
+        if (v > maxOwner) maxOwner = v;
+      }
+    } else {
+      const body = buf.toString('latin1', list.offset);
+      const stop = body.indexOf(')');
+      for (const tok of (stop >= 0 ? body.slice(0, stop) : body).split(/\s+/)) {
+        if (!tok) continue;
+        const v = Number(tok);
+        if (Number.isInteger(v) && v > maxOwner) maxOwner = v;
+      }
+    }
+    n_cells = maxOwner >= 0 ? maxOwner + 1 : null;
+  }
+  return {
+    n_points,
+    n_cells,
+    n_faces,
+    points_path: pointsPath,
+    owner_path: ownerPath,
+    source: 'polyMesh/points+owner',
+  };
+}
+
+function readEmeshStats(emeshPath) {
+  if (!existsSync(emeshPath)) return { present: false, n_points: null, n_edges: null, bytes: 0 };
+  const st = statSync(emeshPath);
+  const lines = readFileSync(emeshPath, 'utf8').split(/\r?\n/);
+  const ints = [];
+  let past = false;
+  for (let i = 0; i < lines.length; i++) {
+    const s = lines[i].trim();
+    if (!past) {
+      if (s === '}' || s.startsWith('// *****')) past = true;
+      continue;
+    }
+    if (/^\d+$/.test(s)) ints.push(parseInt(s, 10));
+    if (ints.length >= 2) break;
+  }
+  return {
+    present: true,
+    n_points: ints[0] ?? null,
+    n_edges: ints[1] ?? null,
+    bytes: st.size,
+    path: emeshPath,
+  };
+}
+
+function fingerprintPolyMesh(polyMeshDir) {
+  const pointsPath = join(polyMeshDir, 'points');
+  const ownerPath = join(polyMeshDir, 'owner');
+  const h = createHash('sha256');
+  if (existsSync(pointsPath)) {
+    const st = statSync(pointsPath);
+    h.update(`points:${st.size}:${st.mtimeMs}`);
+    const buf = readFileSync(pointsPath);
+    h.update(buf.subarray(0, Math.min(2048, buf.length)));
+    if (buf.length > 2048) h.update(buf.subarray(buf.length - 2048));
+  }
+  if (existsSync(ownerPath)) {
+    const st = statSync(ownerPath);
+    h.update(`owner:${st.size}:${st.mtimeMs}`);
+    const buf = readFileSync(ownerPath);
+    h.update(buf.subarray(0, Math.min(2048, buf.length)));
+    if (buf.length > 2048) h.update(buf.subarray(buf.length - 2048));
+  }
+  const counts = readPolyMeshCounts(polyMeshDir);
+  h.update(`cells:${counts.n_cells}:pts:${counts.n_points}`);
+  return { sha256: h.digest('hex'), ...counts };
+}
+
+function polyMeshCacheToken(caseDir) {
+  try {
+    const txt = readFileSync(join(caseDir, 'constant', 'polyMesh', 'owner'), 'utf8').slice(0, 1600);
+    const cells = /nCells:(\d+)/.exec(txt);
+    const pts = /nPoints:(\d+)/.exec(txt);
+    if (cells && pts) return `c${cells[1]}p${pts[1]}`;
+  } catch {}
+  try {
+    const st = statSync(join(caseDir, 'constant', 'polyMesh', 'points'));
+    return `t${st.mtimeMs}s${st.size}`;
+  } catch {
+    return '0';
+  }
+}
+
+function meshSurfaceCacheKey(caseDir) {
+  const h = createHash('sha256')
+    .update(String(caseDir) + '|' + polyMeshCacheToken(caseDir))
+    .digest('hex')
+    .slice(0, 16);
+  return join(MESH_SURFACE_CACHE_ROOT, `surface-${h}.vtp`);
+}
+
+function prewarmMeshSurface(winOut) {
+  if (!existsSync(MESH_SURFACE_EXPORT_SCRIPT) || !pythonFound()) {
+    return { ok: false, skipped: 'missing_tool' };
+  }
+  mkdirSync(MESH_SURFACE_CACHE_ROOT, { recursive: true });
+  const outVtp = meshSurfaceCacheKey(winOut);
+  const metaPath = outVtp.replace(/\.vtp$/i, '.meta.json');
+  const r = spawnSync(
+    PYTHON,
+    [MESH_SURFACE_EXPORT_SCRIPT, '--case', winOut, '--out', outVtp, '--meta', metaPath],
+    { encoding: 'utf8', timeout: 180000, windowsHide: true }
+  );
+  return { ok: r.status === 0 && existsSync(outVtp), path: outVtp, status: r.status };
+}
+
+export function pidIsAlive(pid) {
+  const n = Number(pid);
+  if (!Number.isFinite(n) || n <= 0) return false;
+  try {
+    process.kill(n, 0);
+    return true;
+  } catch (e) {
+    if (e && (e.code === 'EPERM' || e.code === 'EACCES')) return true;
+    return false;
+  }
+}
+
+export function liveChildIsRunning(child) {
+  if (!child || child.killed) return false;
+  if (child.exitCode != null || child.signalCode) return false;
+  if (!child.pid) return false;
+  return pidIsAlive(child.pid);
+}
+
+function dropDeadLiveJob() {
+  if (!liveJob) return;
+  if (!liveChildIsRunning(liveJob.child)) liveJob = null;
+}
+
+export function isLiveMeshJobHeld() {
+  dropDeadLiveJob();
+  return !!(liveJob && liveChildIsRunning(liveJob.child));
+}
+
+/** How long 'close' may trail 'exit' before the pipes count as held by orphans. */
+const ORPHAN_PIPE_GRACE_MS = 4000;
+
+/**
+ * A generator that is killed or crashes can leave its own children (the real
+ * python behind the venv launcher, gmsh, wsl.exe) holding stdout. Then 'close'
+ * never fires: mesh.json stays "running" and the queue is never kicked. After
+ * 'exit', give 'close' a short grace, then call onOrphaned (reap the leftovers)
+ * and drop the pipes so 'close' runs and the job finishes as failed.
+ * @param {import('node:child_process').ChildProcess} child
+ * @param {{ graceMs?: number, onOrphaned?: () => void }} [opts]
+ */
+export function closeAfterExit(child, { graceMs = ORPHAN_PIPE_GRACE_MS, onOrphaned } = {}) {
+  let closed = false;
+  child.once('close', () => {
+    closed = true;
+  });
+  child.once('exit', () => {
+    const timer = setTimeout(() => {
+      if (closed) return;
+      try {
+        if (onOrphaned) onOrphaned();
+      } catch {
+        /* ignore */
+      }
+      for (const stream of [child.stdout, child.stderr]) {
+        try {
+          if (stream) stream.destroy();
+        } catch {
+          /* ignore */
+        }
+      }
+    }, graceMs);
+    if (timer.unref) timer.unref();
+  });
+}
+
+/** How often, and how long after its generator is gone, watchGeneratorGone ends a job. */
+const GONE_POLL_MS = 2000;
+const GONE_GRACE_MS = ORPHAN_PIPE_GRACE_MS + 4000;
+
+/**
+ * The last guard against a mesh that shows "meshing" for ever: when the generator is
+ * gone (it exited, crashed or was killed) and its 'close' has still not come a grace
+ * later (closeAfterExit normally brings it within ORPHAN_PIPE_GRACE_MS), drop the pipes
+ * and send 'close' with its exit code, so the job ends failed and frees the slot.
+ * @param {import('node:child_process').ChildProcess} child
+ * @param {{ pollMs?: number, graceMs?: number, alive?: (child: any) => boolean }} [opts]
+ * @returns {() => void} stops the watch
+ */
+export function watchGeneratorGone(child, { pollMs = GONE_POLL_MS, graceMs = GONE_GRACE_MS, alive = liveChildIsRunning } = {}) {
+  let closed = false;
+  let goneAt = 0;
+  const timer = setInterval(() => {
+    // Never spawned: its 'error' handler already ended the job.
+    if (closed || !child.pid) {
+      clearInterval(timer);
+      return;
+    }
+    if (alive(child)) {
+      goneAt = 0;
+      return;
+    }
+    if (!goneAt) {
+      goneAt = Date.now();
+      return;
+    }
+    if (Date.now() - goneAt < graceMs) return;
+    clearInterval(timer);
+    for (const stream of [child.stdout, child.stderr]) {
+      try {
+        if (stream) stream.destroy();
+      } catch {
+        /* ignore */
+      }
+    }
+    if (!closed) child.emit('close', child.exitCode ?? null, child.signalCode ?? null);
+  }, pollMs);
+  if (timer.unref) timer.unref();
+  child.once('close', () => {
+    closed = true;
+    clearInterval(timer);
+  });
+  return () => clearInterval(timer);
+}
+
+/** Record a generate's end and tell its job; a failed write must not leave the job "running". */
+function reportMeshEnd(projectId, terminal, onUpdate) {
+  try {
+    persistMeshResult(projectId, terminal);
+  } catch (e) {
+    console.warn('[CFD] mesh result write', e);
+  }
+  try {
+    onUpdate(terminal);
+  } catch (e) {
+    console.warn('[CFD] mesh result update', e);
+  }
+  scheduleComputeQueueKick(250);
+}
+
+/**
+ * Run a generate's close handler once (a 'close' from watchGeneratorGone may be followed
+ * by the real one). If it throws before it reports the end, onCloseError reports it.
+ * @param {(code: number | null, signal: string | null) => void} onClose
+ * @param {(code: number | null, signal: string | null, err: unknown) => void} onCloseError
+ */
+function closeOnce(onClose, onCloseError) {
+  let done = false;
+  return (code, signal) => {
+    if (done) return;
+    done = true;
+    try {
+      onClose(code, signal);
+    } catch (err) {
+      onCloseError(code, signal, err);
+    }
+  };
+}
+
+/** Kill what a dead generator left behind, unless a new generate already owns that case folder. */
+function reapAfterDeadGenerator(job, caseDir) {
+  if (!(liveJob && liveJob !== job && liveJob.case_dir && caseDir && liveJob.case_dir === caseDir)) {
+    void reapStaleMeshGenerators(caseDir);
+  }
+  killWslMeshCase(job);
+}
+
+/**
+ * @param {LiveMeshJob | null | undefined} live
+ * @param {{ meshId?: string, projectId?: string }} [ids]
+ */
+export function meshStopMatchesLive(live, { meshId, projectId } = {}) {
+  if (!live) return { match: false, reason: 'idle' };
+  if (meshId && live.mesh_id && String(live.mesh_id) !== String(meshId)) {
+    return { match: false, reason: 'other_mesh' };
+  }
+  if (projectId && live.project_id && String(live.project_id) !== String(projectId)) {
+    return { match: false, reason: 'other_project' };
+  }
+  return { match: true, reason: 'ok' };
+}
+
+/** @param {{ stopRequested?: boolean, ok?: boolean }} [close] */
+export function meshCloseStatus({ stopRequested, ok } = {}) {
+  if (stopRequested) return 'stopped';
+  return ok ? 'done' : 'failed';
+}
+
+function bindLiveMeshJob({
+  child,
+  generate_id,
+  path_kind,
+  project_id,
+  started_at,
+  mesh_id,
+  mesh_name,
+  case_dir,
+  wsl_dst,
+  onUpdate,
+}) {
+  const job = {
+    child,
+    generate_id,
+    path_kind,
+    project_id,
+    started_at,
+    mesh_id: mesh_id || null,
+    mesh_name: mesh_name || null,
+    case_dir: case_dir || null,
+    wsl_dst: wsl_dst || null,
+    wsl_case: wsl_dst ? wslCasePath(wsl_dst) : null,
+    onUpdate: typeof onUpdate === 'function' ? onUpdate : () => {},
+    stop_requested: false,
+    cancelled_notified: false,
+  };
+  liveJob = job;
+  return job;
+}
+
+/** @type {((caseDir: string) => Promise<number[]>) | null} */
+let staleGeneratorFinder = null;
+
+/**
+ * Tests: how leftover generators of a case folder are found (null: PowerShell on Windows,
+ * none elsewhere).
+ * @param {((caseDir: string) => Promise<number[]>) | null} fn
+ */
+export function setStaleGeneratorFinderForTests(fn) {
+  staleGeneratorFinder = fn;
+}
+
+/**
+ * The pids of generate_* processes whose command line names this case folder: PowerShell's
+ * process list on Windows (up to 15 s), as a child process the server keeps running beside.
+ * @param {string} caseDir
+ * @returns {Promise<number[]>}
+ */
+async function staleGeneratorPids(caseDir) {
+  if (staleGeneratorFinder) return staleGeneratorFinder(caseDir);
+  if (process.platform !== 'win32') return [];
+  const like = '*' + String(caseDir).replace(/'/g, "''") + '*';
+  const r = await runProbe(
+    'powershell.exe',
+    [
+      '-NoProfile',
+      '-NonInteractive',
+      '-Command',
+      "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and ($_.CommandLine -like '*generate_standard.py*' -or $_.CommandLine -like '*generate_snappy.py*' -or $_.CommandLine -like '*generate_cfmesh_standard.py*') -and $_.CommandLine -like '" +
+        like +
+        "' } | ForEach-Object { $_.ProcessId }",
+    ],
+    15000,
+  );
+  return String(r.stdout || '')
+    .split(/\s+/)
+    .map(Number)
+    .filter((pid) => Number.isInteger(pid) && pid > 0);
+}
+
+/**
+ * Kill leftover generate_* processes still pointed at this mesh case folder. It never holds the
+ * server: the search (PowerShell, up to 15 s) and the kills (taskkill) run as child processes,
+ * and the promise resolves once they ended. A caller that deletes the folder next awaits it.
+ * @param {string | null | undefined} caseDir
+ * @returns {Promise<void>}
+ */
+export function reapStaleMeshGenerators(caseDir) {
+  if (!caseDir) return Promise.resolve();
+  /** @type {Promise<unknown>[]} */
+  const kills = [];
+  const lockPath = join(caseDir, '.generate.lock');
+  try {
+    if (existsSync(lockPath)) {
+      const prev = JSON.parse(readFileSync(lockPath, 'utf8'));
+      if (prev && prev.pid) kills.push(killProcessTreeAsync(prev.pid));
+    }
+  } catch {
+    /* ignore */
+  }
+  kills.push(
+    staleGeneratorPids(caseDir)
+      .then((pids) => Promise.all(pids.map((pid) => killProcessTreeAsync(pid))))
+      .catch(() => undefined),
+  );
+  return Promise.all(kills).then(() => undefined);
+}
+
+function killWslMeshCase(job) {
+  const needles = [];
+  if (job && job.wsl_dst) needles.push(String(job.wsl_dst));
+  if (job && job.generate_id) {
+    needles.push(`cfddesk-cfdweb-${job.generate_id}`);
+    needles.push(`cfddesk-w25-${job.generate_id}`);
+  }
+  if (job && job.wsl_case) {
+    const last = String(job.wsl_case)
+      .split('/')
+      .filter(Boolean)
+      .pop();
+    if (last) needles.push(last);
+  }
+  const cleaned = [
+    ...new Set(
+      needles
+        .map((s) => String(s || '').replace(/[^a-zA-Z0-9._-]/g, ''))
+        .filter(Boolean)
+    ),
+  ];
+  if (!cleaned.length) return;
+  try {
+    const child = spawn(
+      'wsl',
+      ['-d', wslDistro(), '--', 'bash', '-lc', `pkill -f ${JSON.stringify(cleaned.join('|'))} || true`],
+      { windowsHide: true, stdio: 'ignore' }
+    );
+    // No wsl (WSL not installed, or a Linux host) comes as an 'error' event, not a throw:
+    // unheard, it would end the whole server.
+    child.on('error', () => {});
+  } catch {
+    /* ignore */
+  }
+}
+
+function notifyMeshStopped(job) {
+  if (!job || job.cancelled_notified) return;
+  job.cancelled_notified = true;
+  const terminal = {
+    status: 'stopped',
+    mode: 'mesh',
+    path_kind: job.path_kind || PATH_CFMESH,
+    generate_id: job.generate_id,
+    kick_id: job.generate_id,
+    pid: null,
+    exit_code: null,
+    finished_at: new Date().toISOString(),
+    project_id: job.project_id,
+    mesh_id: job.mesh_id,
+    wsl_case: job.wsl_case,
+    stage: 'stopped',
+    error: 'cancelled',
+    note: 'Mesh generate cancelled.',
+    increment: INCREMENT,
+  };
+  try {
+    persistMeshResult(job.project_id, terminal);
+  } catch {
+    /* ignore */
+  }
+  try {
+    job.onUpdate(terminal);
+  } catch {
+    /* ignore */
+  }
+  scheduleComputeQueueKick(250);
+}
+
+/** Kill the live generate for this mesh so the next queued job can start. */
+/** @param {{ meshId?: string, projectId?: string }} [ids] */
+export function stopMeshGenerate({ meshId, projectId } = {}) {
+  dropDeadLiveJob();
+  const job = liveJob;
+  const match = meshStopMatchesLive(job, { meshId, projectId });
+  const id = projectId || (job && job.project_id) || projectIdOrActive('', readActiveId);
+  const mid = meshId || (job && job.mesh_id);
+  let caseDir = null;
+  if (id && mid) {
+    try {
+      caseDir = meshCasePath(id, mid, studyIdForMesh(id, mid));
+    } catch {
+      caseDir = null;
+    }
+  }
+  if (!match.match) {
+    return {
+      ok: true,
+      status: 200,
+      bodyExtra: { ok: true, stopped: !!caseDir, reason: match.reason, increment: INCREMENT },
+      reaped: reapStaleMeshGenerators(caseDir),
+    };
+  }
+  job.stop_requested = true;
+  job.stop_requested_at = Date.now();
+  const pid = job.child && job.child.pid;
+  try {
+    job.child.kill();
+  } catch {
+    /* ignore */
+  }
+  // The kills run beside the server (never taskkill or PowerShell with spawnSync).
+  const reaped = Promise.all([killProcessTreeAsync(pid), reapStaleMeshGenerators(caseDir)]).then(() => undefined);
+  killWslMeshCase(job);
+  notifyMeshStopped(job);
+  if (liveJob === job) liveJob = null;
+  return {
+    ok: true,
+    status: 200,
+    bodyExtra: {
+      ok: true,
+      stopped: true,
+      mesh_id: job.mesh_id || meshId || null,
+      generate_id: job.generate_id || null,
+      increment: INCREMENT,
+    },
+    // Resolves once the generator and what it left are gone: a delete awaits it before it removes files.
+    reaped,
+  };
+}
+
+/**
+ * The mesh's Stop (POST /api/mesh/stop): ends its generate and keeps everything else (the
+ * mesh record, its settings, its refinements). The generate this server runs is stopped
+ * as Delete stops it; one a previous server left running (its record says running and its
+ * generator lives) is killed by its case folder and recorded stopped. Anything else is
+ * not running: `{ stopped: false }`.
+ * @param {{ meshId: string, projectId: string }} ids
+ * @returns {{ stopped: boolean, generate_id?: string | null, reaped: Promise<void> }}
+ */
+export function stopMeshGenerating({ meshId, projectId }) {
+  dropDeadLiveJob();
+  if (liveJob && meshStopMatchesLive(liveJob, { meshId, projectId }).match && String(liveJob.mesh_id || '') === String(meshId)) {
+    const r = stopMeshGenerate({ meshId, projectId });
+    return { stopped: true, generate_id: (r.bodyExtra && r.bodyExtra.generate_id) || null, reaped: r.reaped };
+  }
+  let rec = null;
+  try {
+    rec = meshLiveRecord(projectId, meshId);
+  } catch {
+    rec = null;
+  }
+  if (!rec || rec.status !== 'running' || !meshGeneratorAlive(rec)) return { stopped: false, reaped: Promise.resolve() };
+  // Unowned: kill what runs on its case folder (stopMeshGenerate reaps it when no live job matches).
+  const killed = rec.pid ? killProcessTreeAsync(rec.pid) : Promise.resolve();
+  const stop = stopMeshGenerate({ meshId, projectId });
+  killWslMeshCase({ generate_id: rec.generate_id, wsl_case: rec.wsl_case });
+  persistMeshResult(projectId, {
+    ...rec,
+    mesh_id: meshId,
+    status: 'stopped',
+    stage: 'stopped',
+    pid: null,
+    error: 'cancelled',
+    finished_at: new Date().toISOString(),
+    note: 'Mesh generate cancelled.',
+  });
+  scheduleComputeQueueKick(250);
+  return { stopped: true, generate_id: rec.generate_id || null, reaped: Promise.all([killed, stop.reaped]).then(() => undefined) };
+}
+
+/** Case on disk is a finished generate even if mesh.json never flipped. */
+export function inspectGeneratedCase(caseDir) {
+  if (!caseDir) return null;
+  const polyDir = join(caseDir, 'constant', 'polyMesh');
+  // A generate killed mid copy-back leaves a partial polyMesh: not a mesh.
+  if (!polyMeshComplete(polyDir)) return null;
+  let n_cells = null;
+  let n_points = null;
+  let n_faces = null;
+  let source = null;
+  let generate_id = null;
+  const countsJson = join(caseDir, 'w21-counts.json');
+  if (existsSync(countsJson)) {
+    try {
+      const j = JSON.parse(readFileSync(countsJson, 'utf8'));
+      n_cells = j.n_cells ?? null;
+      n_points = j.n_points ?? null;
+      n_faces = j.n_faces ?? null;
+      generate_id = j.generate_id != null ? String(j.generate_id) : null;
+      source = j.source || 'w21-counts.json';
+    } catch {
+      /* ignore */
+    }
+  }
+  let script_ok = false;
+  for (const name of ['log.standard_generate.txt', 'log.cartesianMesh', 'log.snappyHexMesh']) {
+    const p = join(caseDir, name);
+    if (!existsSync(p)) continue;
+    try {
+      const t = readFileSync(p, 'utf8');
+      if (t.includes('MESH_SCRIPT_OK') || /mesh OK/i.test(t) || /End\b/.test(t)) {
+        script_ok = true;
+        break;
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  return {
+    ok: true,
+    case_dir: caseDir,
+    mesh_path: polyDir,
+    n_cells,
+    n_points,
+    n_faces,
+    counts_source: source || 'polyMesh/points',
+    generate_id,
+    script_ok,
+  };
+}
+
+export function recoverStudyMeshesFromDisk(projectId, simId) {
+  if (!projectId || !simId) return 0;
+  dropDeadLiveJob();
+  const doc = assembleMeshDoc(projectId, simId);
+  let n = 0;
+  for (const m of doc.meshes || []) {
+    if (!m || !m.id) continue;
+    if (isLiveMeshJobHeld() && liveJob.mesh_id && String(liveJob.mesh_id) === String(m.id)) continue;
+    const live = m.live_mesh_result;
+    if (live && (live.status === 'stopped' || live.status === 'cancelled')) continue;
+    if (m.generated && live && live.status === 'done') continue;
+    const caseDir = (live && live.case_dir) || m.case_dir || meshCasePath(projectId, m.id, simId);
+    const found = inspectGeneratedCase(caseDir);
+    if (!found) continue;
+    // Its build stamp (host API 1.5): the one its generate wrote at its start, else unknown.
+    const generateId = found.generate_id || (live && live.generate_id) || null;
+    const builtFromRev =
+      buildStampOf(projectId, m.id, generateId) ??
+      (live && generateId && String(live.generate_id || '') === String(generateId) && typeof live.built_from_rev === 'number'
+        ? live.built_from_rev
+        : null);
+    persistMeshResult(projectId, {
+      ...(builtFromRev !== null ? { built_from_rev: builtFromRev } : {}),
+      status: 'done',
+      mesh_id: m.id,
+      simulation_id: simId,
+      path_kind: (live && live.path_kind) || PATH_STANDARD,
+      generate_id: found.generate_id || (live && live.generate_id) || null,
+      case_dir: found.case_dir,
+      mesh_path: found.mesh_path,
+      n_cells: found.n_cells,
+      n_points: found.n_points,
+      n_faces: found.n_faces,
+      counts_source: found.counts_source,
+      finished_at: new Date().toISOString(),
+      note:
+        found.n_cells != null
+          ? `Recovered generated mesh from case (${found.n_cells} cells).`
+          : 'Recovered generated mesh from polyMesh on disk.',
+    });
+    n += 1;
+  }
+  return n;
+}
+
+
+function studyIdForMesh(projectId, meshId) {
+  const folder = meshId ? meshFolderOf(projectId, meshId) : null;
+  return folder && folder.simulation_id ? String(folder.simulation_id) : '';
+}
+
+/** The geometry a mesh's study lives on ('' when unknown). */
+function studyGeometryIdForMesh(projectId, meshId) {
+  const folder = projectId && meshId ? meshFolderOf(projectId, meshId) : null;
+  return folder && folder.geometry_id ? String(folder.geometry_id) : '';
+}
+
+/**
+ * A generate's build stamp (host API 1.5, LINK 5.15): the linked geometry's rev now, in
+ * the step that spawns, also written beside the case for a recovery; with the stamp of
+ * the mesh it replaces, for a generate interrupted with that mesh kept. Empty when no link
+ * made the geometry.
+ */
+function buildStampFields(projectId, meshId, simId, generateId) {
+  const rev = generateRev(projectId, simId);
+  try {
+    writeBuildStamp(projectId, meshId, generateId, rev);
+  } catch (e) {
+    console.warn('[CFD] mesh build stamp', e);
+  }
+  if (rev === null) return {};
+  const folder = meshFolderOf(projectId, meshId, simId);
+  const prev = folder && folder.live_mesh_result;
+  const prevRev = prev && prev.status === 'done' && typeof prev.built_from_rev === 'number' ? prev.built_from_rev : null;
+  return { built_from_rev: rev, ...(prevRev !== null ? { prev_built_from_rev: prevRev } : {}) };
+}
+
+export function persistMeshResult(projectId, resultFields) {
+  if (!projectId) return null;
+  const simId =
+    (resultFields && resultFields.simulation_id) ||
+    studyIdForMesh(projectId, resultFields && resultFields.mesh_id);
+  /** @type {{ meshes?: any[], active_id?: string, id?: string, out_of_scope?: unknown, [k: string]: any }} */
+  const existing = readMeshDoc(projectId, simId) || {};
+  const now = new Date().toISOString();
+  const pathKind = resultFields.path_kind || PATH_SNAPPY;
+  const increment = resultFields.increment || INCREMENT;
+  const live = {
+    status: resultFields.status,
+    path_kind: pathKind,
+    generate_id: resultFields.generate_id,
+    pid: resultFields.pid,
+    exit_code: resultFields.exit_code,
+    command: resultFields.command,
+    log_path: resultFields.log_path,
+    log_excerpt: slimLiveMeshResult({ log_excerpt: resultFields.log_excerpt || null }).log_excerpt,
+    wsl_case: resultFields.wsl_case,
+    case_dir: resultFields.case_dir,
+    mesh_path:
+      resultFields.mesh_path ||
+      (resultFields.case_dir ? join(resultFields.case_dir, 'constant', 'polyMesh') : null),
+    n_cells: resultFields.n_cells ?? null,
+    n_points: resultFields.n_points ?? null,
+    n_faces: resultFields.n_faces ?? null,
+    counts_source: resultFields.counts_source || null,
+    emesh: resultFields.emesh || null,
+    feature_marks_total: resultFields.feature_marks_total ?? null,
+    fingerprint_before: resultFields.fingerprint_before || null,
+    fingerprint_after: resultFields.fingerprint_after || null,
+    started_at: resultFields.started_at,
+    finished_at: resultFields.finished_at || null,
+    settings_snapshot: resultFields.settings_snapshot || null,
+    geometry: resultFields.geometry || null,
+    step_path: resultFields.step_path || null,
+    body1_path: resultFields.body1_path || null,
+    engine: resultFields.engine || null,
+    mesh_backend: resultFields.mesh_backend || null,
+    stage: resultFields.stage || null,
+    stage_detail: resultFields.stage_detail || null,
+    error: resultFields.error || null,
+    hex_core_applied: resultFields.hex_core_applied ?? null,
+    layers_applied: resultFields.layers_applied ?? null,
+    surface_size_m: resultFields.surface_size_m ?? null,
+    // Host API 1.8: a mesh of several regions (a study's materials), one cellZone each.
+    regions: Array.isArray(resultFields.regions) ? resultFields.regions : null,
+    // Host API 1.8: bodies no material names, left out of the mesh.
+    left_out: Array.isArray(resultFields.left_out) ? resultFields.left_out : null,
+    note: resultFields.note,
+    increment,
+  };
+  // The build stamp (host API 1.5): the rev this generate started from, set here only.
+  if (typeof resultFields.built_from_rev === 'number') live.built_from_rev = resultFields.built_from_rev;
+  if (typeof resultFields.prev_built_from_rev === 'number') live.prev_built_from_rev = resultFields.prev_built_from_rev;
+  const fallbackNote =
+    resultFields.status === 'done'
+      ? `Mesh done: ${live.n_cells} cells, ${live.n_points} points.`
+      : resultFields.status === 'failed'
+        ? `Mesh failed (exit ${resultFields.exit_code}).`
+        : resultFields.status === 'stopped'
+          ? 'Mesh generate cancelled.'
+          : 'Mesh running.';
+  const generated = resultFields.status === 'done';
+  const meshId = resultFields.mesh_id || null;
+  const ownedCase = meshId ? meshCasePath(projectId, meshId, simId) : null;
+  if (ownedCase) {
+    live.case_dir = ownedCase;
+    live.mesh_path = join(ownedCase, 'constant', 'polyMesh');
+  }
+  let meshes = Array.isArray(existing.meshes) ? existing.meshes.slice() : null;
+  if (meshes && meshes.length) {
+    if (!meshId) return existing;
+    const matchesLive = (m) => !!(m && String(m.id) === String(meshId));
+    let hit = 0;
+    meshes = meshes.map((m) => {
+      if (!matchesLive(m)) return m;
+      hit += 1;
+      return {
+        ...m,
+        generated,
+        live_mesh_result: live,
+        updated_at: now,
+      };
+    });
+    if (!hit) return existing;
+    const nextActive =
+      (existing.active_id && meshes.some((m) => m && m.id === existing.active_id)
+        ? existing.active_id
+        : null) ||
+      (meshId && meshes.some((m) => m && m.id === meshId) ? meshId : null);
+    const activeEntry = meshes.find((m) => m && m.id === nextActive) || null;
+    const doc = {
+      ...existing,
+      generated: !!(activeEntry && activeEntry.generated),
+      generate_available: true,
+      live_mesh_result: (activeEntry && activeEntry.live_mesh_result) || null,
+      note: resultFields.note || fallbackNote,
+      updated_at: now,
+      increment,
+      active_id: nextActive,
+      meshes,
+    };
+    delete doc.out_of_scope;
+    const updated = meshes.find((m) => m && String(m.id) === String(meshId));
+    if (updated) persistOneMesh(projectId, simId, { ...updated, simulation_id: simId }, { generator: true });
+    return assembleMeshDoc(projectId, simId, meshId);
+  }
+  const doc = {
+    ...existing,
+    generated,
+    generate_available: true,
+    live_mesh_result: live,
+    note: resultFields.note || fallbackNote,
+    updated_at: now,
+    increment,
+    active_id: existing.active_id || existing.id || meshId || null,
+  };
+  delete doc.out_of_scope;
+  writeMeshDoc(projectId, slimMeshDoc(doc));
+  return doc;
+}
+
+/**
+ * Resolve MeshBackend dump key from mesh.json settings.
+ * Explicit settings.mesh_backend / advanced.mesh_backend wins when registered.
+ * Else: Hex-dominant → snappy_hexdominant; Standard + cfmesh hex-core → cfmesh;
+ * otherwise standard. Migration for existing mesh.json (algorithm + mesh_engine).
+ */
+export function resolveMeshBackend(settings) {
+  const keys = new Set(mesherKeys());
+  const adv = (settings && settings.advanced) || {};
+  const explicit = String(
+    (settings && settings.mesh_backend) || adv.mesh_backend || ''
+  ).trim();
+  // An explicit backend that is not installed is returned as-is so Generate can
+  // say so; never mesh with a different engine than the one picked.
+  if (explicit) return explicit;
+
+  const algo = String((settings && settings.algorithm) || 'Standard')
+    .trim()
+    .toLowerCase();
+  if (algo.startsWith('hex-dominant') || algo === 'hexdominant') {
+    return keys.has('snappy_hexdominant') ? 'snappy_hexdominant' : 'snappy_hexdominant';
+  }
+  const eng = String(adv.mesh_engine || (settings && settings.mesh_engine) || 'standard')
+    .trim()
+    .toLowerCase();
+  // The mesh panel's engine select writes the registry key here: Hex-dominant
+  // (snappy_hexdominant) or a plugin mesher must run as picked, not fall to Standard.
+  if (eng && eng !== 'standard' && eng !== 'cfmesh') return eng;
+  if (eng === 'cfmesh' && wantsHexCore(settings) && keys.has('cfmesh') && MESH_ENGINES.has('cfmesh')) {
+    return 'cfmesh';
+  }
+  if (keys.has('standard')) return 'standard';
+  return MESH_ENGINES.values().next().value || 'standard';
+}
+
+function wantsStandard(settings) {
+  const engine = mesherEngineOf(resolveMeshBackend(settings));
+  return engine === 'standard' || engine === 'cfmesh';
+}
+
+function wantsHexCore(settings) {
+  return !settings || settings.hex_element_core === undefined
+    ? true
+    : !!settings.hex_element_core;
+}
+
+/**
+ * Standard engine: 'standard' (SimScale-style gmsh surface + hex core, default)
+ * or 'cfmesh' (legacy cartesianMesh, hex core only). Chosen in Advanced settings.
+ */
+function standardEngine(settings) {
+  return mesherEngineOf(resolveMeshBackend(settings)) === 'cfmesh' ? 'cfmesh' : 'standard';
+}
+
+function wantsHexDominant(settings) {
+  return mesherEngineOf(resolveMeshBackend(settings)) === 'snappy_hexdominant';
+}
+
+function parseCfmeshLine(line) {
+  const s = String(line || '').trim();
+  if (s.startsWith('CFMESH_PROGRESS ')) {
+    try {
+      return { kind: 'progress', data: JSON.parse(s.slice('CFMESH_PROGRESS '.length)) };
+    } catch {
+      return null;
+    }
+  }
+  if (s.startsWith('CFMESH_RESULT ')) {
+    try {
+      return { kind: 'result', data: JSON.parse(s.slice('CFMESH_RESULT '.length)) };
+    } catch {
+      return null;
+    }
+  }
+  // Phase 1 Step 7: MAGNUSIM_EVENT / CFDDESK_EVENT progress|result (same stage names).
+  for (const prefix of ['MAGNUSIM_EVENT ', 'CFDDESK_EVENT ']) {
+    if (!s.startsWith(prefix)) continue;
+    try {
+      const data = JSON.parse(s.slice(prefix.length));
+      if (!data || typeof data !== 'object') return null;
+      if (data.event === 'progress') return { kind: 'progress', data };
+      if (data.event === 'result') return { kind: 'result', data };
+      return null;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function resolveProjectStep(projectId, meshId) {
+  return resolveProjectGeometry(projectId, meshId ? { meshId } : undefined);
+}
+
+/**
+ * What a mesh run takes from its saved settings, with the defaults the panel shows.
+ * No settings at all is the same as an empty object.
+ */
+export function meshGenerateValues(settings) {
+  const s = settings && typeof settings === 'object' ? settings : {};
+  const adv = s.advanced || {};
+  return {
+    fineness: s.fineness != null ? s.fineness : 5,
+    addLayers: s.automatic_boundary_layers === undefined ? true : !!s.automatic_boundary_layers,
+    physicsBased: s.physics_based_meshing === undefined ? true : !!s.physics_based_meshing,
+    hexCore: wantsHexCore(settings),
+    smallFeature:
+      adv.small_feature_suppression == null || String(adv.small_feature_suppression).trim() === ''
+        ? 'auto'
+        : String(adv.small_feature_suppression).trim(),
+    gapFactor: Number.isFinite(Number(adv.gap_refinement_factor)) ? Number(adv.gap_refinement_factor) : 0.05,
+    gradation: Number.isFinite(Number(adv.global_gradation_rate)) ? Number(adv.global_gradation_rate) : 1.22,
+  };
+}
+
+/** Generator flags for those values. cfMesh and Hex-dominant read only the first three. */
+export function meshGeneratorFlags(values, engine) {
+  const flags = [
+    '--fineness',
+    String(clampFineness(values.fineness)),
+    '--add-layers',
+    values.addLayers ? '1' : '0',
+    '--physics-based',
+    values.physicsBased ? '1' : '0',
+  ];
+  if (engine === 'standard') {
+    flags.push(
+      '--hex-core',
+      values.hexCore ? '1' : '0',
+      '--small-feature',
+      values.smallFeature,
+      '--gap-factor',
+      String(values.gapFactor),
+      '--gradation',
+      String(values.gradation),
+    );
+  }
+  return flags;
+}
+
+/**
+ * Standard mesh generate (python host script + WSL OpenFOAM tools).
+ * engine 'standard' → generate_standard.py (gmsh surface, hex core, layers)
+ * engine 'cfmesh'   → generate_cfmesh_standard.py (legacy cartesianMesh)
+ */
+function startStandardGenerate({ settings, projectId, onUpdate, engine, meshId }) {
+  const pathKind = engine === 'cfmesh' ? PATH_CFMESH : PATH_STANDARD;
+  if (!meshId) {
+    return {
+      ok: false,
+      status: 400,
+      bodyExtra: { error: 'mesh_id required', path_kind: pathKind },
+    };
+  }
+  const geometry = resolveProjectStep(projectId, meshId);
+  if (!geometry.ok) {
+    return {
+      ok: false,
+      status: 400,
+      bodyExtra: {
+        error: geometry.error,
+        step_path: geometry.step_path || null,
+        project_id: geometry.project_id || projectId || projectIdOrActive('', readActiveId),
+        path_kind: pathKind,
+      },
+    };
+  }
+
+  const generateId = stampId();
+  const project_id = geometry.project_id;
+  const simIdEarly = studyIdForMesh(project_id, meshId);
+  const meshDoc = project_id && simIdEarly ? readMeshDoc(project_id, simIdEarly, meshId) : null;
+  const settings_snapshot = settingsForMesh(meshDoc, meshId, settings) || settings || null;
+  const meshValues = meshGenerateValues(settings_snapshot);
+  const { fineness, addLayers, hexCore } = meshValues;
+
+  const wslDst = `cfddesk-cfdweb-${generateId}`;
+  const winOut = meshCasePath(project_id, meshId, simIdEarly);
+  if (!winOut) {
+    return {
+      ok: false,
+      status: 400,
+      bodyExtra: { error: 'mesh folder missing — create Mesh first', mesh_id: meshId, path_kind: pathKind },
+    };
+  }
+  mkdirSync(winOut, { recursive: true });
+  // No reap here: the generator's claim_generate_case kills a leftover on this case
+  // before it writes anything. Listing processes here held the server ~1 s before
+  // every spawn (the mesh clock then restarted at the server's later start).
+  // Phase 1 land10: job logs live under .cache (not projects/); job-runner/log.js owns JSONL.
+  mkdirSync(REPORT_DIR, { recursive: true });
+  const winLog = join(REPORT_DIR, `generate-${generateId}.log`);
+  const projectDir = join(PROJECTS_ROOT, project_id);
+
+  let fingerprint_before = null;
+  try {
+    const prev = join(winOut, 'constant', 'polyMesh');
+    if (existsSync(join(prev, 'owner')) && existsSync(join(prev, 'points'))) {
+      fingerprint_before = fingerprintPolyMesh(prev);
+    }
+  } catch {
+    fingerprint_before = null;
+  }
+
+  const argv = [
+    PYTHON,
+    engine === 'cfmesh' ? CFMESH_GENERATE_SCRIPT : STANDARD_GENERATE_SCRIPT,
+    '--project-dir',
+    projectDir,
+    '--case-dir',
+    winOut,
+    '--wsl-case',
+    wslDst,
+    '--generate-id',
+    generateId,
+    ...meshGeneratorFlags(meshValues, engine),
+  ];
+  const scopedMeshId = meshId || '';
+  if (scopedMeshId) {
+    argv.push('--mesh-id', String(scopedMeshId));
+  }
+  const meshRec = ((meshDoc && meshDoc.meshes) || []).find((m) => m && String(m.id) === String(meshId));
+  const simId = (meshRec && meshRec.simulation_id) || (meshDoc && meshDoc.simulation_id) || '';
+  if (simId) argv.push('--simulation-id', String(simId));
+  const command = argv.join(' ');
+  const started_at = new Date().toISOString();
+  const engineLabel = engine === 'cfmesh' ? 'cfMesh cartesianMesh' : 'Standard';
+  // The build stamp, read in the step that spawns (the mesh holds the slot until its close).
+  const builtFrom = buildStampFields(project_id, meshId, simIdEarly, generateId);
+
+  let lastResult = null;
+  const jobLog = createJobLogger('mesh', generateId);
+  const { child } = spawnJob({
+    kind: 'mesh',
+    jobId: generateId,
+    // Tests (MAGNUSIM_TEST_COMPUTE=fake): a stand-in generator with the same arguments.
+    script: meshGeneratorScript(argv[1]),
+    args: argv.slice(2),
+    env: { PYTHONUNBUFFERED: '1' },
+  });
+  const job = bindLiveMeshJob({
+    child,
+    generate_id: generateId,
+    path_kind: pathKind,
+    project_id,
+    started_at,
+    mesh_id: meshId || null,
+    mesh_name: (meshRec && (meshRec.name || (meshRec.settings && meshRec.settings.name))) || null,
+    case_dir: winOut,
+    wsl_dst: wslDst,
+    onUpdate,
+  });
+  closeAfterExit(child, { onOrphaned: () => reapAfterDeadGenerator(job, winOut) });
+  watchGeneratorGone(child);
+  // The registry key that was picked (a plugin mesher runs through its engine's path).
+  const meshBackend = resolveMeshBackend(settings);
+  jobLog.info('spawn', { pid: child.pid || null, path_kind: pathKind, engine, mesh_backend: meshBackend });
+  try {
+    writeFileSync(winLog, '', 'utf8');
+  } catch {}
+
+  const baseRunning = {
+    status: 'running',
+    mode: 'mesh',
+    path_kind: pathKind,
+    engine,
+    mesh_backend: meshBackend,
+    generate_id: generateId,
+    kick_id: generateId,
+    pid: child.pid || null,
+    exit_code: null,
+    command,
+    argv,
+    started_at,
+    finished_at: null,
+    log_path: winLog,
+    log_jsonl_path: jobLog.path,
+    log_excerpt: '',
+    wsl_case: wslCasePath(wslDst),
+    case_dir: winOut,
+    mesh_path: join(winOut, 'constant', 'polyMesh'),
+    n_cells: null,
+    n_points: null,
+    n_faces: null,
+    counts_source: null,
+    emesh: null,
+    feature_marks_total: null,
+    fingerprint_before,
+    fingerprint_after: null,
+    project_id,
+    settings_snapshot,
+    fineness_used: fineness,
+    add_layers_used: addLayers,
+    geometry: {
+      step_path: geometry.step_path,
+      body1_path: geometry.body1_path,
+      step_sha256: geometry.step_sha256,
+      body1_sha256: geometry.body1_sha256,
+      geometry_name: geometry.geometry_name,
+      source: 'W16_project_STEP',
+    },
+    step_path: geometry.step_path,
+    body1_path: geometry.body1_path,
+    stage: 'starting',
+    stage_detail: null,
+    note: `${engineLabel} mesh on project STEP (fineness ${fineness}, hex core ${hexCore ? 'on' : 'off'}, layers ${addLayers ? 'on' : 'off'}).`,
+    mesh_id: job.mesh_id,
+    ...builtFrom,
+  };
+  persistMeshResult(project_id, baseRunning);
+
+  let lastStage = null;
+  // The model's length unit in metres (step_loaded): where a failure is, in the user's units.
+  let scaleToMetres = null;
+  const flushParsedLine = (line) => {
+    const parsed = parseCfmeshLine(line);
+    if (!parsed) return;
+    if (parsed.kind === 'result') lastResult = parsed.data;
+    if (parsed.kind === 'progress' && parsed.data && Number(parsed.data.scale_to_metres) > 0) {
+      scaleToMetres = Number(parsed.data.scale_to_metres);
+    }
+    if (parsed.kind === 'progress' && parsed.data && parsed.data.stage) {
+      const stage = String(parsed.data.stage);
+      const detail = parsed.data.msg ? String(parsed.data.msg) : null;
+      if (stage !== lastStage || detail) {
+        lastStage = stage;
+        if (liveJob && liveJob.child === child) {
+          const running = { ...baseRunning, stage, stage_detail: detail };
+          try {
+            persistMeshResult(project_id, running);
+            onUpdate(running);
+          } catch (_) {}
+        }
+      }
+    }
+  };
+  // A line split mid-chunk is carried, so a JSON result line still sets lastResult
+  // (avoids exit_code 45 false-fail).
+  const out = generateOutput(winLog, flushParsedLine);
+  child.stdout?.on('data', out.add);
+  child.stderr?.on('data', out.add);
+
+  child.on('error', (err) => {
+    out.note(`\nSPAWN_ERROR: ${err}\n`);
+    if (job.stop_requested) {
+      if (liveJob && liveJob.child === child) liveJob = null;
+      notifyMeshStopped(job);
+      scheduleComputeQueueKick(250);
+      return;
+    }
+    liveJob = null;
+    const failed = {
+      ...baseRunning,
+      status: 'failed',
+      exit_code: -1,
+      finished_at: new Date().toISOString(),
+      log_excerpt: out.text().slice(-2000),
+      error: String(err),
+      note: `${engineLabel} mesher failed to start: ${err}`,
+    };
+    persistMeshResult(project_id, failed);
+    onUpdate(failed);
+    scheduleComputeQueueKick(250);
+  });
+
+  /** The reason a failed generate shows (see mesh-failure.js). */
+  const failureText = () =>
+    plainMeshFailure({ error: lastResult && lastResult.error, log: out.text(), scaleToMetres, gotResult: !!lastResult });
+
+  // Decide on 'close' (not 'exit'): exit can fire while the final JSON result
+  // chunk is still in the pipe; close waits until stdout/stderr are fully drained.
+  const onClose = (code, signal) => {
+    out.flushCarry();
+    if (liveJob && liveJob.child === child) liveJob = null;
+    if (job.stop_requested) {
+      notifyMeshStopped(job);
+      return;
+    }
+    const exit_code = code == null ? (signal ? -2 : -1) : code;
+    const finished_at = new Date().toISOString();
+    out.save();
+    const polyDir = join(winOut, 'constant', 'polyMesh');
+    let counts = { n_cells: null, n_points: null, n_faces: null, source: null };
+    const inspected = inspectGeneratedCase(winOut);
+    try {
+      if (inspected) {
+        counts = {
+          n_cells: inspected.n_cells,
+          n_points: inspected.n_points,
+          n_faces: inspected.n_faces,
+          source: inspected.counts_source,
+        };
+      } else if (existsSync(polyDir)) {
+        const c = readPolyMeshCounts(polyDir);
+        counts = {
+          n_cells: c.n_cells,
+          n_points: c.n_points,
+          n_faces: c.n_faces,
+          source: c.source,
+        };
+      }
+      if (lastResult) {
+        if (counts.n_cells == null) counts.n_cells = lastResult.n_cells ?? null;
+        if (counts.n_points == null) counts.n_points = lastResult.n_points ?? null;
+        if (counts.n_faces == null) counts.n_faces = lastResult.n_faces ?? null;
+      }
+    } catch (e) {
+      out.note(`\nCOUNT_PARSE_ERROR: ${e}\n`);
+    }
+
+    const scriptOk = (lastResult && lastResult.ok === true) || !!(inspected && inspected.script_ok);
+    const hasMesh = existsSync(join(polyDir, 'points')) && (counts.n_cells != null || !!(inspected && inspected.ok));
+    const ok = exit_code === 0 && scriptOk && hasMesh;
+    const status = meshCloseStatus({ stopRequested: job.stop_requested, ok });
+
+    const terminal = {
+      ...baseRunning,
+      status,
+      exit_code: ok ? 0 : exit_code === 0 && !ok ? 45 : exit_code,
+      finished_at,
+      log_excerpt: out.text().slice(-4000),
+      case_dir: winOut,
+      mesh_path: polyDir,
+      n_cells: counts.n_cells,
+      n_points: counts.n_points,
+      n_faces: counts.n_faces,
+      counts_source: counts.source,
+      fingerprint_after: null,
+      script_result: lastResult,
+      stage: status,
+      stage_detail: null,
+      error:
+        status === 'done'
+          ? null
+          : status === 'stopped'
+            ? 'cancelled'
+            : exit_code === 75
+              ? 'Volume fill timed out. Reduce inflate thickness or fineness and generate again.'
+              : failureText(),
+      hex_core_applied: lastResult && lastResult.hex_core != null ? !!lastResult.hex_core : hexCore,
+      layers_applied: lastResult && lastResult.layers_applied != null ? !!lastResult.layers_applied : null,
+      surface_size_m: (lastResult && lastResult.surface_size_m) || null,
+      regions: lastResult && Array.isArray(lastResult.regions) ? lastResult.regions : null,
+      left_out: lastResult && Array.isArray(lastResult.left_out) ? lastResult.left_out : null,
+      signal: signal || null,
+      note:
+        status === 'done'
+          ? `${engineLabel} mesh done: ${counts.n_cells} cells, ${counts.n_points} points.`
+          : status === 'stopped'
+            ? 'Mesh generate cancelled.'
+            : exit_code === 75
+              ? 'Volume fill timed out. Reduce inflate thickness or fineness and generate again.'
+              : `${engineLabel} mesh failed (exit ${exit_code}${lastResult && lastResult.error ? ': ' + lastResult.error : ''}).`,
+    };
+    reportMeshEnd(project_id, terminal, onUpdate);
+    setImmediate(() => {
+      if (job.stop_requested) return;
+      let fingerprint_after = null;
+      try {
+        if (existsSync(polyDir)) fingerprint_after = fingerprintPolyMesh(polyDir);
+      } catch (fpErr) {
+        fingerprint_after = { error: String(fpErr), ...counts };
+      }
+      try {
+        if (existsSync(polyDir)) prewarmMeshSurface(winOut);
+      } catch (_) {}
+      if (fingerprint_after) {
+        try {
+          persistMeshResult(project_id, { ...terminal, fingerprint_after });
+        } catch (_) {}
+      }
+    });
+  };
+  child.on(
+    'close',
+    closeOnce(onClose, (code, signal, err) => {
+      if (liveJob && liveJob.child === child) liveJob = null;
+      const exit_code = code == null ? (signal ? -2 : -1) : code;
+      out.note(`\nCLOSE_ERROR: ${err}\n`);
+      reportMeshEnd(
+        project_id,
+        {
+          ...baseRunning,
+          status: 'failed',
+          exit_code: exit_code || 1,
+          finished_at: new Date().toISOString(),
+          log_excerpt: out.text().slice(-4000),
+          script_result: lastResult,
+          stage: 'failed',
+          stage_detail: null,
+          error: failureText(),
+          signal: signal || null,
+          note: `${engineLabel} mesh failed (exit ${exit_code}).`,
+        },
+        onUpdate,
+      );
+    }),
+  );
+
+  return {
+    ok: true,
+    status: 202,
+    bodyExtra: { ...baseRunning },
+  };
+}
+
+/**
+ * A generator's stdout and stderr: the text so far (for log excerpts), each whole line to
+ * `onLine` (a line split across chunks is carried to the next), and each chunk appended to
+ * the Windows log. Appending keeps writing the log linear in the output; rewriting the
+ * whole log on every chunk cost the square of it.
+ */
+export function generateOutput(winLog, onLine, io = { appendFileSync, writeFileSync }) {
+  let text = '';
+  let carry = '';
+  const write = (s) => {
+    text += s;
+    try {
+      io.appendFileSync(winLog, s, 'utf8');
+    } catch {}
+  };
+  return {
+    text: () => text,
+    /** A chunk of output (Buffer or string). */
+    add(chunk) {
+      const s = chunk.toString('utf8');
+      write(s);
+      carry += s;
+      const parts = carry.split(/\r?\n/);
+      carry = parts.pop() ?? '';
+      for (const line of parts) onLine(line);
+    },
+    /** The last line, when the output ended without a newline. */
+    flushCarry() {
+      if (!carry) return;
+      const rem = carry;
+      carry = '';
+      onLine(rem);
+    },
+    /** A note of the app's own (not parsed as output). */
+    note: write,
+    /** The whole log once more (after the process ends): mends a chunk an append missed. */
+    save() {
+      try {
+        io.writeFileSync(winLog, text, 'utf8');
+      } catch {}
+    },
+  };
+}
+
+export function startMeshGenerate(args) {
+  const held = computeSlotHolder();
+  if (held) return slotRefusal(held);
+  const before = liveJob;
+  try {
+    return startMeshGenerateBody(args);
+  } finally {
+    const job = /** @type {any} */ (liveJob);
+    if (job && job !== before && job.child && !job.slot_token) {
+      const c = claimComputeSlot('mesh', {
+        project_id: job.project_id || null, mesh_id: job.mesh_id, mesh_name: job.mesh_name,
+        generate_id: job.generate_id, path_kind: job.path_kind, started_at: job.started_at,
+        name: job.mesh_name || 'Mesh',
+      }, { phase: 'running' });
+      if (c.ok) { job.slot_token = c.token; job.child.once('close', () => releaseComputeSlot(c.token)); }
+    }
+  }
+}
+
+function startMeshGenerateBody({ settings, projectId, onUpdate, meshId }) {
+  if (isLiveMeshJobHeld()) {
+    return {
+      ok: false,
+      status: 409,
+      bodyExtra: {
+        error: 'mesh generate already running',
+        pid: liveJob.child.pid || null,
+        generate_id: liveJob.generate_id,
+        path_kind: liveJob.path_kind || PATH_CFMESH,
+        increment: INCREMENT,
+      },
+    };
+  }
+  liveJob = null;
+
+  const projectIdEarly = projectId || projectIdOrActive('', readActiveId);
+  // A linked geometry (host API 1.5): no generate while it is updating or while a face is
+  // claimed twice. Here, so the route and the queue's kick both meet it.
+  const linkRefused = projectIdEarly && meshId ? linkStartRefusal(projectIdEarly, studyIdForMesh(projectIdEarly, meshId)) : null;
+  if (linkRefused) return linkRefused;
+  const meshDocEarly =
+    projectIdEarly && meshId
+      ? readMeshDoc(projectIdEarly, studyIdForMesh(projectIdEarly, meshId), meshId)
+      : null;
+  const settingsEarly = settingsForMesh(meshDocEarly, meshId, settings) || settings || null;
+  const backend = resolveMeshBackend(settingsEarly);
+  const knownBackends = new Set(mesherKeys());
+  if (!knownBackends.has(backend)) {
+    return {
+      ok: false,
+      status: 400,
+      bodyExtra: {
+        error: `Mesher "${backend}" is not installed or is turned off. Turn it on in Settings → Plugins, or pick another mesh engine.`,
+        path_kind: null,
+      },
+    };
+  }
+  if (wantsStandard(settingsEarly)) {
+    return startStandardGenerate({
+      settings: settingsEarly,
+      projectId: projectIdEarly,
+      onUpdate,
+      engine: standardEngine(settingsEarly),
+      meshId: meshId || null,
+    });
+  }
+  if (!wantsHexDominant(settingsEarly)) {
+    return {
+      ok: false,
+      status: 400,
+      bodyExtra: {
+        error: `Mesher "${backend}" has no run path in this version of Magnusim.`,
+        path_kind: null,
+      },
+    };
+  }
+  if (!meshId) {
+    return {
+      ok: false,
+      status: 400,
+      bodyExtra: { error: 'mesh_id required', path_kind: 'snappyHexMesh' },
+    };
+  }
+
+  // The mesh input of the mesh's own geometry, not the one shown.
+  const meshGeometryId = studyGeometryIdForMesh(projectIdEarly, meshId);
+  const stlReady = ensureBody1Stl(projectId, meshGeometryId ? { geometryId: meshGeometryId } : undefined);
+  if (!stlReady.ok) {
+    return {
+      ok: false,
+      status: 400,
+      bodyExtra: {
+        error: stlReady.error || 'could not tessellate STEP for mesh generate',
+        detail: stlReady.detail || null,
+        step_path: stlReady.step_path || null,
+        project_id: stlReady.project_id || projectId || projectIdOrActive('', readActiveId),
+        path_kind: 'snappyHexMesh',
+        mtp1_silent_copy: false,
+        soft_pass_avoided: true,
+        increment: INCREMENT,
+      },
+    };
+  }
+
+  // A linked or budgeted geometry: the mesh job builds its input (prepare_input) when
+  // `deferred`; w21 records Body1.json's shape hash, never reading Body1.stl (LINK 5.9).
+  const input = /** @type {{ shape_sha256?: string, cached?: boolean, deferred?: boolean }} */ (stlReady);
+  const inputShape = input.shape_sha256 ? String(input.shape_sha256) : '';
+  const geometry = resolveProjectGeometry(
+    projectId,
+    inputShape ? { meshId, body1Sha256: input.cached ? inputShape : null } : { meshId },
+  );
+  if (!geometry.ok) {
+    return {
+      ok: false,
+      status: 400,
+      bodyExtra: {
+        error: geometry.error,
+        step_path: geometry.step_path || null,
+        body1_path: geometry.body1_path || null,
+        project_id: geometry.project_id || projectId || projectIdOrActive('', readActiveId),
+        path_kind: 'snappyHexMesh',
+        mtp1_silent_copy: false,
+        soft_pass_avoided: true,
+        increment: INCREMENT,
+      },
+    };
+  }
+
+  const generateId = stampId();
+  const project_id = geometry.project_id;
+  const simIdSnappy = studyIdForMesh(project_id, meshId);
+  const meshDoc = project_id && simIdSnappy ? readMeshDoc(project_id, simIdSnappy, meshId) : null;
+  const settings_snapshot = settingsForMesh(meshDoc, meshId, settings) || settings || null;
+  // Geometry bounds may be mm from W16 fingerprint; generate scales Body1 mm->m.
+  const meshValues = meshGenerateValues(settings_snapshot);
+  const { fineness, addLayers } = meshValues;
+  const wslDst = `cfddesk-w25-${generateId}`;
+  mkdirSync(REPORT_DIR, { recursive: true });
+  const winOut = meshCasePath(project_id, meshId, simIdSnappy);
+  if (!winOut) {
+    return {
+      ok: false,
+      status: 400,
+      bodyExtra: { error: 'mesh folder missing — create Mesh first', mesh_id: meshId, path_kind: 'snappyHexMesh' },
+    };
+  }
+  mkdirSync(winOut, { recursive: true });
+  // No reap here: the generator's claim_generate_case kills a leftover on this case
+  // before it writes anything. Listing processes here held the server ~1 s before
+  // every spawn (the mesh clock then restarted at the server's later start).
+  const winLog = join(REPORT_DIR, `generate-${generateId}.log`);
+  const projectDir = join(PROJECTS_ROOT, project_id);
+
+  let fingerprint_before = null;
+  try {
+    const prev = join(winOut, 'constant', 'polyMesh');
+    if (existsSync(join(prev, 'owner')) && existsSync(join(prev, 'points'))) {
+      fingerprint_before = fingerprintPolyMesh(prev);
+    }
+  } catch {
+    fingerprint_before = null;
+  }
+
+  const argv = [
+    PYTHON,
+    SNAPPY_GENERATE_SCRIPT,
+    '--project-dir',
+    projectDir,
+    '--case-dir',
+    winOut,
+    '--wsl-case',
+    wslDst,
+    '--generate-id',
+    generateId,
+    ...meshGeneratorFlags(meshValues, 'snappy_hexdominant'),
+    '--legacy-markers',
+  ];
+  if (simIdSnappy) argv.push('--simulation-id', String(simIdSnappy));
+  if (meshId) argv.push('--mesh-id', String(meshId));
+  if (inputShape) argv.push('--input-shape-sha256', inputShape);
+  const command = argv.join(' ');
+  const started_at = new Date().toISOString();
+  const builtFrom = buildStampFields(project_id, meshId, simIdSnappy, generateId);
+
+  let lastResult = null;
+  const jobLog = createJobLogger('mesh', generateId);
+  const { child } = spawnJob({
+    kind: 'mesh',
+    jobId: generateId,
+    // Tests (MAGNUSIM_TEST_COMPUTE=fake): a stand-in generator with the same arguments.
+    script: meshGeneratorScript(argv[1]),
+    args: argv.slice(2),
+    env: { PYTHONUNBUFFERED: '1' },
+  });
+
+  const job = bindLiveMeshJob({
+    child,
+    generate_id: generateId,
+    path_kind: PATH_SNAPPY,
+    project_id,
+    started_at,
+    mesh_id: meshId || null,
+    mesh_name: null,
+    case_dir: winOut,
+    wsl_dst: wslDst,
+    onUpdate,
+  });
+  closeAfterExit(child, { onOrphaned: () => reapAfterDeadGenerator(job, winOut) });
+  watchGeneratorGone(child);
+  const meshBackend = resolveMeshBackend(settingsEarly);
+  jobLog.info('spawn', { pid: child.pid || null, path_kind: PATH_SNAPPY, mesh_backend: meshBackend });
+  try {
+    writeFileSync(winLog, '', 'utf8');
+  } catch {}
+
+  const baseRunning = {
+    status: 'running',
+    mode: 'mesh',
+    path_kind: 'snappyHexMesh',
+    mesh_backend: meshBackend,
+    generate_id: generateId,
+    kick_id: generateId,
+    pid: child.pid || null,
+    exit_code: null,
+    command,
+    argv,
+    started_at,
+    finished_at: null,
+    log_path: winLog,
+    log_jsonl_path: jobLog.path,
+    log_excerpt: '',
+    wsl_case: wslCasePath(wslDst),
+    case_dir: winOut,
+    mesh_path: join(winOut, 'constant', 'polyMesh'),
+    n_cells: null,
+    n_points: null,
+    n_faces: null,
+    counts_source: null,
+    emesh: null,
+    feature_marks_total: null,
+    fingerprint_before,
+    fingerprint_after: null,
+    project_id,
+    mesh_id: meshId || null,
+    settings_snapshot,
+    fineness_used: fineness,
+    add_layers_used: addLayers,
+    snappy_geometry_rev: null,
+    lift: {
+      from: [
+        'cfddesk/mesh/snappy_hexdominant.py',
+        'cfddesk/mesh/snappy_policy.py',
+        'cfddesk/wsl/templates/snappy_hexdominant.sh',
+        'tools/generate_snappy.py',
+      ],
+      automatic_boundary_layers: addLayers,
+    },
+    geometry: {
+      step_path: geometry.step_path,
+      body1_path: geometry.body1_path,
+      step_sha256: geometry.step_sha256,
+      body1_sha256: geometry.body1_sha256,
+      ...(inputShape ? { input_shape_sha256: inputShape, input_deferred: !!input.deferred } : {}),
+      geometry_name: geometry.geometry_name,
+      source: 'W16_project_STEP_Body1',
+    },
+    step_path: geometry.step_path,
+    body1_path: geometry.body1_path,
+    stage: 'starting',
+    stage_detail: null,
+    note: `Hex-dominant snappy via generate_snappy.py (fineness ${fineness}, layers ${addLayers ? 'on' : 'off'}).`,
+    mtp1_silent_copy: false,
+    ...builtFrom,
+  };
+  persistMeshResult(project_id, baseRunning);
+
+  let lastStage = null;
+  const flushParsedLine = (line) => {
+    const parsed = parseCfmeshLine(line);
+    if (!parsed) return;
+    if (parsed.kind === 'result') lastResult = parsed.data;
+    if (parsed.kind === 'progress' && parsed.data && parsed.data.stage) {
+      const stage = String(parsed.data.stage);
+      const detail = parsed.data.msg ? String(parsed.data.msg) : null;
+      if (stage !== lastStage || detail) {
+        lastStage = stage;
+        if (liveJob && liveJob.child === child) {
+          const running = { ...baseRunning, stage, stage_detail: detail };
+          try {
+            persistMeshResult(project_id, running);
+            onUpdate(running);
+          } catch (_) {}
+        }
+      }
+    }
+  };
+  const out = generateOutput(winLog, flushParsedLine);
+  child.stdout?.on('data', out.add);
+  child.stderr?.on('data', out.add);
+
+  const failureText = () =>
+    plainMeshFailure({ error: lastResult && lastResult.error, log: out.text(), gotResult: !!lastResult });
+
+  const onClose = (code) => {
+    out.flushCarry();
+    if (liveJob && liveJob.child === child) liveJob = null;
+    if (job.stop_requested) {
+      notifyMeshStopped(job);
+      return;
+    }
+    const exit_code = code == null ? 1 : code;
+    const finished_at = new Date().toISOString();
+    const inspected = inspectGeneratedCase(winOut);
+    const counts = lastResult
+      ? {
+          n_cells: lastResult.n_cells ?? null,
+          n_points: lastResult.n_points ?? null,
+          n_faces: lastResult.n_faces ?? null,
+          counts_source: lastResult.counts_source || null,
+        }
+      : inspected
+        ? {
+            n_cells: inspected.n_cells,
+            n_points: inspected.n_points,
+            n_faces: inspected.n_faces,
+            counts_source: inspected.counts_source,
+          }
+        : readPolyMeshCounts(join(winOut, 'constant', 'polyMesh'));
+    const ok =
+      exit_code === 0 &&
+      !(lastResult && lastResult.ok === false) &&
+      (!!inspected || counts.n_cells != null);
+    const status = meshCloseStatus({ stopRequested: job.stop_requested, ok });
+    const terminal = {
+      ...baseRunning,
+      status,
+      exit_code,
+      finished_at,
+      n_cells: counts.n_cells,
+      n_points: counts.n_points,
+      n_faces: counts.n_faces,
+      counts_source: counts.counts_source || 'polyMesh/points+owner',
+      feature_marks_total: lastResult && lastResult.feature_marks_total != null ? lastResult.feature_marks_total : null,
+      regions: lastResult && Array.isArray(lastResult.regions) ? lastResult.regions : null,
+      left_out: lastResult && Array.isArray(lastResult.left_out) ? lastResult.left_out : null,
+      fingerprint_after: null,
+      snappy_geometry_rev: lastResult && lastResult.snappy_geometry_rev != null ? lastResult.snappy_geometry_rev : null,
+      block_used: lastResult && lastResult.block != null ? lastResult.block : null,
+      feature_level_used: lastResult && lastResult.feature_level != null ? lastResult.feature_level : null,
+      walls_level_used: lastResult && lastResult.walls_level != null ? lastResult.walls_level : null,
+      snap_used: lastResult && lastResult.snap != null ? lastResult.snap : null,
+      // The input the generator built or found (prepare_input): its hash, from the result.
+      ...(lastResult && lastResult.body1_sha256
+        ? {
+            geometry: {
+              ...baseRunning.geometry,
+              body1_sha256: String(lastResult.body1_sha256),
+              body1_path: lastResult.body1_path || baseRunning.geometry.body1_path,
+              mesh_input_built: !!lastResult.mesh_input_built,
+            },
+            body1_path: lastResult.body1_path || baseRunning.body1_path,
+          }
+        : {}),
+      stage: status,
+      error:
+        status === 'done'
+          ? null
+          : status === 'stopped'
+            ? 'cancelled'
+            : failureText(),
+      note:
+        status === 'done'
+          ? `Hex-dominant snappy done (exit ${exit_code}). cells=${counts.n_cells} points=${counts.n_points}.`
+          : status === 'stopped'
+            ? 'Mesh generate cancelled.'
+            : `Hex-dominant snappy failed (exit ${exit_code}).`,
+      log_excerpt: out.text().slice(-4000),
+      mtp1_silent_copy: false,
+    };
+    reportMeshEnd(project_id, terminal, onUpdate);
+    setImmediate(() => {
+      if (job.stop_requested) return;
+      let fingerprint_after = null;
+      try {
+        fingerprint_after = fingerprintPolyMesh(join(winOut, 'constant', 'polyMesh'));
+      } catch {
+        fingerprint_after = null;
+      }
+      try {
+        prewarmMeshSurface(winOut);
+      } catch (_) {}
+      if (fingerprint_after) {
+        try {
+          persistMeshResult(project_id, { ...terminal, fingerprint_after });
+        } catch (_) {}
+      }
+    });
+  };
+  child.on(
+    'close',
+    closeOnce(onClose, (code, signal, err) => {
+      if (liveJob && liveJob.child === child) liveJob = null;
+      const exit_code = code == null ? 1 : code;
+      out.note(`\nCLOSE_ERROR: ${err}\n`);
+      reportMeshEnd(
+        project_id,
+        {
+          ...baseRunning,
+          status: 'failed',
+          exit_code: exit_code || 1,
+          finished_at: new Date().toISOString(),
+          log_excerpt: out.text().slice(-4000),
+          stage: 'failed',
+          error: failureText(),
+          note: `Hex-dominant snappy failed (exit ${exit_code}).`,
+          mtp1_silent_copy: false,
+        },
+        onUpdate,
+      );
+    }),
+  );
+
+  return {
+    ok: true,
+    status: 202,
+    bodyExtra: { ...baseRunning },
+  };
+}
+
+export function meshGenerateLivePid() {
+  if (isLiveMeshJobHeld()) return liveJob.child.pid || null;
+  return null;
+}
+
+/**
+ * Kill generators a previous server left running on this projects folder (never
+ * another root's). Boot can run after a Generate (it waits for the registry) and
+ * again on a dev reload in this same process: what this process started is spared.
+ */
+export function reapOrphanMeshGeneratorsOnBoot() {
+  try {
+    spawnSync(
+      PYTHON,
+      [pyTool('reap_mesh_jobs.py'), '--projects-root', PROJECTS_ROOT, '--spare-descendants-of', String(process.pid)],
+      {
+        windowsHide: true,
+        timeout: 20000,
+        stdio: 'ignore',
+      },
+    );
+  } catch {
+    /* ignore */
+  }
+}
+
+/**
+ * Is the generator behind a "running" mesh record still at work? A server that did
+ * not start it (another server on the same projects folder, or the instance a Vite
+ * restart replaced, whose child keeps running) cannot ask its own liveJob. The case
+ * lock names the generate and the real python's pid; before the generator claims the
+ * case, the pid we spawned (the venv launcher) stands in.
+ * @param {{ case_dir?: string | null, generate_id?: string | null, pid?: number | null } | null | undefined} live
+ */
+export function meshGeneratorAlive(live) {
+  if (!live) return false;
+  if (live.case_dir && live.generate_id) {
+    try {
+      const lock = JSON.parse(readFileSync(join(live.case_dir, '.generate.lock'), 'utf8'));
+      if (lock && String(lock.generate_id || '') === String(live.generate_id)) return pidIsAlive(lock.pid);
+    } catch {
+      /* not claimed yet, or released: the launcher pid decides */
+    }
+  }
+  return pidIsAlive(live.pid);
+}
+
+const INTERRUPTED_NOTE = 'Meshing stopped when the server restarted.';
+
+/** Close a "running" record whose generator died with no server watching it. */
+export function markMeshGenerateInterrupted(projectId, live) {
+  const before = live.fingerprint_before || {};
+  // "Previous mesh kept" only when that mesh is still whole on disk: the
+  // interrupted generate may already have overwritten part of it.
+  const polyDir = live.mesh_path || (live.case_dir ? join(live.case_dir, 'constant', 'polyMesh') : null);
+  const keepPrev = before.n_cells != null && polyMeshComplete(polyDir);
+  // A kept previous mesh keeps its own build stamp (host API 1.5), not the interrupted one's.
+  const stamp = keepPrev ? live.prev_built_from_rev : live.built_from_rev;
+  const rest = { ...live };
+  delete rest.built_from_rev;
+  return persistMeshResult(projectId, {
+    ...rest,
+    ...(typeof stamp === 'number' ? { built_from_rev: stamp } : {}),
+    status: keepPrev ? 'done' : 'failed',
+    n_cells: keepPrev ? before.n_cells : live.n_cells,
+    n_points: keepPrev ? before.n_points : live.n_points,
+    n_faces: keepPrev ? before.n_faces : live.n_faces,
+    exit_code: keepPrev ? 0 : live.exit_code != null ? live.exit_code : -1,
+    finished_at: new Date().toISOString(),
+    stage: keepPrev ? 'done' : 'failed',
+    error: keepPrev ? null : INTERRUPTED_NOTE,
+    note: keepPrev ? 'Previous mesh kept — a later generate was interrupted.' : INTERRUPTED_NOTE,
+  });
+}
+
+function meshLiveRecord(projectId, meshId) {
+  const doc = readMeshDoc(projectId, studyIdForMesh(projectId, meshId), meshId);
+  const rec = doc && (doc.meshes || []).find((m) => m && String(m.id) === String(meshId));
+  return (rec && rec.live_mesh_result) || null;
+}
+
+const UNOWNED_MESH_POLL_MS = 2000;
+// The owner writes its result on 'close', at most ORPHAN_PIPE_GRACE_MS after exit.
+const UNOWNED_MESH_GRACE_MS = ORPHAN_PIPE_GRACE_MS + 2000;
+const unownedMeshWatches = new Map();
+
+/**
+ * Follow a "running" mesh this server did not start until its generator exits, and
+ * only then, if no owner wrote a result, mark it interrupted: no ghost "meshing"
+ * card after a restart, and never "failed" while the mesher is still working.
+ * @param {string} projectId
+ * @param {{ mesh_id?: string | null, generate_id?: string | null }} live
+ */
+export function watchUnownedMeshGenerate(projectId, live) {
+  const meshId = live && live.mesh_id ? String(live.mesh_id) : '';
+  const generateId = String((live && live.generate_id) || '');
+  const key = `${projectId}|${meshId}|${generateId}`;
+  if (!projectId || !meshId || unownedMeshWatches.has(key)) return;
+  let deadAt = 0;
+  const tick = () => {
+    unownedMeshWatches.delete(key);
+    let rec = null;
+    try {
+      rec = meshLiveRecord(projectId, meshId);
+    } catch {
+      rec = null;
+    }
+    if (!rec || rec.status !== 'running' || String(rec.generate_id || '') !== generateId) return;
+    if (liveJob && String(liveJob.generate_id || '') === generateId) return;
+    if (meshGeneratorAlive(rec)) {
+      deadAt = 0;
+    } else if (!deadAt) {
+      deadAt = Date.now();
+    } else if (Date.now() - deadAt >= UNOWNED_MESH_GRACE_MS) {
+      try {
+        markMeshGenerateInterrupted(projectId, { ...rec, mesh_id: meshId });
+      } catch (e) {
+        console.warn('[CFD] mark interrupted mesh job', e);
+      }
+      return;
+    }
+    // Keyed while pending so a second hydrate does not start a second watch.
+    const timer = setTimeout(tick, UNOWNED_MESH_POLL_MS);
+    if (timer.unref) timer.unref();
+    unownedMeshWatches.set(key, timer);
+  };
+  tick();
+}
+
+export function liveMeshJobSnapshot() {
+  if (isLiveMeshJobHeld()) {
+    return {
+      pid: liveJob.child.pid || null,
+      generate_id: liveJob.generate_id || null,
+      path_kind: liveJob.path_kind || PATH_CFMESH,
+      project_id: liveJob.project_id || null,
+      project_title: projectTitleOf(liveJob.project_id),
+      mesh_id: liveJob.mesh_id || null,
+      mesh_name: liveJob.mesh_name || null,
+      started_at: liveJob.started_at || null,
+    };
+  }
+  return null;
+}
+
+export const W21_META = {
+  increment: INCREMENT,
+  path_kind: 'snappyHexMesh',
+  report_dir: REPORT_DIR,
+  forbidden_path_kind: 'checkMesh',
+  generate_script: 'generate_snappy.py',
+  geometry_source: 'W16_project_STEP_Body1',
+  mtp1_silent_copy: false,
+};
+
+export const W23_META = W21_META;

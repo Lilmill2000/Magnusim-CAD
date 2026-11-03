@@ -1,0 +1,904 @@
+# Magnusim CAD 0.2.0-dev: the CAD plugin's development version
+
+A parametric part modeler in the style of SolidWorks and Fusion, built into
+Magnusim as the **Part** workspace. You draw sketches, turn them into solids,
+edit STEP files, wrap the part in an air volume for CFD, and go back to the
+simulation with the part already in the project.
+
+It is a bundled plugin and it is on by default. Settings > Plugins turns it off
+(Disable); while it is off, nothing of it runs. Everything runs in the app's
+window: the modeling kernel (Open CASCADE 7.9.3) and the sketch solver
+(FreeCAD's PlaneGCS) run as WebAssembly in the workspace's own workers, so CAD
+needs no Python, no WSL and no internet connection.
+
+What is new in each version: `CHANGELOG.md`. How it is built: the
+[Developer](#developer) section below.
+
+## Contents
+
+- [Start a part](#start-a-part)
+- [The workspace](#the-workspace)
+- [Sketches](#sketches)
+- [Constraints and dimensions](#constraints-and-dimensions)
+- [Solids](#solids)
+- [Modify: fillets, shells, booleans and direct edits](#modify-fillets-shells-booleans-and-direct-edits)
+- [Patterns and mirror](#patterns-and-mirror)
+- [Reference geometry](#reference-geometry)
+- [STEP files: import, edit, export](#step-files-import-edit-export)
+- [CFD prep: Enclosure and Combine](#cfd-prep-enclosure-and-combine)
+- [Measure and inspect](#measure-and-inspect)
+- [History, parameters, undo and saving](#history-parameters-undo-and-saving)
+- [Back to the simulation](#back-to-the-simulation)
+- [The Assistant in the Part](#the-assistant-in-the-part)
+- [Mouse and keys](#mouse-and-keys)
+- [Known limitations in 0.1.0](#known-limitations-in-010)
+- [Licence](#licence)
+- [Developer](#developer)
+
+## Start a part
+
+A Part lives in a project, like a simulation study. Start one from any of these:
+
+- **Design a part**, beside "Add geometry", on a project with no geometry yet.
+- **New project** on Home, then **Start from: Design a part**: the title fills in
+  ("Untitled Part N"), and Create makes the project and opens a Part in one step.
+- The **CAD** button in the project header: its menu lists the project's Parts
+  and makes a new one.
+- Once a project has a Part, the tree's STUDIES section lists it, with
+  **+ New Part**.
+
+The Part opens in its own full-page workspace over the project. It uses the
+project's units (millimetres, inches and so on); a typed value may carry its own
+unit ("125 mm", "5 in").
+
+## The workspace
+
+- **Toolbar** across the top. In model mode its groups are SKETCH, SOLID,
+  PATTERN, MODIFY, CONSTRUCT, CFD PREP, INSPECT and FILE, then the views and
+  Undo / Redo. It starts compact: each group shows its main one or two commands
+  (Sketch; Extrude; Linear pattern; Fillet and Chamfer; Plane; Enclosure;
+  Measure; Import STEP), and the rest of the group is in its **More ▾** menu. In
+  sketch mode the ribbon shows DRAW, CONSTRAIN, DIMENSION and MODIFY.
+  - Arrange it your way: right-click a command for **Show in toolbar**, **Move to
+    More**, **Move left**, **Move right** and **Reset toolbar**, or drag a command
+    along its group. Drag a command out of a group's **More** onto the toolbar: it
+    goes in where you drop it and the group's last command moves to More (the
+    toolbar says which while you drag), so the group keeps its size; right-click
+    it in More for **Swap with** that last command. Drag a command into its
+    group's open More to put it there. A command stays in its own group. The
+    layout is yours in every project, and another open CAD tab follows a change
+    at once.
+  - A command that cannot run right now is greyed, and its tooltip says why
+    ("Make or import a body first").
+- **Design tree** on the left: **Origin** (the Top, Front and Right planes and
+  the X, Y and Z axes), **Bodies**, and **History**, the features in build order
+  with a rollback bar. The chevron at its top right (or `Ctrl+\`) slides it into a
+  slim rail at the left edge; click the rail to bring it back. It stays the way
+  you leave it, in every project. While you edit a sketch it is a rail by itself
+  (click the rail to see it for that sketch) and comes back at **Done**.
+- **Feature panels** open on the left when you make or edit a feature. Changes
+  apply live as you type or pick; **Done** closes the panel; **Delete** removes
+  the feature (on a new one it discards it).
+- **Viewport** with the view triad, the views menu (the standard views, Normal
+  to, Perspective or Orthographic, Shaded, Shaded + edges, Wireframe), the
+  **Selection filter** (Bodies, Faces, Edges, Vertices, Planes) and the
+  **Section view** button (the same cut as INSPECT > Section view).
+- **Chips** at the bottom: the selected body's volume (or each body's, never a
+  total), the number of items selected, the save state and the sketch's state.
+- **Banana for scale** (SCALE MODELS, after VIEW) puts a yellow banana beside the
+  bodies to show their size. Drag it: it moves parallel to the screen, stays
+  within reach of the part and snaps to the spots beside it (hold Alt not to
+  snap); right-click it for Place next to part, Turn 90° and Remove banana.
+  Click the button again to remove it. It is not a body and never reaches the simulation. In a sketch the same
+  button tapes a true-size banana picture to the sketch's plane, behind the
+  sketch; move it with the Select tool (drawing tools draw over it), right-click
+  it for Place next to sketch.
+
+## Sketches
+
+Click **Sketch** (or right-click a flat face: **New sketch on this face**), then
+pick an origin plane, a CONSTRUCT plane or a flat face of a body. The view turns
+square to the sketch. **Finish sketch** (or Enter with no tool step open) leaves
+sketch mode; the camera stays where it is.
+
+The **Sketch panel** is compact: the sketch's name and state, what the tool
+wants next and its own fields, the dimension you are editing, and **Done**.
+Problems always show there (a failed sketch, the constraints that over-define
+it, a lost reference). **Details ▸** in its foot adds the plane, the selection
+with Construction and Delete selected, every pattern and the references; it
+stays open or closed the way you leave it. The chevron in the panel's head (or
+`Ctrl+\`) slides the panel into a slim rail at the left edge, with the sketch's
+state dot and **Finish sketch** on it; the next sketch opens the same way. While
+it is a rail, a tool that has its own fields (Offset's distance, Fillet's
+radius, a pattern's count) shows them in a small card beside the rail.
+
+**Draw** (DRAW group):
+
+- **Line** (L): chained lines, click by click. A, or a drag from the end, makes
+  a tangent arc. Click and drag draws one line from the press to the release
+  (Rectangle, Circle, 3-point arc and Tangent arc draw the same way).
+- **Rectangle** (R, two corners) and **Center rectangle**.
+- **Circle** (C), **3-point arc** (A), **Tangent arc**, **Point**,
+  **Centerline**.
+- **Spline** (S): a fit-point spline through the points you click. Double-click
+  or Enter places it; a click on its first point closes it. Its fit points are
+  ordinary sketch points: dimension them, relate them, drag them.
+- **Control-point spline**: degree 3 (or 5), pulled by its control points;
+  the control polygon shows dashed while it is selected.
+- **Construction** (X, in DRAW's More): with a drawing tool in hand, or nothing
+  selected, it turns construction drawing on or off. While it is on (checked in
+  More, pressed if you put it on the toolbar, and the view says "Construction
+  (X)"), every line, rectangle, circle, arc and spline you draw is construction.
+  It is off again when the sketch closes. With curves selected and no drawing
+  tool, it turns them into construction geometry and back; right-click a
+  selection for the same **Construction** (a mixed selection offers **Make
+  construction** and **Make normal**).
+
+While you draw, a value box follows the pointer: type a length or an angle and
+press Enter or Tab. A click counts where you pressed, even when the mouse is
+still moving as you click. The pointer is a thin crosshair with the tool's icon
+beside it. With no tool in hand it is a small arrow with a tiny icon of what is
+under it (a point, a line, an arc, a circle or an ellipse), and a four-way arrow
+while you drag. The point under the pointer grows in a light blue disk; a
+selected point is green with a green ring.
+
+Relations (the small horizontal, parallel, tangent, ... badges) show only for
+the geometry you select. **Show relations** (VIEW, Shift+R) shows them all and
+is remembered; a relation in conflict always shows, in red. Dimensions always
+show. The pointer snaps to the sketch (ends, midpoints,
+centres, curves, horizontal and vertical) and to the model itself: a body's
+vertex, an edge's middle, a point on an edge, a round edge's centre (hover the
+rim first), and the point where an edge pierces the sketch plane. Clicking a model snap adds
+a linked reference and the relation in one undo step. Hold Ctrl to draw without
+snapping.
+
+**Modify** (MODIFY group):
+
+- **Trim** (T) and **Extend**: click the piece to cut off, or the end to extend
+  to the next curve. Splines can be trimmed and trimmed against.
+- **Offset** (O): point at a curve; its chain (lines, arcs and splines joined end
+  to end) is previewed on the pointer's side. Click to place; **Both sides** is
+  an option. Line and arc offsets stay tied to their source.
+- **Fillet** and **Chamfer** of a sketch corner, with a Radius or Distance
+  dimension you can edit later. A new fillet shows an arrow on its arc: drag it
+  and the arc's middle follows the pointer (inward, away from the corner, for a
+  bigger radius; towards the corner for a smaller one) (the Radius box follows;
+  it stops at the largest radius the corner takes and says why). Select a fillet
+  arc later to get the arrow back.
+- **Mirror** (M): pick entities, then the mirror line. The copies stay
+  symmetric to their source.
+- **Linear pattern** (one or two directions; count, spacing, angle or "Along a
+  line") and **Circular pattern** (about the origin or a picked centre; full
+  circle or a total angle). The copies are tied to their source and follow it.
+  The pattern you just made or selected has a row in the Sketch panel (every
+  pattern has one under **Details**) where you change its count,
+  spacing or angle, bring back a deleted copy, or **Dissolve** it (the copies
+  become free geometry where they are). Deleting a pattern's source makes the
+  next copy the source; the message offers **Dissolve pattern** instead.
+- **Project** (P): click a body's vertex, edge or face to bring it into the
+  sketch, or switch on **Silhouette** and click a body for its outline seen
+  along the sketch normal. Works on imported STEP bodies too.
+- **Intersect**: the curves where the sketch plane cuts the bodies (all shown
+  bodies, or the ones you click).
+- **Import SVG/DXF**: pick an SVG or an ASCII DXF file (at most 20 MB). The
+  Sketch panel shows what it read (lines, arcs, circles, ellipses, splines and
+  points), what it skipped and why (text, scripts, pictures, links to other
+  files, DXF dimensions and hatches...), its size in mm and its open ends; the
+  curves preview in the sketch. **Scale** is mm per drawing unit, from the
+  file's units (an SVG's width over its viewBox, else 96 px per inch; a DXF's
+  $INSUNITS, or mm when it has none). **Place**: the drawing's own origin on the
+  sketch origin, or centred there. A DXF's **layers** can be ticked off (one the
+  file has off starts unticked). **OK** adds the curves as one undo step. Ends
+  that meet share one point (the panel says within what distance), so closed
+  outlines are profiles; no relations are added (fix or dimension what must
+  hold). A drawing too heavy for the sketch solver (about 10,000 points, or 400
+  arcs: every later change solves all of it) is refused with what it weighs. An SVG's curves are exact: cubic
+  Beziers are splines, arcs are arcs, transforms are applied; a DXF's splines
+  are exact too, except rational ones (made as fit splines through points of
+  them; the panel says so). A drawing is read as data only: nothing in it runs
+  or loads. Inside a sketch only (start the sketch first).
+- **Copy and Paste** (Ctrl+C, Ctrl+V, or the right-click menu): select sketch
+  geometry and copy it; Paste picks the copy up, held by the middle of its box,
+  and it follows the pointer (snapping as the drawing tools do); click (or
+  Enter) to place it, one undo step, Esc to put it down. Construction stays
+  construction; the relations and dimensions between the copied pieces come
+  with it, so the copy is as defined as the original; those that also tie
+  geometry you did not copy are left out, and the panel says how many. A
+  dimension keeps its expression where it gives the same value there, else the
+  value it had (the panel says which). It pastes into any sketch, on any plane
+  (the same 2D shape), also in another Part. In a text or number field the keys
+  copy and paste text; with text selected (the panel's red note) Ctrl+C copies
+  that text.
+
+Projected and intersected curves are **linked**: drawn purple, fixed in place,
+and recomputed whenever the model rebuilds, so a sketch built on them follows
+the model. Dimensions, relations, Trim (against them) and regions all use them.
+**Break link** (right-click, or its References row under the panel's
+**Details**) turns one into
+ordinary geometry. If its source disappears upstream, the curve turns amber,
+the panel says "Lost reference: ...", and the sketch still solves; nothing is
+blocked.
+
+**Select** in a sketch: click, Ctrl+click to toggle, or **Ctrl + drag a box**.
+Dragging left to right selects what the box encloses (solid box); right to left,
+what it touches (dashed box). Ctrl+Shift + drag adds to the selection. In sketch
+mode the Selection filter offers Points, Curves and Dimensions.
+
+## Constraints and dimensions
+
+**Relations** (CONSTRAIN group): Coincident, Horizontal, Vertical, Parallel,
+Perpendicular, Tangent, Equal, Midpoint, Symmetric, Concentric, Collinear and
+Fix. Select the items first, then click the relation; if the selection does not
+fit, the button says what it needs. Many relations are added for you while you
+draw (inferred).
+
+**Dimensions** (D): pick one or two items and place the label. Lengths,
+distances, radii, diameters and angles. Every label shows its unit ("⌀125 mm",
+"R10 mm", "40 mm", "30°"). Double-click a label to change it; type a number,
+a value with a unit, or an expression using your named parameters ("fx: 40 mm"
+marks a value from an expression). A dimension that would over-define the
+sketch can be placed as a **driven** (reference) dimension, shown in brackets:
+"(40 mm)".
+
+**How defined the sketch is**: the sketch chip says "Under defined · 2 DOF",
+"Fully defined", or which relations conflict. Free geometry is drawn in blue and
+fully defined geometry in black; an over-defined sketch shows red. Drag
+under-defined geometry to move it; a fully defined entity keeps the normal arrow
+and the panel says why it cannot move ("This line is fully defined: change a
+dimension to move it").
+
+## Solids
+
+Solids come only from sketches and from STEP files: there is no one-click box
+or cylinder. Every body-making feature has an **Operation**: New body, Join,
+Cut or Intersect, with the bodies it works on.
+
+**Join merges bodies that only touch** (face to face, with no overlap) into one
+body, as well as bodies that overlap. This is by design (decided for 0.1.0): two
+blocks placed side by side and joined become one solid. Use New body to keep
+touching bodies apart.
+
+- **Extrude** (E): pick sketch regions (profiles). Extents: blind, two sides,
+  symmetric, through all, or up to a face or a vertex, with an offset; along the
+  sketch normal or a chosen direction; Flip. You can also extrude a **flat face
+  of a body** directly, with no sketch: right-click it, **Extrude face**. A drag
+  arrow in the view changes the distance.
+- **Revolve**: profiles about an axis (a centerline or line of the sketch, a
+  straight or round edge, a round face's axis, an origin or CONSTRUCT axis); one
+  side, symmetric or two sides, by an angle.
+- **Sweep**: a profile along a sketched path; **Follow path** or **Keep
+  orientation**.
+- **Loft**: through two or more profiles, in the order you pick them (Move up /
+  Move down); **Ruled** for straight sides.
+
+## Modify: fillets, shells, booleans and direct edits
+
+- **Fillet**: round edges with a radius. Tangent edges are taken as a chain. A
+  radius that is too large names the edges and says which radius works.
+- **Chamfer**: one distance, or two (Flip sides swaps them). A distance that is
+  too large says what works.
+- **Shell**: hollow a body to a wall thickness, removing the faces you pick;
+  inside or outside.
+- **Combine**: Join, Cut or Intersect several target bodies with several tool
+  bodies; **Keep the tool bodies** is an option.
+- **Split**: cut a body in two by a plane, a flat face or another body.
+- **Move/copy body** (M, or "Move/copy Body 1…" in a body's menu): move bodies
+  by X, Y, Z and turn them by an angle about X, Y or Z through a pivot (the
+  centre of their box unless you type one) or about an axis, a straight or round
+  edge, a round face or a sketch line. It turns first, then moves. A moved body
+  keeps its name and faces, so later features still find them, and what you made
+  on it (a hole sketched on its face, a fillet) goes with it when you change the
+  move or put one in before it. While you edit it, the features after it are
+  rolled back, as for a sketch. **Keep a copy**
+  leaves the bodies and moves copies ("Body 1 (Copy)"). Or drag the handle in
+  the view: its arrows move along X, Y, Z, its rings turn (Ctrl: whole mm and
+  15°); the fields follow, and Escape during a drag puts it back.
+- **Delete faces and heal**: remove faces (a hole, a fillet, a boss) and let
+  the kernel close the gap. When that heal cannot do it cleanly (the fillets of
+  a part with a cavity on each side, such as a rounded T-block) and the faces
+  are every fillet of the body up to the largest picked radius, they are taken
+  off as fillets (Analysis Situs) and the row says so. A red Delete faces names
+  the faces that would make the pick whole, and **Add the rest** in its panel
+  adds them; when the fillets up to that radius include rings round a boss or a
+  hole, which cannot come off as fillets, it says so instead. On a body over
+  a face limit (holes are found on bodies of up to 2,600 faces, fillets up to
+  5,000) the red words say what was not looked for and name both limits.
+  Rounds that end on other fillets' corner pieces (a T-block rounded R2 and
+  then R1 along it) come off one round at a time with those corner pieces, and
+  the row says so. The heal has 20 s (120 s on a part of over 2,000 faces), the
+  time it had before; one that does not finish is red in words, the body
+  unchanged. In the panel, **Fillets up to** [R] **Add** and **Holes up to Ø**
+  [D] **Add** pick the faces by size (whole drilled holes, through holes too)
+  and say what they added; with no face picked yet they use the Part's one solid
+  body. A Ctrl+drag box in the view adds the faces it selects while the panel is
+  open.
+- **Press-pull** (Q): move faces along their normal. Out adds material, in
+  removes it. Flat and curved faces, several at once:
+  - a sloping neighbour is extended to meet the moved face, so no step is left;
+  - a hole's bore or a boss changes its radius, and the panel says so ("Bore
+    radius 10 mm → 8 mm"; 2 mm out on a 10 mm bore makes it 8 mm);
+  - a fillet face changes its radius and stays tangent;
+  - fillets and chamfers beside a moved face keep their size;
+  - a move that would close a hole, cut the part through itself or leave a step
+    is refused in red with a distance that works ("the hole would close: 9.9 mm
+    or less works").
+
+Every result is checked (still a valid solid, no face lost, a plausible volume
+change) before it is taken. When a feature fails, it turns red with the reason
+in plain words, and the model before it still shows.
+
+## Patterns and mirror
+
+The PATTERN group, beside SOLID:
+
+- **Linear pattern**: one or two directions (an edge, an axis, a sketch line, or
+  a plane's or flat face's normal), count with spacing or total extent,
+  symmetric.
+- **Circular pattern**: about an origin or CONSTRUCT axis, a straight edge or a
+  round face; full 360° with equal spacing, or a set angle; symmetric.
+- **Mirror**: across an origin or CONSTRUCT plane, or a flat face.
+
+Each one repeats **features** (applied with each feature's own operation, or New
+body / Join / Cut / Intersect), **bodies** (copies, named "Body 1 (Instance 2)")
+or **faces** of one body (the boss or pocket they bound). Select what to repeat
+before you click the command, or pick it in the panel. Numbered markers in the
+view show each copy: click one to skip that copy, and use **Make it again** in
+the panel to bring it back. Patterns of mirrors and mirrors of patterns work.
+Copies keep stable names, so a fillet on copy 3 survives a change of count.
+
+## Reference geometry
+
+The CONSTRUCT group adds history features you can sketch on, extrude along,
+revolve about, pattern about or mirror across. They follow the model when it
+changes.
+
+- **Plane**: offset, at an angle, through 3 points, midplane, normal to a curve
+  at a point.
+- **Axis**: through two points, of a round face, along an edge, where two planes
+  cross.
+- **Point**: at a vertex, at the centre of an arc, circle or sphere, on an edge
+  at a distance or a percentage, where an edge crosses a plane, or at
+  coordinates.
+
+The origin's X, Y and Z axes are rows under Origin and can be used the same way.
+
+## STEP files: import, edit, export
+
+- **Import STEP** (FILE group): the file is read, healed (faces knitted into
+  solids within a tolerance you can change) and added as an **Imported** feature,
+  keeping the bodies' names and colours. A large file shows its progress and can
+  be cancelled; a 113 MB, 11,776-face part imports in under a minute.
+- Edit it with the same tools as a native part: Press-pull, Delete faces,
+  Split, Combine, Fillet, Chamfer, Shell, sketches on its faces, Project of its
+  edges. Each edit is a feature on top of the import, so it can be changed or
+  undone later.
+- **Export STEP**: the bodies you pick, as STEP AP214 or AP242, in the length
+  unit you choose.
+
+### Edit in CAD: a geometry imported in the simulation view
+
+A STEP, IGES or BREP part you imported into the project (the simulation view)
+opens in CAD from **Edit in CAD**: right-click its row (or one of its bodies) in
+the tree, right-click the part in the viewport, or use the button in its Geometry
+panel.
+
+- The first time, a Part named like the geometry is made and imports it by
+  itself: the import panel shows the progress and closes when it is done. If
+  Magnusim is still updating the geometry, the Part says "Waiting for Magnusim to
+  finish storing <geometry>" and goes on when it can (at most 2 minutes; **Stop**
+  ends the wait, **Try again** starts it again); modelling waits meanwhile. A face
+  you right-clicked in the viewport is selected.
+- Open in two tabs at once, the part is imported once: the tab whose save came
+  second shows Reload, and after it uses the same import.
+- Edit it as any import. **Back** with a change updates the geometry; when a
+  simulation uses it, Back asks first, as for any Part: **Overwrite
+  <geometry>** updates the geometry in place (the same geometry, its boundary
+  conditions, refinements and monitors carried over by face), **Save as new
+  geometry** adds a new one, **Keep editing** stays. Meshes are marked out of
+  date; nothing is deleted. The original file is kept, and the Geometry panel can
+  add it back as a geometry of its own.
+- **Back with no change changes nothing** in the project, also after an Undo
+  back to the import.
+- **Edit in CAD again** opens the same Part with its history; it does not import
+  again.
+- If the geometry is **removed** from the project, the Part says so (one line).
+  Back with a change then asks first: **Add as new geometry** adds the part as a
+  geometry of its own, **Not now** leaves the project as it is (and does not ask
+  again until you change the part), **Keep editing** stays. A Part opened for a
+  geometry that was removed before anything was imported imports nothing.
+- The faces of the part in CAD are matched to the geometry's own (by number,
+  then by place, size and facing), and Magnusim checks each match again. If some
+  could not be matched or checked, the Part says how many, and if the matching
+  failed, it says why: those boundary conditions follow by shape only (a face
+  you move or resize then loses its boundary condition).
+- A mesh geometry (STL, OBJ, PLY) shows Edit in CAD greyed out, with the reason:
+  import the part as STEP to edit it.
+
+## CFD prep: Enclosure and Combine
+
+**Enclosure** (CFD PREP group) makes the box or cylinder of air around the part,
+once the part has a body:
+
+- **Box**, or **Cylinder** with its axis, around the exact bounding box of the
+  bodies you choose (all of them by default).
+- **Padding**: **Zero** (tight to the part, the default), **Percent** of the
+  part's size, or **Fixed** distance. Each side then has its own value: type it,
+  or drag that side's arrow in the view (Escape during a drag puts it back).
+- A side may go into the part (an amber note names it: the fluid leaves out the
+  part beyond it), but never past the part's far side.
+- It follows the part when the part changes, keeping your padding. It is drawn
+  see-through, so a click picks the part inside it. Its faces are named by side
+  ("+X face of Enclosure 1", "Top face"), which become clear patch names in the
+  simulation.
+
+The air volume is always a separate step: **Combine**, **Cut**, with the
+Enclosure as the target and the part as the tool (**Keep the tool bodies**
+comes on). Rename the result, for example to "Fluid".
+
+## Measure and inspect
+
+- **Measure**: click faces, edges and vertices for distances, angles, lengths,
+  radii and areas. Its picks survive a rebuild that keeps their geometry.
+- **Mass properties**: volume, surface area, centroid and size, for each body
+  and in total.
+- **Find**: type what to find ("Body 1 faces >Z", "edges of Base.end") and see
+  the matches lit, listed and counted; **Select all** selects them. Fillets and
+  drilled holes are found by their shape, whatever made them: "Body 1 faces
+  fillet <= 2 mm", "Body 1 faces hole <= 6 mm" (every face of the whole holes
+  with that bore). Fillets are found on bodies of up to 5,000 faces, holes on
+  bodies of up to 2,600; a larger body is refused in words that name both
+  limits, and you select its faces in the view instead.
+- **Check**: pick what to check at the top of the panel.
+  - **Solids**: each body is "Valid", or its problems are listed by kind with
+    where they are.
+  - **Interference**: the pairs of bodies that overlap and how much (the
+    selected bodies, or every shown one; one selected body against every other
+    shown body). A bore drawn a little under its shaft is a press fit: listed
+    apart, not as a collision. A clearance also lists the pairs closer than it.
+  - **Loose parts**: the parts on each shaft in order, what holds each one,
+    and which can slide along the shaft (which way and how far), with a play
+    you set (0.5 mm if empty). The play is the gap between the bore and its
+    shaft all round, so a D or hex shaft in a bore of its shape counts as
+    loose, not pressed on. With bodies selected it checks the shafts near them.
+  - **Rotation**: a body turned a full turn about an axis: the first angle it
+    meets each other body, counter-clockwise about the axis's direction (the
+    column says which way, e.g. "Counter-clockwise about +Z") and clockwise.
+
+  Press Check to run one; Stop ends a long one. A check that runs past its
+  time limit (90 s) says "Stopped at the time limit" and what helps: what it
+  lists is only what it reached. Click a row to select its bodies. The
+  Assistant runs the same checks and gets the same words.
+- The **volume chip** shows the selected body's volume; with nothing selected it
+  lists each body on its own. It never adds bodies together.
+- **Section view** (INSPECT, key X) cuts the view on a plane, so you can see and
+  reach faces inside the part. The panel opens with the view cut:
+  - **Plane**: click a construction plane or a flat face in the view, or a plane
+    in the tree, or Top, Front or Right. The cut is parallel to it, along its
+    own normal (a construction plane at an angle cuts at that angle), and the
+    panel names it. On a construction plane it starts at the plane itself; on
+    an origin plane or a face, through the middle of the shown bodies.
+  - **Offset**: how far from the plane along its normal (a length in the
+    Part's units; parameters and expressions as in any length field); **Middle**
+    cuts through the middle of the shown bodies. **Keep the other side** flips
+    which half stays. **Cut the view** turns it off and on.
+  - **The arrow** on the cut points along the plane's normal (the way Offset
+    grows): drag it to move the cut, and Offset follows (hold Ctrl for whole
+    millimetres, tenths of an inch in an inch Part). Esc while dragging puts it
+    back.
+  - The cut follows its plane: an edit that moves a construction plane, or a
+    face that moves, moves the cut too. If the plane is deleted (or no longer
+    builds), the section turns off and a note says why, and the next cut starts
+    on Front; while a panel edits an earlier feature or the rollback bar is
+    above the plane, the cut stays where it was (the note says it is rolled
+    back). A Part opened with the bar above its section's plane opens uncut
+    and keeps the section: it comes back once the plane builds.
+  - The view tools' button and INSPECT > Section view turn the cut on where
+    its plane is now (a face that moved while the cut was off is cut through
+    its middle again).
+  - It is a view, not a feature: no undo step, never in the model or the
+    simulation. The Part keeps it, so it is there when you open the Part again.
+    The view tools' section button and its quick controls (Top, Front, Right, a
+    slider, Flip side, Middle) drive the same cut; **More** opens this panel.
+  - The Assistant sets the same cut (workspace section, on any of these
+    planes), reads it back (with the panel's note, and a face's selector it can
+    use again), and draws pictures cut on any of them; the Picture panel's
+    Section takes a construction plane or the selected flat face too.
+- **See-through** (INSPECT) draws the selected bodies see-through (a selected
+  face counts for its body), so you can see what is inside and behind them.
+  Their edges stay drawn, and a click on them goes through to an opaque face
+  behind (pick the see-through body itself in the tree, by an edge, or where
+  nothing is behind it). Run it again while all of them are see-through to make
+  them opaque; a mix of the two all turn see-through.
+  - A body's menu (right-click its Bodies row, or the body in the view) has
+    **Make Body 1 see-through** or **Make Body 1 opaque**, next to Hide. The row
+    shows a see-through mark; a hidden body is dimmed instead, and a body can be
+    both. An Enclosure's air is always see-through: its menu says so.
+  - A section cuts a see-through body with a see-through cap, so a body inside
+    it keeps its own cap and shows through.
+  - It is a view, as hiding is: no undo step, never in the model or the
+    simulation. The Part keeps it, so it is there when you open the Part again.
+    Pictures draw see-through bodies see-through, as they leave out hidden ones.
+  - It belongs to the body, as hiding does: a new body made from it (a split's
+    other pieces, a Move/copy body copy, a pattern's copies) starts opaque,
+    with its colour; make it see-through on its own.
+  - The Assistant does the same (workspace see_through and opaque) and reads it
+    back (get_model's parts say see_through).
+
+## History, parameters, undo and saving
+
+- **History**: right-click a feature for Edit, Rename, Suppress or Unsuppress,
+  Roll back to here, Roll to end and Delete; a sketch or a reference plane,
+  axis or point also has Hide or Show (its eye in the tree does the same; a
+  hidden one is still used by what is built on it). Drag the rollback bar to
+  see the part as it was at that feature. A feature that breaks because something
+  upstream changed is marked red with the reason; a reference it can follow
+  only approximately says "Reference repaired · check".
+- **Parameters**: named values with units and expressions. Use them in any
+  number field ("width * 2").
+- **Undo and redo** (Ctrl+Z, Ctrl+Y): up to 100 steps. One panel, one drag or one
+  action is one step.
+- **Saving is automatic.** The save chip says Saved, or what it is waiting for.
+  If you leave while a change is still being written, the app asks first.
+- **Two tabs**: if another tab saved the same Part while this tab has an
+  unsaved change, you choose: **Reload (discard my change)** or **Keep mine
+  (replace the other tab's save)**. Nothing is lost silently.
+
+## Back to the simulation
+
+A Part is **linked** to one geometry of its project. There is no export step:
+
+- **Leave the Part** any way you like (Back, the browser's Back, another
+  project, Home). The Part saves, the project's geometry is brought up to date,
+  and you land in the simulation viewport looking at the part the way you left
+  it. The first time, the geometry is created; after that it is updated in
+  place.
+- **Include in simulation**: each body has this toggle (its Bodies row and its
+  menu). It is on for every solid body. A hidden body is still in the
+  simulation while it is included.
+- **Studies are kept**: boundary conditions and refinements follow faces by
+  their CAD names. If a named face is gone, you are told which. Meshes are marked
+  out of date; nothing is deleted.
+- If nothing changed, leaving is instant. If a feature is broken, leaving asks
+  first ("Couldn't update the project", with the reason). A broken reference
+  plane, axis or point that nothing uses does not stop the update.
+
+## The Assistant in the Part
+
+*In development: this needs Magnusim's Assistant, which comes with Magnusim
+0.5.0 and is not released yet.*
+
+Magnusim's Assistant works with a model you choose in **Settings > Assistant**:
+a cloud provider with your own key, or a local server on this PC. While a Part
+is open in an app window on this PC, the Part offers the Assistant its own
+tools, so you can ask it to build or change the part and watch it work. The
+tools run in the Part like the rest of CAD; only the model runs elsewhere. A
+page opened from another computer offers no tools.
+
+**Asking.** Until the app's chat panel arrives, a request starts from the app's
+terminal client, run in `magnusim-web` with the Part open and the Magnusim
+window shown:
+
+```
+node scripts/assistant-run.mjs --tab auto "A 100 x 60 x 8 mm plate with four 6.5 mm through holes 10 mm from the edges, its sizes as parameters"
+```
+
+`--tab auto` sends the request to the one app tab that is connected. The
+terminal shows each step and the answer, and the app shows its questions too.
+One request at a time runs in a tab.
+
+**What it can do.** Read the Part (features, sketches, parameters, bodies, and
+what you changed since its last step), find faces, edges and sketch regions by
+name or by a point on them, measure (volumes, voids, areas, distances, overlaps
+of two bodies, sections), look at pictures of the Part, set parameters, sketch
+(points, lines, centerlines, polylines, circles, arcs, rectangles, slots,
+polygons and sectors, with relations and dimensions), extrude, revolve, sweep
+and loft, drill holes into a flat face, fillet, chamfer and shell, pattern and
+mirror, combine bodies, name and colour a body, change, rename, suppress or
+move a feature, undo its own steps, and delete features. It makes the offset
+planes its sketches and mirrors need. It does not export: use Export STEP, or
+go Back to the simulation. It can also use the Part's other tools: Split,
+Press-pull and Delete faces, the Enclosure, Import STEP (you pick the file),
+CONSTRUCT's axes and points, an extrude of a face, and in a sketch Project /
+Intersect, offsets, the linear and circular patterns, Copy and Paste (it copies
+geometry from a sketch, or pastes what you copied with Ctrl+C) and Import
+SVG/DXF (a drawing you attach in the Assistant panel, SVG or DXF).
+
+**Watching it work.** It works in the Part's own panels and in sketch mode, as
+you would: a panel opens, its values go in, the part rebuilds, and the tree and
+the volume chip follow. In a sketch the curves appear where it guessed, then
+each relation and dimension pulls them into shape until the sketch is Fully
+defined. Its panels carry an **Assistant** badge and cannot be typed in (a tall
+one still scrolls); their Done reads "The Assistant is filling this in · Esc
+takes over (the Assistant pauses)", and its sketch says "The Assistant is
+drawing this sketch · Esc takes over". With the Sketch panel collapsed to its
+rail, the rail says **Assistant** too and its Finish sketch waits the same way.
+- **Watch or Fast** (the chip): Watch, the default, pauses a moment at each
+  step (at most 6 s per call); Fast makes each step at once. Your choice is
+  kept. Watching needs the Magnusim window shown: in a hidden window, or a
+  covered one (Windows reports a covered window as hidden), the steps run
+  without pauses and the Assistant is told so. A part whose rebuild takes more
+  than 1.5 s also runs without pauses.
+- **The camera.** At the watch pace the view turns for its sketches and new
+  extrudes as it does for yours (square to a new sketch, Isometric when a new
+  extrude would be seen end on), until you move the camera yourself: from then
+  on, for the rest of that request, it leaves your view alone. Its pictures are
+  drawn off screen: they never move your camera, change your section view or
+  change the Part.
+
+**The chip.** While a request runs, the Assistant chip in the dock (bottom left)
+says what it does:
+
+| The chip says | Buttons |
+|---|---|
+| Assistant · thinking · 12 of 120 steps | Pause, Stop, Ask each step |
+| Assistant · Sketch Plate sketch · 12 of 120 steps | Pause, Stop, Fast (or Watch), Ask each step |
+| Assistant waits for you: close the Fillet 2 panel | Pause, Stop |
+| Assistant: Extrude Boss · keep it? | Keep, Discard |
+| Assistant paused · you took over | Resume, Stop |
+| Assistant: <your request> · done | Undo |
+
+A request on a coding agent counts its changes instead of its steps
+("Assistant · thinking · 3 of 24 changes"): past its change limit its edits are
+refused while it can still read the Part.
+
+- **Pause**: its edits wait until you Resume; it can still read the Part. A
+  step it is making when you pause stops where it is (at its next pace) and
+  goes on at Resume; nothing of it is kept or saved until then. A pause ends
+  with the request.
+- **Stop** ends the request. The step it is on is not kept; its earlier steps
+  stay, and Undo takes them back.
+- **Ask each step** (off by default; your choice is kept): each edit waits
+  after its rebuild for **Keep** or **Discard**. Discard puts the Part back as it
+  was before that step, and the Assistant is told to ask you what to change. No
+  answer within 10 minutes counts as Discard.
+- **When the request ends** the chip says how ("done", "stopped", "failed",
+  "stopped at its limits") for two minutes, or until the Part changes, with the
+  Part's health: "· Fillet 1 fails", "· 1 sketch under-defined", "· 2 features
+  with a warning" (red for a failure, amber for the others). A click on those
+  words selects the first such feature in the tree. **Undo** shows while the
+  request's changes are the newest step.
+
+**You come first.**
+- While you have a feature or tool panel open, a value typed and not applied, a
+  rename, a menu or a dialog, or while the rollback bar is not at the end, its
+  edits wait and the chip says for what ("close the Fillet 2 panel", "move the
+  rollback bar to the end"). Its reads go on. After 10 minutes the Assistant is
+  told you are busy, and to say what it needs and end its request. A Parameters
+  panel you have open but are not typing in does not count: it stays open, shows
+  the new values and flashes the rows that changed.
+- **Taking over.** During one of its steps, Escape, Ctrl+Z, Ctrl+Y (the Undo
+  button's tip then says it takes the step over), a toolbar or tree command
+  (Parameters too), or Enter or Finish sketch in its sketch takes the step
+  over: it is discarded, nothing of it is kept, and the Assistant pauses in this
+  Part until the request ends (the chip's Resume lets it go on). A change of
+  yours to the Part during a step (a rename, a value, a Delete) stops it too,
+  and yours is kept; what the step had already made before your change (the
+  offset plane of its sketch, say) then stays as well, since taking it back
+  would undo yours. The Assistant is told what stayed, the chip names it when
+  it pauses ("you took over · Plane 1 stayed"), and Ctrl+Z takes it back.
+  Undoing its steps while the request runs pauses it the same way ("you undid
+  its steps"; a redo: "you redid its steps").
+- **Looking is not taking over**: selecting, hovering and orbiting in the view,
+  and clicks on the fields of its panel.
+- It is told to leave what you made alone unless you ask, and everything it
+  changes is an undo step of its own.
+
+**Undo.** All of one request's changes are one undo step: the Undo button's tip
+reads "Undo Assistant: <your request>" (its first line), and one Ctrl+Z, or the
+chip's Undo, takes them all back; Ctrl+Y brings them back. A change of yours
+during the request starts a new undo step, so it is never undone with the
+Assistant's. The Assistant's own undo takes back only its own steps and stops at
+any change of yours. Like every edit in CAD, undo lasts while the Part stays
+open: Back or a reload clears it.
+
+**Deleting asks you.** Before the Assistant deletes features the app asks
+"Allow the Assistant to delete features?", "Deletes features from the Part;
+one Ctrl+Z takes back the whole request, this deletion with it.", with the
+keyboard on **Don't**. A feature another one
+uses is not deleted; the Assistant is told which features use it.
+
+**Honest results.** Each call applies completely or not at all (unless you
+change the Part while it runs: see Taking over). While a call runs, the saved
+Part stays as it was before it, so a reload, a crash or Back in the middle of
+one never leaves half a step in the Part. A feature that fails (a
+fillet too large, a join that touches nothing, a cut that misses the part) is
+not kept, and its reason goes back to the model, with which way a cut missed. A
+changed size that would break a later feature is put back. A change of
+structure (a new sketch shape, a deleted feature) that breaks a later feature is
+kept, and the broken feature is named. Every sketch goes through the solver; one
+left under-defined is kept and shows in the chip's health at the end. The
+Assistant is asked to measure the Part and look at it before it says it is
+done.
+
+**Limits and local models.**
+- A watched build takes many calls: tens for a plate or a bracket, up to about
+  100 for a part of two interlocking bodies. The app's limits per request
+  (Settings > Assistant; by default 120 steps, $8 and 60 minutes) cover that,
+  and the time it waits for you does not count against the minutes.
+- A local model needs a context of at least 24,000 tokens for the Part's tools
+  (below that, the tools answer that it needs a longer one); load it with
+  48,000 or more: the tools and their notes alone take about 12,000 tokens. A
+  local model that reads no images gets no pictures; it measures and reads the
+  Part instead.
+
+## Mouse and keys
+
+The view moves the way the simulation viewer's does, in model and sketch mode:
+
+| Input | Does |
+|---|---|
+| Left drag | Orbits, wherever it starts. In sketch mode, a drag that starts on sketch geometry moves it instead (what is under-defined). |
+| Shift + left drag, middle drag | Pans |
+| Wheel, right drag | Zooms (to the cursor) |
+| Alt + left drag | Orbits, always (also while a sketch tool draws) |
+| **Ctrl + drag** | **Box select**: left to right selects what the box encloses (solid box), right to left what it touches (dashed box); Ctrl+Shift + drag adds; an empty box clears. In model mode it takes what is visible: edges with no filter, else the filter's bodies, faces, edges or vertices. |
+| Click, Ctrl+click | Select; Ctrl+click toggles one item (in a sketch it also adds a body vertex or edge, projected) |
+| Right click | The context menu |
+
+**Model mode:** E Extrude, Q Press-pull, M Move/copy body, F Fit, N Normal to, 1–7 the standard
+views (Front, Back, Left, Right, Top, Bottom, Isometric), Delete (on faces:
+Delete faces), Ctrl+Z / Ctrl+Y, Escape clears the selection.
+
+**Sketch mode:** L Line, R Rectangle, C Circle, A 3-point arc, S Spline,
+M Mirror, O Offset, P Project, D Dimension, T Trim, X Construction, N Normal to
+(the open sketch), Ctrl+C Copy and Ctrl+V Paste (the selected sketch geometry;
+in a text or number field they are the field's), Enter places an open tool step or finishes the sketch
+(on a menu item, or a button you reached with Tab, Enter presses that instead),
+Escape steps back (a line chain first, then the tool), then clears the selection.
+A tool's own key pressed again while it is in hand (L with Line, or the key you
+gave it), or its toolbar button clicked again, puts the tool down at once, as
+Escape pressed until the tool is gone; what you drew stays. Ctrl held while drawing turns
+snapping off. `Ctrl+\` collapses or expands the Sketch panel (in model mode: the
+design tree).
+
+**Normal to** (N, the views menu, and the right-click menu of a face, a plane, a
+sketch's row or its curves in the view) turns the view square to a flat face, a
+plane or a sketch. A curved face is refused in words.
+
+## Known limitations in 0.1.0
+
+**Scope.** 0.1.0 makes multi-body parts. Assemblies and joints, surface
+modeling, 2D drawings, sheet metal and feature recognition on imported parts are
+not part of it. There is no hole wizard, draft, variable-radius fillet, guide
+rail for Loft or Sweep, or 3D sketch yet. A geometry that was added to a project
+as a STEP file cannot be opened in CAD yet: start a Part and use Import STEP.
+
+**Size.** The kernel runs in the browser with at most 4 GB of memory. A 113 MB
+STEP file (about 12,000 faces) works but takes up to a minute to import; much
+larger files may not fit. On a PC without graphics acceleration, a box selection
+or Escape on such a part pauses for about a second.
+
+**Press-pull** refuses, rather than leave a step, when a face next to the moved
+face is not square to it and OCCT's offset cannot extend it. On imported parts
+this includes many pipes and cones that meet spline faces. Faces tangent to a
+moved face always move with it (the panel says how many); there is no switch to
+keep them still. Only a simple fillet (one face between two faces) is re-rounded;
+a chain of fillets or a corner blend is refused. Chamfers keep their size only
+when a Chamfer feature made them. Some spline faces cannot be offset at all, and
+the refusal says so. On parts over 2,000 faces the "what works" distance is not
+searched ("A smaller distance may work").
+
+**Sketches.**
+- An offset of a spline is a new spline through offset points: it does not
+  follow later changes of the source spline.
+- Extend works on lines and arcs, not splines (a line or an arc can be extended
+  to a spline).
+- Dimensions take a spline's points, not the curve itself (no length or
+  curvature dimension).
+- Sketch Fillet works on two lines, or a line and an arc, that share a corner.
+- Chamfer "Same distance" writes two dimensions with the same value; changing
+  one does not change the other.
+- A projected face, silhouette or intersection whose number of curves changes
+  after an upstream edit keeps its old curves until you open the sketch ("changed:
+  open Sketch N to update it").
+- The centre snap needs the round edge hovered first. Spline edges of a body
+  offer only their end points and pierce points as snaps.
+
+**Patterns.** A pattern of faces copies the boss or pocket the faces bound; it
+does not move the original faces. A copy far outside the view has no marker;
+use the panel's Make it again row. Sketch features default to New body: a
+Revolve or Sweep touching a body is not joined to it until you choose Join.
+
+**Selection.** A box takes only what is visible. Planes are not boxed (click
+them), and in Wireframe faces and bodies are not boxed.
+
+**Other.**
+- Sweep's Keep orientation does not move the profile to the start of the path.
+- On very large imports, Fillet's "which radius works" search can run out of
+  time; you then get the failure without a suggestion.
+- The note that a broken, unused reference was left out of the update shows in
+  the header while you leave, not in the landing report.
+- Some blends OCCT 7.9.3 cannot build (for example a small tangential inlet
+  blend on a cyclone part).
+
+## Licence
+
+GPL-3.0-or-later, like Magnusim (the repository's `LICENSE`). The third-party
+parts the plugin ships (Open CASCADE, PlaneGCS, Eigen, Boost headers, the
+Emscripten and LLVM runtimes, musl, three.js, three-mesh-bvh) and where their
+sources are: `LICENSES/README.md`.
+
+## Developer
+
+### Host API
+
+It needs Magnusim's host API 1.7: Edit in CAD (the manifest's `[[geometry_actions]]`;
+`ws.context.geometry` and `launch`, `ws.project.geometrySource` and `geometryFaces`,
+and `linkGeometry`'s `originalNames`, 1.7: `src/link/edit-open.ts` and `adopt.ts`);
+a Part's design becomes a geometry of its
+project (`ws.project.linkGeometry`, the Part study kind's `links_geometry`, 1.5),
+and its panels are drawn with the host's UI kit (`@magnusim/plugin-ui`, 1.3).
+The sync runs when the user leaves the Part (the host's exit hook,
+`ws.nav.onLeave`, 1.6). From 1.2 it uses `ws.files` to save a Part's model (etag-checked
+writes, so two tabs never overwrite each other) and asks before leaving the
+workspace while a change is not saved yet. (The document still falls back to
+`ws.data` on a 1.1 host; the unit tests' fake host uses that path.) The toolbar
+layout uses the host's per-user plugin prefs (`ws.prefs`) when the host has them,
+else it is kept per project.
+
+The Assistant's tools (in development) use `ws.assistant` from the app's host API
+1.9, which is not released yet: the host still reports 1.8, and the manifest
+stays at 1.7. `assistantOf` in `src/lib/bridge.ts` finds it in the SDK the host
+served, and so do the newer parts the tools use when they are there (an error's
+hint and detail, a result's summary, the turn events and Stop, a call that waits
+for the person, the delete's confirm note). On a host without `ws.assistant` the
+Part offers no tools and works as before.
+
+There is no Python backend (`plugin.py` registers nothing; `manifest.toml`
+declares the workspace, the study kind and the start actions). The description
+in `manifest.toml` (shown in Settings > Plugins) names only what ships: it is updated
+in Magnusim as features land.
+
+### Layout
+
+| Path | What |
+|---|---|
+| `manifest.toml`, `plugin.py` | What the host reads. `plugin.py` is the only Python file in the plugin. |
+| `src/` | TypeScript source of the workspace page and its workers. `src/assistant/` holds the Part's tools for the app's Assistant. |
+| `workspace/` | **Built output only** (what the host serves to the frame): `index.html`, `app.js`, `app.css`, `kernel/` (kernel worker + `mk32.mjs/.wasm`), `solver/` (`planegcs.mjs/.wasm`), `pick/` (the picking worker). Never edit by hand. |
+| `kernel-build/` | OCCT + facade build (pinned sources, patches, scripts), and the vendored Analysis Situs files it links (`kernel-build/asi/`). See `kernel-build/SOURCES.md`. |
+| `solver-build/` | PlaneGCS build (pinned upstream, our patch, script). See `solver-build/SOURCES.md`. |
+| `LICENSES/` | Third-party licence texts and the LGPL source and relinking notes. |
+| `scripts/` | `build.mjs` (page + workers) and what it runs (`keymap-load.mjs`, `make-banana.mjs`, `lock.mjs`). |
+| `CHANGELOG.md` | What changed in each version, for users. |
+
+### Build and test
+
+The plugin has its own toolchain and packages; the app's typecheck never sees
+its `src/`.
+
+```
+cd bundled-plugins/cad
+npm ci                 # own node_modules (gitignored)
+npm run build          # src/ -> workspace/ (page + worker modules)
+npm run build:check    # workspace/ must be exactly the build of src/
+```
+
+`npm run typecheck:cad` in `magnusim-web` checks the plugin's TypeScript. The
+kernel and solver binaries are rebuilt only when their sources change, on Linux
+or WSL: `kernel-build/build.sh`, `solver-build/build.sh`.
+
+The plugin's tests and its other developer scripts for this version are in Magnusim's development version, in its `magnusim-web/bundled-plugins/cad` folder (<https://github.com/Lilmill2000/Magnusim>).
+
+### Separation rules
+
+- The core never imports the plugin, and the plugin never imports core code:
+  the page talks to the app only through `@magnusim/workspace` (the bridge),
+  wrapped in `src/lib/bridge.ts`.
+- `plugin.py` is the only `.py` file (Magnusim's `python/tools/plugin_boundary.py` checks
+  every `.py` in the plugin; `node_modules/` holds none today).
+- React, React DOM, the bridge and the UI kit (`@magnusim/plugin-ui`) come
+  from the host's import map; they are never bundled. Workers get no import map: worker modules are self-contained.
+- The frame has no localStorage, IndexedDB or cookies, no `/api/`, no popups
+  and no `alert`/`confirm`. Saved state goes through the bridge.
+- No change in the core is needed to build or run the plugin. The host
+  features it uses (plugin files with etags, unsaved-work questions, frame
+  focus, off-by-default plugins, the UI kit, linked geometries, the exit hook,
+  start actions, plugin prefs, a workspace's tools for the Assistant) are
+  generic host APIs.
+- The Assistant's tools reach the app only through `ws.assistant`. No test
+  calls a real model provider (the specs use the app's scripted model), and no
+  file of the plugin names a model vendor or is a coding tool's file: Magnusim's
+  `scripts/__tests__/vendor-names.test.mjs` reads every tracked file here.
+- Dependencies must be GPL-3.0-compatible; code from AGPL projects or
+  jsketcher is never copied.

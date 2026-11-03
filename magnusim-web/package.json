@@ -1,0 +1,54 @@
+{
+  "name": "magnusim-cad",
+  "private": true,
+  "version": "0.5.0",
+  "type": "module",
+  "description": "Magnusim CAD: parametric parts and STEP files with the Assistant, as a desktop app (the CAD edition of Magnusim, copied from its repository)",
+  "scripts": {
+    "build": "node --input-type=module -e \"import{build}from'vite';import react from'@vitejs/plugin-react';await build({configFile:false,root:process.cwd(),plugins:[react()],build:{outDir:'dist/page',emptyOutDir:true,chunkSizeWarningLimit:10000,rollupOptions:{input:'cad.html'}}})\"",
+    "build:cad": "npm --prefix bundled-plugins/cad run build",
+    "build:cad:check": "npm --prefix bundled-plugins/cad run build:check",
+    "dev": "node scripts/server/cad-edition/serve.mjs --dev",
+    "typecheck": "tsc -p tsconfig.json && tsc -p scripts/server/tsconfig.json && tsc -p tsconfig.src.json && tsc -p scripts/server/assistant/tsconfig.json",
+    "typecheck:cad": "tsc -p bundled-plugins/cad/tsconfig.json",
+    "start": "npm --prefix desktop start",
+    "dist": "npm ci --prefix bundled-plugins/cad && cd desktop && npm ci && npm run dist"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "0.131.0",
+    "@kitware/vtk.js": "^32.12.1",
+    "@modelcontextprotocol/server": "2.3.0",
+    "@rjsf/core": "^6.10.0",
+    "@rjsf/utils": "^6.10.0",
+    "@rjsf/validator-ajv8": "^6.10.0",
+    "@tanstack/react-query": "^5.102.8",
+    "@vitejs/plugin-react": "^4.7.0",
+    "openai": "7.27.0",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "zod": "4.6.7",
+    "zustand": "^5.0.15"
+  },
+  "devDependencies": {
+    "@agentclientprotocol/sdk": "1.7.0",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "esbuild": "^0.25.12",
+    "typescript": "^5.6.0",
+    "vite": "^6.0.0"
+  },
+  "license": "GPL-3.0-or-later",
+  "engines": {
+    "node": "^22.18.0 || >=24.0.0"
+  },
+  "overrides": {
+    "@kitware/vtk.js": {
+      "@babel/runtime": "^7.26.10",
+      "fflate": "^0.7.5"
+    },
+    "xmlbuilder2": {
+      "js-yaml": "^3.15.2"
+    }
+  }
+}

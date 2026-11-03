@@ -1,0 +1,69 @@
+key = "cad"
+name = "Magnusim CAD"
+version = "0.2.0-dev"
+# 1.7: Edit in CAD (geometry_actions below): a project geometry imported as STEP,
+# IGES or BREP opens in a Part (ws.context.geometry, ws.project.geometrySource and
+# geometryFaces), and its first update goes back into that geometry with its setup
+# (linkGeometry's originalNames); also ws.prefs (the toolbar layout, the rails).
+# 1.6: leaving the Part workspace brings the project's geometry up to date
+# (ws.nav.onLeave, the exit hook) and hands the viewport the Part's camera.
+# 1.5: a Part links its design into the project as a geometry
+# (ws.project.linkGeometry, links_geometry below). 1.3: the workspace imports the
+# host's UI kit (@magnusim/plugin-ui). 1.2: ws.files and nav.setDirty.
+api_version = "1.7"
+tier = "bundled"
+required = false
+# Ships on (Daniel's D33): an optional bundled plugin, on by default. Settings >
+# Plugins turns it off (and on again); off, nothing of CAD runs.
+license = "GPL-3.0-or-later"
+description = "Parametric parts in their own workspace: sketches with dimensions and constraints, splines, offsets, sketch mirrors and patterns, and edges projected from the model; extrude, revolve, sweep and loft; fillet, chamfer, shell and booleans; linear and circular patterns and mirrors; reference planes, axes and points; an enclosure around the part for CFD; named parameters; and STEP import, editing and export."
+authors = ["Magnusim"]
+# No [python]: all modeling runs in the workspace's own workers (OCCT and
+# PlaneGCS compiled to WebAssembly). plugin.py is the only Python file here.
+
+# What the Part workspace may keep in one project through ws.files and ws.data
+# (models, and later imported STEP files): one file, and all of them together.
+[files]
+max_file_mb = 512
+max_total_mb = 4096
+
+[[workspaces]]
+key = "part"
+title = "Part"
+icon = "M4 8l8-4 8 4v8l-8 4-8-4z M4 8l8 4 8-4 M12 12v8"
+entry = "workspace/index.html"
+# The Part's keyboard commands (unreleased 1.9; built from src/app/keymap.ts): Settings → Keybinds lists them.
+commands = "workspace/commands.json"
+
+[[study_kinds]]
+key = "part"
+title = "Part"
+icon = "M4 8l8-4 8 4v8l-8 4-8-4z M4 8l8 4 8-4 M12 12v8"
+workspace = "part"
+schema_version = 1
+# A Part may link one project geometry (host API 1.5): its design becomes a
+# geometry the simulation side uses, and later versions of it update it.
+links_geometry = true
+
+# Where a new Part starts (host API 1.4, D33): "Design a part" on an empty project
+# and in the New Project dialog's "Start from", "New design" on Home, and the
+# header's "CAD" button (its menu lists the Parts and makes a new one).
+[[start_actions]]
+study_kind = "part"
+label = "Design a part"
+places = ["empty_project", "header", "new_project", "home"]
+home_label = "New design"
+header_label = "CAD"
+
+# Edit in CAD (host API 1.7, Daniel 2026-10-09): "Edit in CAD" on a project geometry
+# imported as STEP, IGES or BREP: the right-click menu of its row (and its bodies) in
+# the tree, the viewport right-click on the part, and the Geometry panel. It opens the
+# Part that edits it (made the first time, titled with the geometry's name); the Part
+# imports the geometry by itself, and the first Back with a change updates that
+# geometry in place, its boundary conditions carried over by face name.
+[[geometry_actions]]
+study_kind = "part"
+label = "Edit in CAD"
+hint = "Open this part in CAD. Back updates it in the project, with its boundary conditions."
+formats = ["step", "iges", "brep"]
+places = ["tree", "viewport", "panel"]

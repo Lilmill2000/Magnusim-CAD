@@ -1,0 +1,20 @@
+import { useEffect } from 'react';
+import { initHome } from './controller';
+import { useHashRoute } from '../app/routes';
+
+/**
+ * React home: boots the typed controller against the injected #home shell. Its header holds
+ * Settings and New project only: New project's "Start from" offers the plugins' starts (a
+ * design, a wind tunnel), and a folder comes from My Projects' right-click menu.
+ */
+export function Home() {
+  const route = useHashRoute();
+  useEffect(() => {
+    initHome();
+  }, []);
+  useEffect(() => {
+    document.body.classList.toggle('on-home', route.view === 'home');
+    document.body.classList.toggle('on-workbench', route.view === 'workbench');
+  }, [route.view]);
+  return null;
+}

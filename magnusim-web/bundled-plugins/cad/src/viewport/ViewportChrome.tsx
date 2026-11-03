@@ -1,0 +1,404 @@
+// The viewport's own chrome, bottom-right like the core's gizmo cluster
+// (shell.html:654-670, style.css:1392-1450): Fit (home) button, XYZ key and
+// the triad slot, plus the CAD view tools before them: selection filter,
+// section view and the views menu (standard views, Normal to, projection,
+// display; a right-click on a view's row sets its keybind). Every control here
+// works; nothing is shown that does not. The section's popover drives the one
+// section state INSPECT > Section view drives (the view's SectionState): a plane
+// that panel picked (a construction plane, a flat face) shows here by its name,
+// and "More" opens that panel.
+// Owner: VIEWPORT.
+// SPDX-License-Identifier: GPL-3.0-or-later
+import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { setSelectionFilter } from '../lib/selection';
+import { useServices } from '../lib/services';
+import { createStateStore, useStateStore } from '../lib/store';
+import { ORIGIN_PLANES, type OriginPlaneRef } from '../types/doc';
+import type { PlaneRef } from '../types/references';
+import { sectionPlaneWords, SECTION_COMMAND } from '../features/section/plane';
+import { originFrame, sectionStart, sliderStep } from './section';
+import { sectionOn } from '../features/section/bind';
+// The view tools' and the Section view panel's helpers live with the section state (bind.ts uses them too).
+export { sectionStart, sliderStep, startOffset } from './section';
+import type { SelectKind } from '../types/selection';
+import type { DisplayMode, PlanesMode, Projection, StandardView, ViewportHandle } from '../types/viewport';
+import { normalToTarget, VIEW_COMMANDS } from './commands';
+import { openSetKeybind, useKeyLabel } from '../ui/keybinds';
+import type { AppServices } from '../types/app';
+import type { DocState } from '../types/doc-service';
+// P4b SELECT: the sketch selection filter (Points, Curves, Dimensions) while a sketch is edited.
+import { SKETCH_FILTERS, sketchFilterOf, type SketchPickKind } from '../sketch/select-filter';
+
+/** A services object with no mode store (tests of the chrome alone) is always in model mode. */
+const MODEL_ONLY = createStateStore<{ mode: 'model' | 'sketch' }>({ mode: 'model' });
+/** A services object with no document (tests of the chrome alone): no construction plane to name. */
+const NO_DOC = createStateStore<{ doc: DocState | null }>({ doc: null });
+
+const ICON = {
+  home: ['M4 11.2L12 4.5l8 6.7', 'M6.4 10.2V19.5h11.2V10.2', 'M10 19.5v-5.2h4v5.2'],
+  views: ['M12 3.2l7.6 4.3v9L12 20.8l-7.6-4.3v-9z', 'M12 12l7.6-4.5', 'M12 12v8.8', 'M12 12L4.4 7.5'],
+  section: ['M12 3.2l7.6 4.3v9L12 20.8l-7.6-4.3v-9z', 'M3 15.5l18-7'],
+  filter: ['M4 5h16l-6.2 7.4V19l-3.6 1.6v-8.2z'],
+};
+
+function Svg({ paths }: { paths: string[] }) {
+  return (
+    <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" focusable="false">
+      <g fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+        {paths.map((d) => (
+          <path key={d} d={d} />
+        ))}
+      </g>
+    </svg>
+  );
+}
+
+/** A popover above the cluster that closes on an outside click or Escape. */
+function Popover({ open, onClose, label, children, id }: { open: boolean; onClose: () => void; label: string; children: ReactNode; id: string }) {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const down = (e: PointerEvent) => {
+      const el = ref.current;
+      const t = e.target as Node | null;
+      if (el && t && !el.contains(t) && !(t as HTMLElement).closest?.(`[data-vp-opens="${id}"]`)) onClose();
+    };
+    const key = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      // The popover is the topmost layer: this Escape closes it and nothing
+      // under it (review round 2: it also closed the open feature panel).
+      e.preventDefault();
+      e.stopPropagation();
+      onClose();
+    };
+    document.addEventListener('pointerdown', down, true);
+    document.addEventListener('keydown', key, true);
+    return () => {
+      document.removeEventListener('pointerdown', down, true);
+      document.removeEventListener('keydown', key, true);
+    };
+  }, [open, onClose, id]);
+  if (!open) return null;
+  return (
+    <div ref={ref} className="cad-vp-pop" role="dialog" aria-label={label} data-vp-pop={id}>
+      {children}
+    </div>
+  );
+}
+
+function Seg<T extends string>({ value, options, onChange, name }: { value: T; options: { value: T; label: string }[]; onChange: (v: T) => void; name: string }) {
+  return (
+    <div className="cad-vp-seg" role="radiogroup" aria-label={name} data-vp-seg={name}>
+      {options.map((o) => (
+        <button key={o.value} type="button" role="radio" aria-checked={value === o.value} className={value === o.value ? 'is-on' : ''} onClick={() => onChange(o.value)} data-value={o.value}>
+          {o.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+const FILTERS: { kind: SelectKind; label: string }[] = [
+  { kind: 'face', label: 'Faces' },
+  { kind: 'edge', label: 'Edges' },
+  { kind: 'vertex', label: 'Vertices' },
+  { kind: 'body', label: 'Bodies' },
+  { kind: 'origin', label: 'Planes' },
+];
+
+const PLANES: { value: OriginPlaneRef | 'other'; label: string }[] = [
+  { value: 'origin:top', label: 'Top' },
+  { value: 'origin:front', label: 'Front' },
+  { value: 'origin:right', label: 'Right' },
+];
+
+function fmt(n: number): string {
+  return String(Math.round(n * 1000) / 1000 || 0);
+}
+
+/**
+ * The cut's position shown as the coordinate it fixes (Front plane: y, Top: z,
+ * Right: x) rather than the signed offset along the plane's normal (Front's
+ * normal is -Y): "Y 10 mm" where the cut is at y = 10. Any other plane (a
+ * construction plane, a flat face) shows its offset along its own normal.
+ */
+export function sectionAxis(plane: OriginPlaneRef | PlaneRef): { label: string; sign: number } {
+  const ref = typeof plane === 'string' ? plane : plane.kind === 'origin' ? plane.plane : null;
+  if (!ref) return { label: 'Offset', sign: 1 };
+  const n = ORIGIN_PLANES[ref].normal;
+  const i = n.findIndex((v) => v !== 0);
+  return { label: 'XYZ'[i], sign: Math.sign(n[i]) };
+}
+
+/**
+ * A command's row of the views menu: its label and its key (the person's keybind). A right-click
+ * opens Set keybind for it (the menu closes first: the dialog has the keyboard).
+ */
+function ViewItem(p: { services: AppServices; command: string; label: string; 'data-view': string; disabled?: boolean; title?: string; onClick(): void; onKeybind(): void }) {
+  const key = useKeyLabel(p.services, p.command);
+  return (
+    <button
+      type="button"
+      className="cad-vp-item"
+      data-view={p['data-view']}
+      data-command={p.command}
+      disabled={p.disabled}
+      title={p.title}
+      onClick={p.onClick}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        p.onKeybind();
+        openSetKeybind(p.services, p.command);
+      }}
+    >
+      <span>{p.label}</span>
+      {key ? <kbd>{key}</kbd> : null}
+    </button>
+  );
+}
+
+export function ViewportChrome({ handle }: { handle: ViewportHandle }) {
+  const services = useServices();
+  const [open, setOpen] = useState<'filter' | 'section' | 'views' | null>(null);
+  const vs = useStateStore(handle.state, (s) => ({ projection: s.projection, display: s.display, section: s.section, planes: s.planes }));
+  const modelFilter = useStateStore(services.selection, (s) => s.filter);
+  const items = useStateStore(services.selection, (s) => s.items);
+  // P4b SELECT: in sketch mode the chips are the sketch's own kinds.
+  const inSketch = useStateStore(services.mode ?? MODEL_ONLY, (s) => s.mode) === 'sketch';
+  const sketchFilterStore = sketchFilterOf(services);
+  const sketchKinds = useStateStore(sketchFilterStore, (s) => s.kinds);
+  const filter: string[] = inSketch ? sketchKinds : modelFilter;
+  const chips: { kind: string; label: string }[] = inSketch ? SKETCH_FILTERS : FILTERS;
+  const setSketchKind = (kind: SketchPickKind) => {
+    const next = sketchKinds.includes(kind) ? sketchKinds.filter((k) => k !== kind) : [...sketchKinds, kind];
+    sketchFilterStore.set({ kinds: SKETCH_FILTERS.map((f) => f.kind).filter((k) => next.includes(k)) });
+  };
+  const section = vs.section;
+  const close = () => setOpen(null);
+  const toggle = (which: 'filter' | 'views') => setOpen((o) => (o === which ? null : which));
+
+  const range = open === 'section' && section ? handle.sectionRange(section.frame) : null;
+  // A plane the Section view panel picked (a construction plane, a flat face): shown by its name.
+  const otherPlane = useStateStore<DocState | { doc: DocState | null }, string | null>(services.doc?.state ?? NO_DOC, (s) => ('rebuild' in s && section && section.plane.kind !== 'origin' ? sectionPlaneWords(s, section.plane) : null));
+  const axis = section ? sectionAxis(section.plane) : { label: 'Y', sign: 1 };
+  const coordRange = range ? ([Math.min(range[0] * axis.sign, range[1] * axis.sign), Math.max(range[0] * axis.sign, range[1] * axis.sign)] as const) : null;
+  const normalTo = open === 'views' ? normalToTarget({ items }, handle, services.doc?.state.get()) : null;
+
+  const setFilterKind = (kind: SelectKind) => {
+    const next = modelFilter.includes(kind) ? modelFilter.filter((k) => k !== kind) : [...modelFilter, kind];
+    setSelectionFilter(services.selection, FILTERS.map((f) => f.kind).filter((k) => next.includes(k)));
+  };
+
+  const toggleSection = () => {
+    if (section?.on) {
+      handle.setSection({ on: false });
+      setOpen(null);
+      return;
+    }
+    // On the plane it had, found where it is now (a construction plane or a face may have moved while
+    // the cut was off; one that is gone gives way to Front): src/features/section/bind.ts sectionOn.
+    setOpen('section');
+    void sectionOn(services);
+  };
+
+  const setPlane = (plane: OriginPlaneRef | 'other') => {
+    if (plane === 'other') return;
+    handle.setSection({ plane: { kind: 'origin', plane }, offset: sectionStart(handle.sectionRange(originFrame(plane))) });
+  };
+
+  const view = (v: StandardView) => {
+    handle.setView(v);
+    close();
+  };
+
+  return (
+    <div className="cad-vp-gizmo" data-cad-gizmo="1">
+      <div className="cad-vp-gizmo-row">
+        <div className="cad-vp-tool">
+          <button
+            type="button"
+            className={`cad-vp-btn${filter.length ? ' is-on' : ''}`}
+            title={filter.length ? `Selection filter: ${chips.filter((f) => filter.includes(f.kind)).map((f) => f.label).join(', ')}` : 'Selection filter'}
+            aria-label="Selection filter"
+            aria-expanded={open === 'filter'}
+            data-vp-opens="filter"
+            onClick={() => toggle('filter')}
+          >
+            <Svg paths={ICON.filter} />
+          </button>
+          <Popover open={open === 'filter'} onClose={close} label="Selection filter" id="filter">
+            <div className="cad-vp-pop-title">Select</div>
+            <div className="cad-vp-chips">
+              {chips.map((f) => (
+                <button
+                  key={f.kind}
+                  type="button"
+                  className={`cad-vp-chip${filter.includes(f.kind) ? ' is-on' : ''}`}
+                  aria-pressed={filter.includes(f.kind)}
+                  data-filter={f.kind}
+                  onClick={() => (inSketch ? setSketchKind(f.kind as SketchPickKind) : setFilterKind(f.kind as SelectKind))}
+                >
+                  {f.label}
+                </button>
+              ))}
+            </div>
+            <div className="cad-vp-pop-hint">
+              {inSketch
+                ? filter.length
+                  ? 'Only these can be picked or boxed in the sketch.'
+                  : 'Curves, points and dimensions can be picked or boxed.'
+                : filter.length
+                  ? 'Only these can be picked in the viewport. A box selects them too.'
+                  : 'Faces, edges, vertices and planes can be picked. A box selects edges.'}
+            </div>
+            {filter.length ? (
+              <button type="button" className="cad-vp-link" data-filter-clear="1" onClick={() => (inSketch ? sketchFilterStore.set({ kinds: [] }) : setSelectionFilter(services.selection, []))}>
+                Pick anything
+              </button>
+            ) : null}
+          </Popover>
+        </div>
+        <div className="cad-vp-tool">
+          <button
+            type="button"
+            className={`cad-vp-btn${section?.on ? ' is-on' : ''}`}
+            title={section?.on ? 'Turn off the section view' : 'Section view'}
+            aria-label="Section view"
+            aria-pressed={!!section?.on}
+            data-vp-opens="section"
+            onClick={toggleSection}
+          >
+            <Svg paths={ICON.section} />
+          </button>
+          <Popover open={open === 'section' && !!section?.on} onClose={close} label="Section view" id="section">
+            <div className="cad-vp-pop-title">Section view</div>
+            {section ? (
+              <>
+                <Seg
+                  name="Section plane"
+                  value={section.plane.kind === 'origin' ? section.plane.plane : 'other'}
+                  options={otherPlane ? [...PLANES, { value: 'other' as const, label: otherPlane }] : PLANES}
+                  onChange={setPlane}
+                />
+                <label className="cad-vp-row">
+                  <span>Cut at</span>
+                  <input
+                    type="range"
+                    min={coordRange ? coordRange[0] : -100}
+                    max={coordRange ? coordRange[1] : 100}
+                    step={coordRange ? sliderStep(coordRange[1] - coordRange[0]) : 0.5}
+                    value={section.offset * axis.sign}
+                    aria-label={`Section position along ${axis.label}`}
+                    data-section-offset="1"
+                    onChange={(e) => handle.setSection({ offset: Number(e.target.value) * axis.sign })}
+                  />
+                  <span className="cad-vp-num" data-section-value="1">
+                    {axis.label} {fmt(section.offset * axis.sign)} mm
+                  </span>
+                </label>
+                <div className="cad-vp-row">
+                  <button type="button" className="cad-vp-small" data-section-flip="1" onClick={() => handle.setSection({ flip: !section.flip })}>
+                    Flip side
+                  </button>
+                  <button
+                    type="button"
+                    className="cad-vp-small"
+                    data-section-middle="1"
+                    title="Cut through the middle of the shown bodies"
+                    onClick={() => {
+                      const r = handle.sectionRange(section.frame);
+                      handle.setSection({ offset: r ? (r[0] + r[1]) / 2 : 0 });
+                    }}
+                  >
+                    Middle
+                  </button>
+                  {services.commands?.get(SECTION_COMMAND) ? (
+                    <button
+                      type="button"
+                      className="cad-vp-small"
+                      data-section-more="1"
+                      title="Any plane, a typed offset and the arrow in the view: INSPECT > Section view"
+                      onClick={() => {
+                        close();
+                        void services.commands.run(SECTION_COMMAND);
+                      }}
+                    >
+                      More…
+                    </button>
+                  ) : null}
+                </div>
+              </>
+            ) : null}
+          </Popover>
+        </div>
+        <div className="cad-vp-tool">
+          <button type="button" className="cad-vp-btn" title="Views" aria-label="Views" aria-expanded={open === 'views'} data-vp-opens="views" onClick={() => toggle('views')}>
+            <Svg paths={ICON.views} />
+          </button>
+          <Popover open={open === 'views'} onClose={close} label="Views" id="views">
+            {VIEW_COMMANDS.map((c) => (
+              <ViewItem key={c.view} services={services} command={`view.${c.view}`} label={c.label} data-view={c.view} onClick={() => view(c.view)} onKeybind={close} />
+            ))}
+            <div className="cad-vp-sep" />
+            <ViewItem
+              services={services}
+              command="view.normal-to"
+              label="Normal to"
+              data-view="normal-to"
+              disabled={!normalTo || 'reason' in normalTo}
+              title={normalTo && 'reason' in normalTo ? normalTo.reason : undefined}
+              onClick={() => {
+                if (normalTo && !('reason' in normalTo)) handle.lookAt(normalTo.normal, normalTo.up);
+                close();
+              }}
+              onKeybind={close}
+            />
+            {normalTo && 'reason' in normalTo ? <div className="cad-vp-pop-hint">{normalTo.reason}</div> : null}
+            <div className="cad-vp-sep" />
+            <div className="cad-vp-pop-title">Projection</div>
+            <Seg<Projection>
+              name="Projection"
+              value={vs.projection}
+              options={[
+                { value: 'perspective', label: 'Perspective' },
+                { value: 'orthographic', label: 'Orthographic' },
+              ]}
+              onChange={(p) => handle.setProjection(p)}
+            />
+            <div className="cad-vp-pop-title">Display</div>
+            <Seg<DisplayMode>
+              name="Display"
+              value={vs.display}
+              options={[
+                { value: 'shaded-edges', label: 'Shaded + edges' },
+                { value: 'shaded', label: 'Shaded' },
+                { value: 'wireframe', label: 'Wireframe' },
+              ]}
+              onChange={(d) => handle.setDisplay(d)}
+            />
+            <div className="cad-vp-pop-title">Origin planes</div>
+            <Seg<PlanesMode>
+              name="Origin planes"
+              value={vs.planes}
+              options={[
+                { value: 'auto', label: 'Auto' },
+                { value: 'always', label: 'Always' },
+              ]}
+              onChange={(m) => handle.setPlanes(m)}
+            />
+            <div className="cad-vp-pop-hint">{vs.planes === 'always' ? 'Top, Front and Right are always drawn.' : 'Drawn on an empty part, and while one is selected or hovered.'}</div>
+          </Popover>
+        </div>
+        <button type="button" className="cad-vp-btn" title="Fit model to viewport" aria-label="Fit model to viewport" data-vp-fit="1" onClick={() => handle.setView('home')}>
+          <Svg paths={ICON.home} />
+        </button>
+        <div className="cad-vp-axes-key" title="Axis colours of the triad">
+          <span className="ax ax-x">X</span>
+          <span className="ax ax-y">Y</span>
+          <span className="ax ax-z">Z</span>
+        </div>
+      </div>
+      <div className="cad-vp-triad-slot" data-triad-slot="1" aria-hidden="true" />
+    </div>
+  );
+}

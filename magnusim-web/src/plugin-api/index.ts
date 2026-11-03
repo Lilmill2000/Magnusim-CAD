@@ -1,0 +1,375 @@
+/** @cfddesk/plugin-api — host helpers passed to a plugin's register(host). */
+import { useSyncExternalStore, type ComponentType } from 'react';
+import { useProjectStore } from '../store/project';
+import { useJobsStore } from '../store/jobs';
+import { useUiStore } from '../store/ui';
+import { SchemaForm } from '../forms/SchemaForm';
+import { dispatchPanelDone, islandComponent, registerIsland, unregisterIsland, type IslandProps } from '../islands';
+import * as kit from '../plugin-ui';
+import type { FieldWidgetProps } from '../plugin-ui';
+import { prefersImperial } from '../prefs';
+import { bindLegacyViewer, type ViewerApi } from '../viewer/index';
+import { deleteFieldWidget, setFieldWidget } from './fieldWidgets';
+import { SciNumberInput } from '../forms/SciNumberInput';
+import { mergeObjectSchemas, pickSchemaValues } from '../panels/scope';
+import {
+  registerSlotFor,
+  unregisterSlot,
+  type BcSectionProps,
+  type BcSettingsProps,
+  type RunSettingsProps,
+  type StudySettingsProps,
+} from './slots';
+
+export type { BcSectionProps, BcSettingsProps, RunSettingsProps, StudySettingsProps } from './slots';
+
+/**
+ * Places the host actually renders: the Filters panel and the plugin's row in
+ * Settings → Plugins. API 1.0 also named tree, toolbar, results and geometry,
+ * but nothing ever drew them; registering there is now an error (see
+ * docs/plugins/compatibility.md), never a panel that silently does not appear.
+ */
+export type PanelPlace = 'filters' | 'prefs';
+const RENDERED_PLACES: readonly string[] = ['filters', 'prefs'];
+
+export interface RegisterPanelOpts {
+  key: string;
+  title: string;
+  place: PanelPlace;
+  Component: ComponentType<Record<string, unknown>>;
+}
+
+/** Who registered what, so disabling or reloading a plugin removes exactly its UI. */
+interface Ledger {
+  panels: Set<string>;
+  filterWidgets: Set<string>;
+  fieldWidgets: Set<string>;
+  islands: Map<string, ComponentType<IslandProps> | undefined>;
+  slots: Set<string>;
+}
+
+const HOST = '';
+const panels = new Map<string, RegisterPanelOpts & { owner: string }>();
+const filterWidgets = new Map<string, ComponentType<Record<string, unknown>>>();
+const treeTransforms: Array<{ owner: string; fn: (nodes: PluginTreeNode[]) => PluginTreeNode[] }> = [];
+const ledgers = new Map<string, Ledger>();
+
+function ledgerFor(owner: string): Ledger {
+  let ledger = ledgers.get(owner);
+  if (!ledger) {
+    ledger = { panels: new Set(), filterWidgets: new Set(), fieldWidgets: new Set(), islands: new Map(), slots: new Set() };
+    ledgers.set(owner, ledger);
+  }
+  return ledger;
+}
+
+// Bumped on every change to the panels and the filter and field widgets (cfd:panels).
+let panelsVersion = 0;
+
+function notifyPanels(): void {
+  panelsVersion += 1;
+  if (typeof window !== 'undefined') window.dispatchEvent(new Event('cfd:panels'));
+}
+
+function subscribePanels(onChange: () => void): () => void {
+  window.addEventListener('cfd:panels', onChange);
+  return () => window.removeEventListener('cfd:panels', onChange);
+}
+
+/**
+ * Re-render when plugins register or remove panels and widgets. The version is read
+ * again when React subscribes, so one registered after the first render and before the
+ * subscription still shows.
+ */
+export function usePanelsVersion(): number {
+  return useSyncExternalStore(subscribePanels, () => panelsVersion);
+}
+
+function notifyTree(): void {
+  if (typeof window !== 'undefined') window.dispatchEvent(new Event('cfd:tree-sync'));
+}
+
+function registerPanelFor(owner: string, opts: RegisterPanelOpts): void {
+  if (!RENDERED_PLACES.includes(String(opts.place))) {
+    throw new Error(
+      `panel place "${String(opts.place)}" is not rendered in plugin API 1.1; use "filters" or "prefs"`,
+    );
+  }
+  panels.set(opts.key, { ...opts, owner });
+  ledgerFor(owner).panels.add(opts.key);
+  notifyPanels();
+}
+
+/**
+ * Old host panel ids a plugin may still name. The study panel was
+ * `panel-incompressible-defaults` before API 1.4; replacePanel() with that id
+ * replaces `panel-study-settings`, so a plugin written against 1.3 keeps working.
+ */
+export const PANEL_ID_ALIASES: Readonly<Record<string, string>> = Object.freeze({
+  'panel-incompressible-defaults': 'panel-study-settings',
+});
+
+/** The host panel id `panelId` names today (an old alias resolves to its new id). */
+export function resolvePanelId(panelId: string): string {
+  return Object.prototype.hasOwnProperty.call(PANEL_ID_ALIASES, panelId) ? PANEL_ID_ALIASES[panelId] : panelId;
+}
+
+/**
+ * Host panels nothing may replace. Settings → Assistant holds the field a provider key is
+ * typed into; another component there would see the key. Settings → Keybinds sets every
+ * plugin's keys; another component there could set another plugin's. Only placeHostOnlyPanel()
+ * places them: replacePanel() refuses them for every owner, the host's own included,
+ * because the host-owned API is on `window` (__CFD_PLUGIN_UI__, __CFD_REPLACE_PANEL__)
+ * where any in-page plugin code can call it.
+ */
+const HOST_ONLY_PANELS: ReadonlySet<string> = new Set(['wiz-assistant', 'wiz-keybinds']);
+
+function replacePanelFor(owner: string, requestedId: string, Component: ComponentType<IslandProps>): void {
+  const panelId = resolvePanelId(requestedId);
+  if (HOST_ONLY_PANELS.has(panelId)) {
+    console.warn(`[plugins] ${owner || 'page'}: the ${panelId} panel belongs to Magnusim and can't be replaced`);
+    return;
+  }
+  const ledger = ledgerFor(owner);
+  // Remember the host's own component the first time, to restore it on disable.
+  if (owner !== HOST && !ledger.islands.has(panelId)) ledger.islands.set(panelId, islandComponent(panelId));
+  registerIsland(panelId, Component);
+}
+
+/**
+ * Places one of Magnusim's host-only panels (panels/register.ts). Nothing on `window`
+ * reaches it, so neither a plugin's API nor the page-wide host API can.
+ */
+export function placeHostOnlyPanel(panelId: string, Component: ComponentType<IslandProps>): void {
+  if (!HOST_ONLY_PANELS.has(panelId)) throw new Error(`${panelId} is not a host-only panel`);
+  registerIsland(panelId, Component);
+}
+
+function registerFilterWidgetFor(
+  owner: string,
+  key: string,
+  Component: ComponentType<Record<string, unknown>>,
+): void {
+  filterWidgets.set(key, Component);
+  ledgerFor(owner).filterWidgets.add(key);
+  notifyPanels();
+}
+
+function registerFieldWidgetFor(owner: string, xWidget: string, Component: ComponentType<FieldWidgetProps>): void {
+  // The schema form passes a superset of FieldWidgetProps; the store keeps plain props.
+  setFieldWidget(xWidget, Component as unknown as ComponentType<Record<string, unknown>>);
+  ledgerFor(owner).fieldWidgets.add(xWidget);
+  notifyPanels();
+}
+
+function registerTreeTransformFor(owner: string, fn: (nodes: PluginTreeNode[]) => PluginTreeNode[]): void {
+  treeTransforms.push({ owner, fn });
+  notifyTree();
+}
+
+/** Remove everything one plugin registered (disable, reload, or a second register()). */
+export function unregisterPlugin(owner: string): void {
+  const ledger = ledgers.get(owner);
+  let changed = false;
+  if (ledger) {
+    for (const key of ledger.panels) {
+      if (panels.get(key)?.owner === owner) panels.delete(key);
+    }
+    for (const key of ledger.filterWidgets) filterWidgets.delete(key);
+    for (const name of ledger.fieldWidgets) deleteFieldWidget(name);
+    for (const key of ledger.slots) unregisterSlot(key, owner);
+    for (const [panelId, previous] of ledger.islands) {
+      if (previous) registerIsland(panelId, previous);
+      else unregisterIsland(panelId);
+    }
+    ledgers.delete(owner);
+    changed = true;
+  }
+  const before = treeTransforms.length;
+  for (let i = treeTransforms.length - 1; i >= 0; i -= 1) {
+    if (treeTransforms[i].owner === owner) treeTransforms.splice(i, 1);
+  }
+  if (changed) notifyPanels();
+  if (treeTransforms.length !== before) notifyTree();
+}
+
+/** Plugin keys that currently have UI registered. */
+export function registeredPluginKeys(): string[] {
+  return [...ledgers.keys()].filter((key) => key !== HOST);
+}
+
+export function registerPanel(opts: RegisterPanelOpts): void {
+  registerPanelFor(HOST, opts);
+}
+
+export function panelsFor(place: PanelPlace): RegisterPanelOpts[] {
+  return [...panels.values()].filter((row) => row.place === place);
+}
+
+export function filterWidgetEntries(): Array<[string, ComponentType<Record<string, unknown>>]> {
+  return [...filterWidgets.entries()];
+}
+
+/** Host setup panels and later plugins mount a flyout through this. */
+export function replacePanel(panelId: string, Component: ComponentType<IslandProps>): void {
+  replacePanelFor(HOST, panelId, Component);
+}
+
+export function registerFilterWidget(key: string, Component: ComponentType<Record<string, unknown>>): void {
+  registerFilterWidgetFor(HOST, key, Component);
+}
+
+/** A schema field whose x-cfddesk.widget equals `xWidget` renders with this component. */
+export function registerFieldWidget(xWidget: string, Component: ComponentType<FieldWidgetProps>): void {
+  registerFieldWidgetFor(HOST, xWidget, Component);
+}
+
+export function useProject() {
+  return useProjectStore((s) => s.hydrate);
+}
+
+export function useSimulation() {
+  return useProjectStore((s) => (s.hydrate as { simulation?: unknown } | null)?.simulation);
+}
+
+export function useJob(id: string) {
+  return useJobsStore((s) => s.jobs[id]);
+}
+
+export function useRegistry(kind?: string) {
+  return useProjectStore((s) => {
+    if (!kind) return s.registry;
+    return s.registry ? (s.registry as Record<string, unknown>)[kind] : null;
+  });
+}
+
+export function useViewer(): ViewerApi {
+  return window.__cfdViewer || bindLegacyViewer();
+}
+
+export function usePrefs() {
+  return window.__CFD_PREFS__ || {};
+}
+
+export { SchemaForm };
+export { useUiStore };
+
+export interface PluginTreeNode {
+  label: string;
+  scope?: string;
+  projectId?: string;
+}
+
+export function registerTreeTransform(fn: (nodes: PluginTreeNode[]) => PluginTreeNode[]): void {
+  registerTreeTransformFor(HOST, fn);
+}
+
+export function clearTreeTransforms(): void {
+  treeTransforms.length = 0;
+}
+
+function projectOfScope(scope: string | undefined): string {
+  const part = String(scope || '')
+    .split('/')
+    .find((piece) => piece.startsWith('p:'));
+  return part ? part.slice(2) : '';
+}
+
+/** Keep plugin tree rows that belong to the open project. */
+export function pluginTreeNodes(projectId: string): PluginTreeNode[] {
+  let nodes: PluginTreeNode[] = [];
+  for (const { fn } of treeTransforms) nodes = fn(nodes) || [];
+  return nodes.filter((node) => {
+    const pid = node.projectId || projectOfScope(node.scope);
+    return !!pid && pid === projectId;
+  });
+}
+
+/** An analysis's study settings, drawn in the study panel (its contract's ui.study_settings). */
+function registerStudySettingsFor(owner: string, name: string, Component: ComponentType<StudySettingsProps>): void {
+  ledgerFor(owner).slots.add(registerSlotFor(owner, 'study-settings', name, Component as ComponentType<never>));
+}
+
+/** An analysis's run settings, drawn in the run panel (its contract's ui.run_settings). */
+function registerRunSettingsFor(owner: string, name: string, Component: ComponentType<RunSettingsProps>): void {
+  ledgerFor(owner).slots.add(registerSlotFor(owner, 'run-settings', name, Component as ComponentType<never>));
+}
+
+/**
+ * A BC family's fields in the BC editor (API 1.4; the family's `ui`), and
+ * optionally a line under its assigned faces (`facesNote`).
+ */
+function registerBcSettingsFor(
+  owner: string,
+  name: string,
+  Component: ComponentType<BcSettingsProps>,
+  opts?: { facesNote?: ComponentType<BcSettingsProps> },
+): void {
+  const ledger = ledgerFor(owner);
+  ledger.slots.add(registerSlotFor(owner, 'bc-settings', name, Component as ComponentType<never>));
+  if (opts?.facesNote) {
+    ledger.slots.add(registerSlotFor(owner, 'bc-faces-note', name, opts.facesNote as ComponentType<never>));
+  }
+}
+
+/** An analysis's BC field group in the BC editor (API 1.8; its `bc_fields` row's `ui`). */
+function registerBcSectionFor(owner: string, name: string, Component: ComponentType<BcSectionProps>): void {
+  ledgerFor(owner).slots.add(registerSlotFor(owner, 'bc-section', name, Component as ComponentType<never>));
+}
+
+export type PluginToastKind = 'info' | 'success' | 'error';
+
+/** An app toast (the app's toast layer, bottom left). An unknown kind is info, as in ws.ui.toast. */
+function pluginToast(message: string, opts?: { kind?: PluginToastKind }): void {
+  const asked = opts?.kind;
+  const kind: PluginToastKind = asked === 'success' || asked === 'error' ? asked : 'info';
+  window.dispatchEvent(new CustomEvent('cfd:toast', { detail: { message: String(message).slice(0, 300), kind } }));
+}
+
+/** The units the open project shows (else the Settings choice). */
+function unitSystem(): 'metric' | 'imperial' {
+  return prefersImperial() ? 'imperial' : 'metric';
+}
+
+/** The API object one plugin's register(host) receives; its registrations are recorded under its key. */
+export function pluginUiFor(owner: string) {
+  return {
+    registerStudySettings: (name: string, Component: ComponentType<StudySettingsProps>) =>
+      registerStudySettingsFor(owner, name, Component),
+    registerRunSettings: (name: string, Component: ComponentType<RunSettingsProps>) =>
+      registerRunSettingsFor(owner, name, Component),
+    // API 1.4: a BC family's editor fields.
+    registerBcSettings: (
+      name: string,
+      Component: ComponentType<BcSettingsProps>,
+      opts?: { facesNote?: ComponentType<BcSettingsProps> },
+    ) => registerBcSettingsFor(owner, name, Component, opts),
+    // API 1.8: an analysis's BC field group.
+    registerBcSection: (name: string, Component: ComponentType<BcSectionProps>) => registerBcSectionFor(owner, name, Component),
+    SciNumberInput,
+    schema: { mergeObjectSchemas, pickSchemaValues },
+    registerPanel: (opts: RegisterPanelOpts) => registerPanelFor(owner, opts),
+    replacePanel: (panelId: string, Component: ComponentType<IslandProps>) => replacePanelFor(owner, panelId, Component),
+    registerFilterWidget: (key: string, Component: ComponentType<Record<string, unknown>>) =>
+      registerFilterWidgetFor(owner, key, Component),
+    registerFieldWidget: (xWidget: string, Component: ComponentType<FieldWidgetProps>) =>
+      registerFieldWidgetFor(owner, xWidget, Component),
+    useProject,
+    useSimulation,
+    useJob,
+    useRegistry,
+    useViewer,
+    usePrefs,
+    SchemaForm,
+    registerTreeTransform: (fn: (nodes: PluginTreeNode[]) => PluginTreeNode[]) => registerTreeTransformFor(owner, fn),
+    panelsFor,
+    // API 1.3: the plugin UI kit (the page's own copy), and what its panels need.
+    kit,
+    panelDone: dispatchPanelDone,
+    toast: pluginToast,
+    unitSystem,
+  };
+}
+
+/** Host-owned API (dev probes and tests); plugins get pluginUiFor(theirKey). */
+export const pluginUi = pluginUiFor(HOST);

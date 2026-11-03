@@ -1,0 +1,1472 @@
+import { safeProjectPath } from './safe-path.js';
+import { projectIdOrActive } from './request-scope.js';
+import { removeTreeSync } from './remove-tree.js';
+/**
+ * W20 — Mesh form settings only (filesystem persistence).
+ * Persists projects/<id>/mesh.json via POST/GET /api/mesh.
+ * Exact bank labels from mesh-form-labels.txt / FINDINGS.
+ * NO Generate / remesh kick / Area average / solves in this slice.
+ * Finished cell counts are NOT invented as live mesh results.
+ */
+import { randomBytes } from 'node:crypto';
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+} from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import {
+  activeGeometryId,
+  filterByGeometry,
+  filterByStudy,
+  geometriesOf,
+  matchesGeometry,
+  matchesStudy,
+  primaryGeometryId,
+} from './w16-geometry-scope.js';
+import { firstLegacySimId, getActiveSimulation, listSimulations, writeActiveMirror } from './w17-sim-catalog.js';
+import { fileURLToPath } from 'node:url';
+import { envGet } from './env-compat.js';
+import { polyMeshComplete } from './poly-mesh.js';
+import { stopFilterToolsFor } from './filter-spawn.js';
+import { dropComputeJobsForMesh, removeComputeJob, snapshotComputeQueue } from './server/compute-queue.ts';
+import { writeJsonCli, writeProjectCli } from './py-json.js';
+import {
+  MESH_ENGINES,
+  buildMeshDefaultsFromRegistry,
+  defaultMeshEngineFor,
+} from './registry-defaults.js';
+import { slimLiveMeshResult, slimMeshDoc, meshDocLogIsBloated } from './mesh-live-slim.js';
+import { baseRevOf, recordRev, staleAnswer, StaleRecord } from './record-rev.js';
+import { recoverStudyMeshesFromDisk, stopMeshGenerate, stopMeshGenerating } from './w21-mesh-generate.js';
+import {
+  assembleAllMeshes,
+  assembleMeshDoc,
+  persistMeshDoc,
+  persistOneMesh,
+  meshFolderOf,
+  writeMeshRefinements,
+  readMeshRefinements,
+} from './study-io.js';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const ROOT = resolve(__dirname, '..');
+const _projectsRoot = envGet('PROJECTS_ROOT');
+const PROJECTS_ROOT = _projectsRoot ? resolve(_projectsRoot) : join(ROOT, 'projects');
+const ACTIVE_PATH = join(PROJECTS_ROOT, 'active.json');
+
+const _meshReg = buildMeshDefaultsFromRegistry();
+
+/** Exact bank labels — HARD, no invent; algorithm + mesh_engine from registry dump */
+export const W20_DEFAULTS = {
+  name: 'Mesh 1',
+  algorithm: _meshReg.algorithm_label,
+  sizing: 'Automatic',
+  fineness: 5,
+  fineness_labels: { coarse: 'COARSE', fine: 'FINE' },
+  curvature: 'Automatic',
+  automatic_boundary_layers: true,
+  physics_based_meshing: true,
+  hex_element_core: true,
+  automatic_extrusion_meshing: false,
+  preferred_cpus: 'Automatic (max 16)',
+  preferred_cpus_label: 'Preferred number of CPUs',
+  requires_upgrade: true,
+  maximum_meshing_runtime: '1.8e+4',
+  maximum_meshing_runtime_unit: 's',
+  advanced: {
+    /* '' = automatic (derived from the geometry size at generate time) */
+    small_feature_suppression: '',
+    small_feature_suppression_unit: 'm',
+    gap_refinement_factor: 0.05,
+    global_gradation_rate: 1.22,
+    /* dump-backed: 'standard' or 'cfmesh' (MESH_ENGINES from registry.json) */
+    mesh_engine: _meshReg.mesh_engine,
+  },
+};
+
+export { MESH_ENGINES };
+/* Old projects stored the fixed SimScale example value; treat it as automatic. */
+const LEGACY_SFS_DEFAULT = '4.227e-6';
+
+function asSfs(v, fallback) {
+  if (v === undefined || v === null) return fallback;
+  const s = String(v).trim();
+  if (s === '' || s === LEGACY_SFS_DEFAULT || s.toLowerCase() === 'auto') return '';
+  return Number.isFinite(Number(s)) && Number(s) > 0 ? s : fallback;
+}
+
+/* A mesher key that is not installed right now (plugin off or removed) is kept
+   as saved, so turning the plugin back on restores the pick; Generate reports
+   it as not installed instead of silently meshing with Standard. */
+const ENGINE_KEY_RE = /^[a-z][a-z0-9_]*$/;
+
+function asEngine(v, fallback) {
+  const s = String(v == null ? '' : v).trim().toLowerCase();
+  return MESH_ENGINES.has(s) || ENGINE_KEY_RE.test(s) ? s : fallback;
+}
+
+function readActiveId() {
+  if (!existsSync(ACTIVE_PATH)) return null;
+  try {
+    const j = JSON.parse(readFileSync(ACTIVE_PATH, 'utf8'));
+    return j.project_id || null;
+  } catch {
+    return null;
+  }
+}
+
+function projectDir(id) {
+  return safeProjectPath(PROJECTS_ROOT, id);
+}
+
+function projectJsonPath(id) {
+  return join(projectDir(id), 'project.json');
+}
+
+function simulationJsonPath(id) {
+  return join(projectDir(id), 'simulation.json');
+}
+
+function meshJsonPath(id) {
+  return join(projectDir(id), 'mesh.json');
+}
+
+function readProject(id) {
+  const p = projectJsonPath(id);
+  if (!existsSync(p)) return null;
+  return JSON.parse(readFileSync(p, 'utf8'));
+}
+
+function writeProject(proj) {
+  // Phase 1 Step 9/land9: shared writeProjectCli helper.
+  return writeProjectCli(projectDir(proj.id), proj, String((proj.simulation && proj.simulation.id) || proj.active_simulation_id || ''));
+}
+
+function readSimulationFile(id) {
+  const p = simulationJsonPath(id);
+  if (!existsSync(p)) return null;
+  try {
+    return JSON.parse(readFileSync(p, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function readMeshFile(id, simId, wantId) {
+  if (!id || !simId) return null;
+  const doc = assembleMeshDoc(id, simId, wantId);
+  return doc && doc.meshes && doc.meshes.length ? doc : null;
+}
+
+function sanitizeMeshesLive(meshes) {
+  const list = Array.isArray(meshes) ? meshes : [];
+  const ownerByCase = new Map();
+  for (const m of list) {
+    if (!m) continue;
+    const dir = m.live_mesh_result && m.live_mesh_result.case_dir;
+    if (!dir) continue;
+    if (m.cloned_from_mesh || m.cloned_from_generate) continue;
+    const key = String(dir);
+    if (!ownerByCase.has(key)) ownerByCase.set(key, String(m.id));
+  }
+  return list.map((m) => {
+    if (!m) return m;
+    const dir = m.live_mesh_result && m.live_mesh_result.case_dir;
+    if (!dir) return m;
+    if (m.cloned_from_mesh || m.cloned_from_generate) return m;
+    const owner = ownerByCase.get(String(dir));
+    if (owner && owner !== String(m.id)) {
+      return { ...m, generated: false, live_mesh_result: null };
+    }
+    return m;
+  });
+}
+
+function pickScopedActive(scoped, wantId) {
+  return findMeshById(scoped, wantId) || (scoped && scoped[0]) || null;
+}
+
+function writeMeshFile(id, doc, opts) {
+  const simId = doc && doc.simulation_id;
+  let meshes = sanitizeMeshesLive(meshesFromDoc(doc));
+  if (simId) {
+    const proj = readProject(id);
+    meshes = filterByStudy(meshes, simId, firstLegacySimId(id, proj));
+  }
+  const out = slimMeshDoc({ ...(doc || {}), meshes, simulation_id: simId || (doc && doc.simulation_id) }) || {
+    ...(doc || {}),
+    meshes,
+  };
+  persistMeshDoc(id, simId, out, opts);
+  return meshJsonPath(id);
+}
+
+function dropRefsForMesh(projectId, meshId, simId) {
+  if (!meshId) return;
+  try {
+    writeMeshRefinements(projectId, meshId, simId, { refinements: [], mesh_id: meshId, simulation_id: simId });
+  } catch {
+    /* mesh folder may already be gone */
+  }
+}
+
+function pathInside(parent, child) {
+  const root = resolve(parent).replace(/[\\/]+$/, '').toLowerCase();
+  const target = resolve(child).replace(/[\\/]+$/, '').toLowerCase();
+  return target === root || target.startsWith(root + '\\') || target.startsWith(root + '/');
+}
+
+function caseDirUsedByOtherMesh(_projectId, _caseDir, _exceptId) {
+  return false;
+}
+
+function removeGeneratedMeshRuns(projectId, caseDir, exceptMeshId) {
+  const removed = [];
+  if (caseDirUsedByOtherMesh(projectId, caseDir, exceptMeshId)) return removed;
+  const tryRm = (p, ownerDir) => {
+    if (!p || !existsSync(p)) return;
+    if (ownerDir && !pathInside(ownerDir, p)) return;
+    // A reader that just let go (Windows) can hold a file for a moment.
+    removeTreeSync(p, { maxRetries: 10, retryDelay: 100 });
+    removed.push(p);
+  };
+  if (caseDir) {
+    const folder = exceptMeshId ? meshFolderOf(projectId, exceptMeshId) : null;
+    tryRm(caseDir, folder ? folder.dir : null);
+  }
+  return removed;
+}
+
+function cloneDefaultSettings(name) {
+  return {
+    ...W20_DEFAULTS,
+    name: name || W20_DEFAULTS.name,
+    advanced: { ...W20_DEFAULTS.advanced },
+  };
+}
+
+/**
+ * A NEW mesh's settings in study `sim`: the defaults, on the mesher the study's analysis
+ * starts a new mesh with (host API 1.8 default_mesher; registry-defaults.js
+ * defaultMeshEngineFor, the Mesh form's rule too). Never for an existing mesh or a copy.
+ */
+function newMeshSettings(name, sim) {
+  const settings = cloneDefaultSettings(name);
+  const engine = defaultMeshEngineFor(sim && sim.analysis_type);
+  if (engine) settings.advanced.mesh_engine = engine;
+  return settings;
+}
+
+function cloneSettings(src, name) {
+  const s = src || {};
+  return {
+    ...cloneDefaultSettings(name),
+    ...s,
+    name: name || s.name || W20_DEFAULTS.name,
+    advanced: { ...W20_DEFAULTS.advanced, ...(s.advanced || {}) },
+  };
+}
+
+
+/**
+ * Post-0c6be39 hydrate migrate for product mesh_engine.
+ * - explicit ui_mesh_engine=cfmesh -> keep (real Advanced pick)
+ * - absent ui_mesh_engine + advanced.mesh_engine=cfmesh -> coerce to standard
+ *   (old hexcore_backend-coupled bug stamp). Persist ui_mesh_engine so the
+ *   distinction stays unambiguous. Soft-pass kill: no blind cfmesh->standard.
+ */
+function migrateMeshEngineEntry(entry) {
+  if (!entry || typeof entry !== 'object') return { entry, changed: false };
+  const settings = entry.settings && typeof entry.settings === 'object' ? { ...entry.settings } : {};
+  const adv = { ...(settings.advanced || {}) };
+  const hasUi = Object.prototype.hasOwnProperty.call(entry, 'ui_mesh_engine');
+  let ui;
+  if (hasUi) {
+    ui = String(entry.ui_mesh_engine || 'standard').trim().toLowerCase();
+  } else {
+    const advEngine = String(adv.mesh_engine || 'standard').trim().toLowerCase();
+    ui = advEngine === 'cfmesh' ? 'standard' : advEngine;
+  }
+  if (!MESH_ENGINES.has(ui) && !ENGINE_KEY_RE.test(ui)) ui = 'standard';
+  let changed = false;
+  if (!hasUi || String(entry.ui_mesh_engine) !== ui) changed = true;
+  if (String(adv.mesh_engine || '') !== ui) {
+    adv.mesh_engine = ui;
+    changed = true;
+  }
+  return {
+    entry: {
+      ...entry,
+      ui_mesh_engine: ui,
+      settings: { ...settings, advanced: adv },
+    },
+    changed,
+  };
+}
+
+/** The engine a settings record names, as an entry's ui_mesh_engine records it. */
+function engineOf(settings) {
+  return String((settings && settings.advanced && settings.advanced.mesh_engine) || '') || 'standard';
+}
+
+function makeMeshEntry(raw) {
+  const src = raw || {};
+  const settings = src.settings || cloneDefaultSettings(src.name);
+  const name = String(src.name || settings.name || W20_DEFAULTS.name);
+  if (settings.name !== name) settings.name = name;
+  const base = {
+    id: src.id || newMeshId(),
+    name,
+    settings,
+    generated: isGeneratedDoc(src),
+    live_mesh_result: src.live_mesh_result || null,
+    geometry_id: src.geometry_id || null,
+    simulation_id: src.simulation_id || null,
+    created_at: src.created_at || new Date().toISOString(),
+    updated_at: src.updated_at || src.created_at || new Date().toISOString(),
+  };
+  if (Object.prototype.hasOwnProperty.call(src, 'ui_mesh_engine')) {
+    base.ui_mesh_engine = src.ui_mesh_engine;
+  }
+  if (src.cloned_from_mesh) base.cloned_from_mesh = src.cloned_from_mesh;
+  if (src.cloned_from_generate) base.cloned_from_generate = src.cloned_from_generate;
+  // Its rev (record-rev.js), as read: a save checks a `base_rev` against it.
+  if (Number.isInteger(src.rev)) base.rev = src.rev;
+  return migrateMeshEngineEntry(base).entry;
+}
+
+function geomNames(proj) {
+  const o = {};
+  for (const g of geometriesOf(proj)) {
+    if (g && g.id) o[g.id] = g.name || g.original_filename || g.id;
+  }
+  return o;
+}
+
+function meshesFromDoc(doc) {
+  if (!doc) return [];
+  const raw =
+    Array.isArray(doc.meshes) && doc.meshes.length
+      ? doc.meshes.map((m) => makeMeshEntry(m))
+      : [makeMeshEntry(doc)];
+  return sanitizeMeshesLive(raw);
+}
+
+function nextMeshName(meshes) {
+  if (!meshes || !meshes.length) return 'Mesh 1';
+  let max = 0;
+  for (const m of meshes) {
+    const hit = /^Mesh\s+(\d+)$/i.exec(String((m && m.name) || ''));
+    if (hit) max = Math.max(max, Number(hit[1]));
+  }
+  return `Mesh ${Math.max(max, meshes.length) + 1}`;
+}
+
+function findMeshById(meshes, id) {
+  if (!id || !meshes || !meshes.length) return null;
+  const want = String(id);
+  return meshes.find((m) => m && String(m.id) === want) || null;
+}
+
+function liveStudyMeshes(projectId, proj, meshes) {
+  const liveIds = new Set((listSimulations(projectId, proj) || []).map((s) => String(s.id)));
+  const legacy = firstLegacySimId(projectId, proj);
+  return (meshes || []).filter((m) => {
+    if (!m) return false;
+    const sid = m.simulation_id != null ? String(m.simulation_id).trim() : '';
+    if (sid) return liveIds.has(sid);
+    return liveIds.size === 1 && !!legacy;
+  });
+}
+
+function isRunningMesh(entry) {
+  const live = entry && entry.live_mesh_result;
+  return !!(live && live.status === 'running');
+}
+
+/**
+ * A record says "done" but its polyMesh on disk is not whole (a generate killed
+ * during copy-back). Report it as failed so no panel shows "Mesh ready" and no
+ * run tries to use it.
+ */
+function withDiskTruth(m) {
+  const live = m && m.live_mesh_result;
+  if (!live || live.status !== 'done') return m;
+  const caseDir = live.case_dir || m.case_dir;
+  if (!caseDir || !existsSync(caseDir)) return m;
+  const poly = live.mesh_path && existsSync(live.mesh_path) ? live.mesh_path : join(caseDir, 'constant', 'polyMesh');
+  if (polyMeshComplete(poly)) return m;
+  return {
+    ...m,
+    generated: false,
+    live_mesh_result: {
+      ...live,
+      status: 'failed',
+      n_cells: null,
+      n_points: null,
+      n_faces: null,
+      error: 'The mesh files are incomplete (meshing was interrupted). Generate it again.',
+      note: 'The mesh files are incomplete (meshing was interrupted). Generate it again.',
+    },
+  };
+}
+
+function listPayload(meshes, activeId, nameByGeom) {
+  return (meshes || []).map(withDiskTruth).map((m) => ({
+    id: m.id,
+    name: m.name,
+    generated: isGeneratedDoc(m),
+    status: (m.live_mesh_result && m.live_mesh_result.status) || (isGeneratedDoc(m) ? 'done' : null),
+    n_cells: (m.live_mesh_result && m.live_mesh_result.n_cells) || null,
+    n_points: (m.live_mesh_result && m.live_mesh_result.n_points) || null,
+    case_dir: (m.live_mesh_result && m.live_mesh_result.case_dir) || m.case_dir || null,
+    settings: m.settings || null,
+    live_mesh_result: slimLiveMeshResult(m.live_mesh_result) || null,
+    geometry_id: m.geometry_id || null,
+    geometry_name: (m.geometry_id && nameByGeom && nameByGeom[m.geometry_id]) || null,
+    simulation_id: m.simulation_id || null,
+    created_at: m.created_at,
+    updated_at: m.updated_at,
+    rev: Number.isInteger(m.rev) ? m.rev : 0,
+  }));
+}
+
+function isGeneratedDoc(doc) {
+  if (!doc) return false;
+  const live = doc.live_mesh_result;
+  return !!(doc.generated || (live && live.status === 'done'));
+}
+
+function writeProjectMeshRef(proj, sim, doc, now) {
+  if (proj) {
+    proj.mesh = {
+      id: doc.id,
+      name: doc.name,
+      algorithm: doc.settings && doc.settings.algorithm,
+      sizing: doc.settings && doc.settings.sizing,
+      fineness: doc.settings && doc.settings.fineness,
+      bank_exact: doc.bank_exact,
+      mesh_json: doc.mesh_json,
+      active_id: doc.active_id,
+      mesh_count: Array.isArray(doc.meshes) ? doc.meshes.length : 1,
+      updated_at: now,
+    };
+    proj.updated_at = now;
+    // set_mesh_settings already stamps project.json.
+  }
+  if (sim) {
+    try {
+      const simDoc = { ...sim };
+      simDoc.mesh = {
+        id: doc.id,
+        name: doc.name,
+        mesh_json: doc.mesh_json,
+        bank_exact: doc.bank_exact,
+        active_id: doc.active_id,
+      };
+      simDoc.updated_at = now;
+      simDoc.increment = 'W20';
+      writeActiveMirror(doc.project_id, simDoc);
+    } catch {
+      /* non-fatal */
+    }
+  }
+}
+
+function composeMeshDoc(projectId, sim, existing, meshes, active, now) {
+  const settings = active.settings || cloneDefaultSettings(active.name);
+  const meshPath = meshJsonPath(projectId);
+  const generated = isGeneratedDoc(active);
+  const doc = {
+    ...(existing || {}),
+    id: active.id,
+    project_id: projectId,
+    simulation_id: sim && sim.id,
+    name: active.name,
+    settings,
+    defaults: { ...W20_DEFAULTS, advanced: { ...W20_DEFAULTS.advanced } },
+    bank_exact: bankExact(settings),
+    generated,
+    generate_available: !!(existing && existing.generate_available) || generated,
+    live_mesh_result: slimLiveMeshResult(active.live_mesh_result) || null,
+    active_id: active.id,
+    meshes,
+    note:
+      'W20 Mesh form settings. Multiple meshes in meshes[]. Top-level fields are the active mesh.',
+    persistence: 'filesystem',
+    mesh_json: meshPath,
+    created_at: (existing && existing.created_at) || active.created_at || now,
+    updated_at: now,
+    soft_pass_avoided: true,
+    increment: 'W20',
+  };
+  delete doc.last_generate;
+  delete doc.n_cells;
+  delete doc.n_points;
+  delete doc.n_faces;
+  delete doc.out_of_scope;
+  return doc;
+}
+
+function scopedMeshFields(doc, scoped, projectId) {
+  const want = doc && doc.active_id;
+  const active =
+    findMeshById(scoped, want) ||
+    (want ? findMeshById((doc && doc.meshes) || [], want) : null) ||
+    (want ? null : pickScopedActive(scoped, want));
+  if (!active) {
+    return {
+      mesh: null,
+      settings: null,
+      generated: false,
+      live_mesh_result: null,
+      active_id: null,
+      bank_exact: false,
+      simulation_id: (doc && doc.simulation_id) || null,
+    };
+  }
+  const slim =
+    slimMeshDoc({
+      id: active.id,
+      name: active.name,
+      settings: active.settings,
+      generated: isGeneratedDoc(active),
+      live_mesh_result: slimLiveMeshResult(active.live_mesh_result) || null,
+      simulation_id: active.simulation_id,
+      geometry_id: active.geometry_id,
+      active_id: active.id,
+      meshes: scoped,
+      project_id: projectId,
+      defaults: (doc && doc.defaults) || { ...W20_DEFAULTS, advanced: { ...W20_DEFAULTS.advanced } },
+      bank_exact: bankExact(active.settings),
+      mesh_json: (doc && doc.mesh_json) || meshJsonPath(projectId),
+      created_at: active.created_at,
+      updated_at: active.updated_at,
+      rev: Number.isInteger(active.rev) ? active.rev : 0,
+    }) || active;
+  return {
+    mesh: slim,
+    settings: slim.settings || active.settings,
+    generated: isGeneratedDoc(active),
+    live_mesh_result: slimLiveMeshResult(active.live_mesh_result) || null,
+    active_id: active.id,
+    rev: Number.isInteger(active.rev) ? active.rev : 0,
+    bank_exact: !!(slim.bank_exact) || bankExact(active.settings),
+    simulation_id: active.simulation_id,
+  };
+}
+
+function meshApiBody(doc, projectId, extra, proj) {
+  const all = sanitizeMeshesLive((doc && doc.meshes) || []);
+  const sim = proj
+    ? getActiveSimulation(projectId, proj, extra && extra.simulation_id)
+    : null;
+  const simId = (sim && sim.id) || (extra && extra.simulation_id) || null;
+  const geomId =
+    (sim && sim.geometry_id) ||
+    activeGeometryId(proj, extra && extra.geometry_id);
+  const names = geomNames(proj);
+  const legacyId = proj ? firstLegacySimId(projectId, proj) : simId;
+  const scoped = proj
+    ? filterByStudy(filterByGeometry(all, geomId, primaryGeometryId(proj)), simId, legacyId)
+    : all;
+  const fields = scopedMeshFields({ ...(doc || {}), meshes: all }, scoped, projectId);
+  return {
+    ok: true,
+    ...fields,
+    defaults: (doc && doc.defaults) || { ...W20_DEFAULTS, advanced: { ...W20_DEFAULTS.advanced } },
+    project_id: projectId,
+    mesh_json: (doc && doc.mesh_json) || meshJsonPath(projectId),
+    meshes: listPayload(scoped, fields.active_id, names),
+    meshes_all: listPayload(
+      projectId ? assembleAllMeshes(projectId) : proj ? liveStudyMeshes(projectId, proj, all) : all,
+      fields.active_id,
+      names
+    ),
+    geometry_id: geomId,
+    soft_pass_avoided: true,
+    increment: 'W20',
+    ...(extra || {}),
+  };
+}
+
+async function deleteGeneratedMesh(body) {
+  const gate = requireProjectSim(body);
+  if (!gate.ok) return gate;
+  const { projectId, proj, sim } = gate;
+  const existing = readMeshFile(projectId, sim.id);
+  if (!existing) {
+    return {
+      ok: false,
+      status: 404,
+      body: { error: 'no mesh settings to delete from', project_id: projectId },
+    };
+  }
+  const meshes = meshesFromDoc(existing);
+  const geomId = sim.geometry_id || activeGeometryId(proj, body && body.geometry_id);
+  const scoped = filterByStudy(
+    filterByGeometry(meshes, geomId, primaryGeometryId(proj)),
+    sim.id,
+    firstLegacySimId(projectId, proj)
+  );
+  const requested = body && (body.mesh_id || body.id);
+  const fileActiveInScoped =
+    existing.active_id && scoped.some((m) => m && String(m.id) === String(existing.active_id));
+  const targetId = requested || (fileActiveInScoped ? existing.active_id : null);
+  const target = findMeshById(scoped, targetId);
+  if (!target) {
+    return {
+      ok: false,
+      status: 404,
+      body: { error: 'mesh not found in this study', project_id: projectId },
+    };
+  }
+  try {
+    // Its generator and what it left go before the files do (never holding the server meanwhile).
+    await stopMeshGenerate({ meshId: target.id, projectId }).reaped;
+  } catch {
+    /* best-effort — delete still proceeds */
+  }
+  const live = target.live_mesh_result || {};
+  // Opening the mesh may still be exporting its surface or a section from these
+  // files; stop that first or Windows refuses to delete them.
+  await stopFilterToolsFor(live.case_dir);
+  const removed = removeGeneratedMeshRuns(projectId, live.case_dir || null, target.id);
+  const now = new Date().toISOString();
+  target.generated = false;
+  target.live_mesh_result = null;
+  target.updated_at = now;
+  const active = target;
+  const doc = composeMeshDoc(projectId, sim, existing, meshes, active, now);
+  doc.note = 'Generated mesh deleted. Settings and other meshes kept.';
+  await writeMeshFile(projectId, doc);
+  try {
+    writeProjectMeshRef(proj, sim, doc, now);
+  } catch {
+    /* non-fatal */
+  }
+  return {
+    ok: true,
+    status: 200,
+    body: meshApiBody(doc, projectId, {
+      deleted: true,
+      deleted_runs: removed,
+      generated: false,
+      live_mesh_result: null,
+    }, proj),
+  };
+}
+
+/**
+ * POST /api/mesh/stop {project_id, simulation_id, mesh_id}: the mesh's Stop. A generating
+ * mesh's generator is ended and the mesh is recorded stopped; a queued one leaves the
+ * queue. Nothing is deleted: the record, its settings and refinements stay (Delete is
+ * the other button). 409 not_running when it neither generates nor waits.
+ */
+export async function stopMeshRoute(body) {
+  const gate = requireProjectSim(body);
+  if (!gate.ok) return gate;
+  const { projectId, proj, sim } = gate;
+  const meshId = String((body && (body.mesh_id || body.id)) || '').trim();
+  if (!meshId) return { ok: false, status: 400, body: { ok: false, error: 'mesh_id required', project_id: projectId } };
+  const existing = readMeshFile(projectId, sim.id);
+  const meshes = existing ? meshesFromDoc(existing) : [];
+  const geomId = sim.geometry_id || activeGeometryId(proj, body && body.geometry_id);
+  const scoped = filterByStudy(filterByGeometry(meshes, geomId, primaryGeometryId(proj)), sim.id, firstLegacySimId(projectId, proj));
+  const target = findMeshById(scoped, meshId);
+  if (!target) {
+    return { ok: false, status: 404, body: { ok: false, error: 'mesh not found in this study', project_id: projectId } };
+  }
+  const name = target.name || (target.settings && target.settings.name) || 'Mesh';
+  const queuedRow = () =>
+    (snapshotComputeQueue(projectId).items || []).some((row) => row && row.kind === 'mesh' && String(row.mesh_id || '') === String(target.id));
+  if (queuedRow()) {
+    removeComputeJob('mesh', target.id, projectId);
+    if (!queuedRow()) {
+      return { ok: true, status: 200, body: { ok: true, stopped: true, unqueued: true, mesh_id: target.id, name, project_id: projectId } };
+    }
+  }
+  const r = stopMeshGenerating({ meshId: String(target.id), projectId });
+  await r.reaped;
+  if (!r.stopped) {
+    return {
+      ok: false,
+      status: 409,
+      body: { ok: false, code: 'not_running', error: `${name} is not generating.`, mesh_id: target.id, project_id: projectId },
+    };
+  }
+  return {
+    ok: true,
+    status: 200,
+    body: { ok: true, stopped: true, mesh_id: target.id, name, generate_id: r.generate_id || null, project_id: projectId },
+  };
+}
+
+async function deleteMeshRecord(body) {
+  const gate = requireProjectSim(body);
+  if (!gate.ok) return gate;
+  const { projectId, proj, sim } = gate;
+  const existing = readMeshFile(projectId, sim.id);
+  if (!existing) {
+    return {
+      ok: false,
+      status: 404,
+      body: { error: 'no mesh settings to delete from', project_id: projectId },
+    };
+  }
+  const meshes = meshesFromDoc(existing);
+  const geomId = sim.geometry_id || activeGeometryId(proj, body && body.geometry_id);
+  const scoped = filterByStudy(
+    filterByGeometry(meshes, geomId, primaryGeometryId(proj)),
+    sim.id,
+    firstLegacySimId(projectId, proj)
+  );
+  const requested = body && (body.mesh_id || body.id);
+  const fileActiveInScoped =
+    existing.active_id && scoped.some((m) => m && String(m.id) === String(existing.active_id));
+  const targetId =
+    requested || (fileActiveInScoped ? existing.active_id : scoped[0] && scoped[0].id);
+  const target = findMeshById(scoped, targetId);
+  if (!target) {
+    return {
+      ok: false,
+      status: 404,
+      body: { error: 'mesh not found in this study', project_id: projectId },
+    };
+  }
+  try {
+    await stopMeshGenerate({ meshId: target.id, projectId }).reaped;
+  } catch {
+    /* best-effort — delete still proceeds */
+  }
+  // A queued generate of this mesh, and runs queued on it, can never start now.
+  try {
+    dropComputeJobsForMesh(target.id, projectId);
+  } catch {
+    /* best-effort */
+  }
+  const live = target.live_mesh_result || {};
+  await stopFilterToolsFor(live.case_dir);
+  const removed = removeGeneratedMeshRuns(projectId, live.case_dir || null, target.id);
+  const now = new Date().toISOString();
+  dropRefsForMesh(projectId, target.id, sim.id);
+  const folder = meshFolderOf(projectId, target.id, sim.id);
+  if (folder && folder.dir) {
+    try {
+      rmSync(folder.dir, { recursive: true, force: true });
+    } catch {
+      /* best-effort */
+    }
+  }
+  const remaining = assembleMeshDoc(projectId, sim.id);
+  const next = remaining.meshes || [];
+  const nextScoped = filterByStudy(
+    filterByGeometry(next, geomId, primaryGeometryId(proj)),
+    sim.id,
+    firstLegacySimId(projectId, proj)
+  );
+  const active = pickScopedActive(nextScoped, existing.active_id);
+  if (!active) {
+    const doc = {
+      ...(existing || {}),
+      id: null,
+      name: null,
+      settings: null,
+      generated: false,
+      live_mesh_result: null,
+      active_id: null,
+      simulation_id: sim.id,
+      meshes: nextScoped,
+      updated_at: now,
+      note: 'Mesh record deleted.',
+    };
+    return {
+      ok: true,
+      status: 200,
+      body: meshApiBody(doc, projectId, {
+        deleted: true,
+        deleted_record: true,
+        deleted_runs: removed,
+        generated: false,
+        live_mesh_result: null,
+      }, proj),
+    };
+  }
+  const doc = composeMeshDoc(projectId, sim, existing, next, active, now);
+  doc.note = 'Mesh record deleted.';
+  try {
+    writeProjectMeshRef(proj, sim, doc, now);
+  } catch {
+    /* non-fatal */
+  }
+  return {
+    ok: true,
+    status: 200,
+    body: meshApiBody(doc, projectId, {
+      deleted: true,
+      deleted_record: true,
+      deleted_runs: removed,
+    }, proj),
+  };
+}
+
+function newMeshId() {
+  return `mesh-${Date.now().toString(36)}-${randomBytes(3).toString('hex')}`;
+}
+
+function asBool(v, fallback) {
+  if (typeof v === 'boolean') return v;
+  if (v === 'true' || v === 'ON' || v === 'on' || v === 1 || v === '1') return true;
+  if (v === 'false' || v === 'OFF' || v === 'off' || v === 0 || v === '0') return false;
+  return fallback;
+}
+
+function asNumber(v, fallback) {
+  if (v === undefined || v === null || v === '') return fallback;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function asSciString(v, fallback) {
+  if (v === undefined || v === null || v === '') return fallback;
+  return String(v);
+}
+
+function bankExact(settings) {
+  if (!settings) return false;
+  const adv = settings.advanced || {};
+  return (
+    settings.algorithm === W20_DEFAULTS.algorithm &&
+    settings.sizing === W20_DEFAULTS.sizing &&
+    Number(settings.fineness) === W20_DEFAULTS.fineness &&
+    settings.curvature === W20_DEFAULTS.curvature &&
+    settings.automatic_boundary_layers === true &&
+    settings.physics_based_meshing === true &&
+    settings.hex_element_core === true &&
+    settings.automatic_extrusion_meshing === false &&
+    settings.preferred_cpus === W20_DEFAULTS.preferred_cpus &&
+    String(settings.maximum_meshing_runtime) === W20_DEFAULTS.maximum_meshing_runtime &&
+    settings.maximum_meshing_runtime_unit === W20_DEFAULTS.maximum_meshing_runtime_unit &&
+    asSfs(adv.small_feature_suppression, '') === W20_DEFAULTS.advanced.small_feature_suppression &&
+    adv.small_feature_suppression_unit === W20_DEFAULTS.advanced.small_feature_suppression_unit &&
+    asEngine(adv.mesh_engine, 'standard') === W20_DEFAULTS.advanced.mesh_engine &&
+    Number(adv.gap_refinement_factor) === W20_DEFAULTS.advanced.gap_refinement_factor &&
+    Number(adv.global_gradation_rate) === W20_DEFAULTS.advanced.global_gradation_rate
+  );
+}
+
+/**
+ * @param {object} body the request
+ * @param {{ settings?: object }} [existing] the mesh's saved record
+ * @param {string} [bankEngine] the engine Restore defaults gives (the study's new-mesh
+ *   mesher, registry-defaults.js defaultMeshEngineFor); the app's default when absent
+ */
+function buildSettings(body, existing, bankEngine) {
+  const src = body || {};
+  const defaultEngine = String(bankEngine || '') || W20_DEFAULTS.advanced.mesh_engine;
+  const advIn = src.advanced || {};
+  const existingSettings = (existing && existing.settings) || {};
+  const existingAdv = existingSettings.advanced || {};
+  const useBank = src.use_bank_defaults === true || src.bank === true || Object.keys(src).length === 0 || src.reset_defaults === true;
+
+  const settings = {
+    name: String(src.name || existingSettings.name || W20_DEFAULTS.name),
+    algorithm: useBank
+      ? W20_DEFAULTS.algorithm
+      : String(src.algorithm || existingSettings.algorithm || W20_DEFAULTS.algorithm),
+    sizing: useBank
+      ? W20_DEFAULTS.sizing
+      : String(src.sizing || existingSettings.sizing || W20_DEFAULTS.sizing),
+    fineness: useBank
+      ? W20_DEFAULTS.fineness
+      : asNumber(src.fineness !== undefined ? src.fineness : existingSettings.fineness, W20_DEFAULTS.fineness),
+    fineness_labels: { ...W20_DEFAULTS.fineness_labels },
+    curvature: useBank
+      ? W20_DEFAULTS.curvature
+      : String(src.curvature || existingSettings.curvature || W20_DEFAULTS.curvature),
+    automatic_boundary_layers: useBank
+      ? true
+      : asBool(
+          src.automatic_boundary_layers !== undefined
+            ? src.automatic_boundary_layers
+            : existingSettings.automatic_boundary_layers,
+          true
+        ),
+    physics_based_meshing: useBank
+      ? true
+      : asBool(
+          src.physics_based_meshing !== undefined
+            ? src.physics_based_meshing
+            : existingSettings.physics_based_meshing,
+          true
+        ),
+    hex_element_core: useBank
+      ? true
+      : asBool(
+          src.hex_element_core !== undefined ? src.hex_element_core : existingSettings.hex_element_core,
+          true
+        ),
+    automatic_extrusion_meshing: useBank
+      ? false
+      : asBool(
+          src.automatic_extrusion_meshing !== undefined
+            ? src.automatic_extrusion_meshing
+            : existingSettings.automatic_extrusion_meshing,
+          false
+        ),
+    preferred_cpus: useBank
+      ? W20_DEFAULTS.preferred_cpus
+      : String(src.preferred_cpus || existingSettings.preferred_cpus || W20_DEFAULTS.preferred_cpus),
+    preferred_cpus_label: W20_DEFAULTS.preferred_cpus_label,
+    requires_upgrade: true,
+    maximum_meshing_runtime: useBank
+      ? W20_DEFAULTS.maximum_meshing_runtime
+      : asSciString(
+          src.maximum_meshing_runtime !== undefined
+            ? src.maximum_meshing_runtime
+            : existingSettings.maximum_meshing_runtime,
+          W20_DEFAULTS.maximum_meshing_runtime
+        ),
+    maximum_meshing_runtime_unit: useBank
+      ? W20_DEFAULTS.maximum_meshing_runtime_unit
+      : String(
+          src.maximum_meshing_runtime_unit ||
+            existingSettings.maximum_meshing_runtime_unit ||
+            W20_DEFAULTS.maximum_meshing_runtime_unit
+        ),
+    advanced: {
+      small_feature_suppression: useBank
+        ? W20_DEFAULTS.advanced.small_feature_suppression
+        : asSfs(
+            advIn.small_feature_suppression !== undefined
+              ? advIn.small_feature_suppression
+              : existingAdv.small_feature_suppression,
+            W20_DEFAULTS.advanced.small_feature_suppression
+          ),
+      small_feature_suppression_unit: W20_DEFAULTS.advanced.small_feature_suppression_unit,
+      mesh_engine: useBank
+        ? defaultEngine
+        : asEngine(
+            advIn.mesh_engine !== undefined ? advIn.mesh_engine : existingAdv.mesh_engine,
+            W20_DEFAULTS.advanced.mesh_engine
+          ),
+      gap_refinement_factor: useBank
+        ? W20_DEFAULTS.advanced.gap_refinement_factor
+        : asNumber(
+            advIn.gap_refinement_factor !== undefined
+              ? advIn.gap_refinement_factor
+              : existingAdv.gap_refinement_factor,
+            W20_DEFAULTS.advanced.gap_refinement_factor
+          ),
+      global_gradation_rate: useBank
+        ? W20_DEFAULTS.advanced.global_gradation_rate
+        : asNumber(
+            advIn.global_gradation_rate !== undefined
+              ? advIn.global_gradation_rate
+              : existingAdv.global_gradation_rate,
+            W20_DEFAULTS.advanced.global_gradation_rate
+          ),
+    },
+    // A mesher's own settings (schema keys the core does not model), as the panel sent them.
+    mesher_settings: useBank
+      ? {}
+      : plainObject(src.mesher_settings !== undefined ? src.mesher_settings : existingSettings.mesher_settings),
+  };
+
+  // Force bank-exact when caller asks for bank defaults (W20 hard bar)
+  if (useBank || src.force_bank === true) {
+    Object.assign(settings, {
+      algorithm: W20_DEFAULTS.algorithm,
+      sizing: W20_DEFAULTS.sizing,
+      fineness: W20_DEFAULTS.fineness,
+      curvature: W20_DEFAULTS.curvature,
+      automatic_boundary_layers: true,
+      physics_based_meshing: true,
+      hex_element_core: true,
+      automatic_extrusion_meshing: false,
+      preferred_cpus: W20_DEFAULTS.preferred_cpus,
+      maximum_meshing_runtime: W20_DEFAULTS.maximum_meshing_runtime,
+      maximum_meshing_runtime_unit: W20_DEFAULTS.maximum_meshing_runtime_unit,
+      advanced: { ...W20_DEFAULTS.advanced, mesh_engine: defaultEngine },
+      mesher_settings: {},
+    });
+  }
+
+  return settings;
+}
+
+function plainObject(v) {
+  return v && typeof v === 'object' && !Array.isArray(v) ? { ...v } : {};
+}
+
+function requireProjectSim(body) {
+  const projectId = (body && body.project_id) || projectIdOrActive('', readActiveId);
+  if (!projectId) {
+    return {
+      ok: false,
+      status: 400,
+      body: { error: 'no active project; create project first', soft_pass: false },
+    };
+  }
+  const proj = readProject(projectId);
+  if (!proj) {
+    return {
+      ok: false,
+      status: 404,
+      body: { error: 'project not found', project_id: projectId },
+    };
+  }
+  const sim = getActiveSimulation(projectId, proj, body && body.simulation_id);
+  if (!sim) {
+    return {
+      ok: false,
+      status: 400,
+      body: {
+        error: 'no simulation; create a simulation first',
+        soft_pass: false,
+      },
+    };
+  }
+  return { ok: true, projectId, proj, sim };
+}
+
+async function saveComposed(projectId, proj, sim, existing, meshes, active, now, extra) {
+  // A settings save: the mesh's rev moves when its record changed (record-rev.js).
+  persistOneMesh(
+    projectId,
+    sim.id,
+    {
+      ...active,
+      simulation_id: sim.id,
+      updated_at: now,
+    },
+    { stampRev: true },
+  );
+  const assembled = assembleMeshDoc(projectId, sim.id, active.id);
+  const liveActive =
+    (assembled.meshes || []).find((m) => m && String(m.id) === String(active.id)) || active;
+  const doc = composeMeshDoc(projectId, sim, existing, assembled.meshes, liveActive, now);
+  // Only this mesh folder is written. Sibling meshes / studies stay untouched.
+  if (!(extra && extra.stamp_project === false)) {
+    writeProjectMeshRef(proj, sim, doc, now);
+  }
+  return {
+    ok: true,
+    status: existing ? 200 : 201,
+    body: meshApiBody(doc, projectId, extra, proj),
+  };
+}
+
+async function createMesh(body) {
+  const gate = requireProjectSim(body);
+  if (!gate.ok) return gate;
+  const { projectId, proj, sim } = gate;
+  const existing = readMeshFile(projectId, sim.id);
+  const meshes = meshesFromDoc(existing);
+  const now = new Date().toISOString();
+  const geomId = sim.geometry_id || activeGeometryId(proj, body && body.geometry_id);
+  const scoped = filterByStudy(
+    filterByGeometry(meshes, geomId, primaryGeometryId(proj)),
+    sim.id,
+    firstLegacySimId(projectId, proj)
+  );
+  const requested = String((body && (body.name || body.mesh_name)) || '').trim();
+  const name = requested || nextMeshName(scoped);
+  const srcId = body && (body.copy_from || body.copy_from_id);
+  const src = srcId ? findMeshById(meshes, srcId) || findMeshById(assembleAllMeshes(projectId), srcId) : null;
+  const settings = src
+    ? cloneSettings(src.settings, name)
+    : body && body.fineness != null
+      ? buildSettings({ ...body, name }, { settings: newMeshSettings(name, sim) }, defaultMeshEngineFor(sim && sim.analysis_type))
+      : newMeshSettings(name, sim);
+  if (settings) settings.name = name;
+  const entry = makeMeshEntry({
+    id: body && body.id,
+    name,
+    settings,
+    // The engine it was made with (the study's default, or the source's for a copy): an
+    // entry without one reads a cfmesh as the old bug stamp (migrateMeshEngineEntry).
+    ui_mesh_engine: engineOf(settings),
+    geometry_id: geomId,
+    simulation_id: sim.id,
+    created_at: now,
+    updated_at: now,
+  });
+  meshes.push(entry);
+  return saveComposed(projectId, proj, sim, existing, meshes, entry, now, {
+    created: true,
+    copied_from: src ? src.id : null,
+  });
+}
+
+async function activateMesh(body) {
+  const gate = requireProjectSim(body);
+  if (!gate.ok) return gate;
+  const { projectId, proj, sim } = gate;
+  const existing = readMeshFile(projectId, sim.id);
+  if (!existing) {
+    return {
+      ok: false,
+      status: 404,
+      body: { error: 'no mesh settings to activate', project_id: projectId },
+    };
+  }
+  const meshes = meshesFromDoc(existing);
+  const geomId = sim.geometry_id || activeGeometryId(proj, body && body.geometry_id);
+  const scoped = filterByStudy(
+    filterByGeometry(meshes, geomId, primaryGeometryId(proj)),
+    sim.id,
+    firstLegacySimId(projectId, proj)
+  );
+  const target = findMeshById(scoped, body && (body.activate || body.mesh_id || body.id));
+  if (!target) {
+    return {
+      ok: false,
+      status: 404,
+      body: { error: 'mesh not found in this study', project_id: projectId },
+    };
+  }
+  const now = new Date().toISOString();
+  const doc = composeMeshDoc(projectId, sim, existing, meshes, target, now);
+  return {
+    ok: true,
+    status: 200,
+    body: meshApiBody(doc, projectId, {
+      activated: true,
+      simulation_id: sim.id,
+      geometry_id: geomId,
+    }, proj),
+  };
+}
+
+async function upsertMesh(body) {
+  if (body && body.create === true) return createMesh(body);
+  if (body && (body.activate || body.activate_id)) {
+    return activateMesh({ ...body, activate: body.activate || body.activate_id });
+  }
+  const gate = requireProjectSim(body);
+  if (!gate.ok) return gate;
+  const { projectId, proj, sim } = gate;
+  const existing = readMeshFile(projectId, sim.id);
+  const meshes = meshesFromDoc(existing);
+  const now = new Date().toISOString();
+  const geomId = sim.geometry_id || activeGeometryId(proj, body && body.geometry_id);
+  const primaryId = primaryGeometryId(proj);
+  const scoped = filterByStudy(
+    filterByGeometry(meshes, geomId, primaryId),
+    sim.id,
+    firstLegacySimId(projectId, proj)
+  );
+  const requested = body && (body.mesh_id || body.id);
+  let active = requested
+    ? findMeshById(scoped, requested)
+    : findMeshById(scoped, existing && existing.active_id) || null;
+  if (active && !requested && !matchesGeometry(active, geomId, primaryId)) {
+    active = null;
+  }
+  if (requested && !active) {
+    return {
+      ok: false,
+      status: 404,
+      body: { error: 'mesh not found in this study', project_id: projectId },
+    };
+  }
+  // A save made from an older copy than the stored mesh is refused (record-rev.js): the
+  // save carries the rev it read as `base_rev`.
+  const base = baseRevOf(body);
+  if (active && base !== null && base !== recordRev(active)) {
+    return staleAnswer(new StaleRecord('mesh', String(active.id), recordRev(active)));
+  }
+  const autoCreated = !active;
+  if (!active) {
+    const name = nextMeshName(scoped);
+    const fresh = newMeshSettings(name, sim);
+    active = makeMeshEntry({
+      name,
+      settings: fresh,
+      ui_mesh_engine: engineOf(fresh),
+      geometry_id: geomId,
+      simulation_id: sim.id,
+      created_at: now,
+      updated_at: now,
+    });
+    meshes.push(active);
+  } else if (geomId && !active.geometry_id) {
+    active.geometry_id = geomId;
+  }
+  const copyFrom = body && (body.copy_from || body.copy_from_id);
+  if (copyFrom) {
+    // The source may be in another study, on this geometry or another one.
+    const src = findMeshById(meshes, copyFrom) || findMeshById(assembleAllMeshes(projectId), copyFrom);
+    if (!src) {
+      return { ok: false, status: 404, body: { error: 'mesh to copy from not found', copy_from: copyFrom } };
+    }
+    if (src && src.id !== active.id) {
+      active.settings = cloneSettings(src.settings, active.name);
+      active.ui_mesh_engine = engineOf(active.settings);
+      active.updated_at = now;
+      return saveComposed(projectId, proj, sim, existing, meshes, active, now, {
+        copied: true,
+        copied_from: src.id,
+      });
+    }
+  }
+  // Restore defaults is the defaults of a new mesh of this study: its analysis's mesher.
+  const settings = buildSettings(body || {}, { settings: active.settings }, defaultMeshEngineFor(sim && sim.analysis_type));
+  if (body && (body.reset_defaults === true || body.use_bank_defaults === true)) {
+    settings.name = String(body.name || active.name || settings.name);
+  }
+  if (autoCreated && settings.advanced) {
+    // A save with no mesh yet makes the study's first mesh. The form it comes from shows
+    // the app's defaults (Standard) when there is no mesh, so the engine it sends is not a
+    // pick: the new mesh starts on the study's mesher, like every new mesh, and a pick
+    // is made on the mesh afterwards.
+    settings.advanced.mesh_engine = engineOf(active.settings);
+  }
+  active.settings = settings;
+  active.name = settings.name;
+  // Persist explicit Advanced mesh_engine as ui_mesh_engine so hydrate migrate
+  // can tell real Advanced=cfmesh from old bug-stamped cfmesh.
+  active.ui_mesh_engine = (settings.advanced && settings.advanced.mesh_engine) || 'standard';
+  active.updated_at = now;
+  const settingsOnly = !!existing && !copyFrom;
+  return saveComposed(projectId, proj, sim, existing, meshes, active, now, {
+    saved: true,
+    stamp_project: !settingsOnly,
+  });
+}
+
+export function getMesh(projectIdOpt, geomIdOpt, simIdOpt, opts) {
+  const wantId = (opts && (opts.meshId || opts.mesh_id)) || null;
+  const projectId = projectIdOpt || projectIdOrActive('', readActiveId);
+  if (!projectId) {
+    return {
+      ok: true,
+      status: 200,
+      body: {
+        ok: true,
+        active: false,
+        mesh: null,
+        settings: null,
+        defaults: { ...W20_DEFAULTS, advanced: { ...W20_DEFAULTS.advanced } },
+        bank_exact: false,
+        meshes: [],
+        active_id: null,
+        note: 'No active project. POST /api/mesh after simulation create.',
+        increment: 'W20',
+      },
+    };
+  }
+  const proj = readProject(projectId);
+  if (!proj) {
+    return {
+      ok: false,
+      status: 404,
+      body: { error: 'project not found', project_id: projectId },
+    };
+  }
+  const persist = !opts || opts.persist !== false;
+  const sim = getActiveSimulation(projectId, proj, simIdOpt);
+  if (persist && sim && sim.id) {
+    try {
+      recoverStudyMeshesFromDisk(projectId, sim.id);
+    } catch (e) {
+      console.warn('[CFD W20] recover generated mesh', e);
+    }
+  }
+  let raw = readMeshFile(projectId, sim && sim.id, wantId);
+  let all = meshesFromDoc(raw);
+  // Drop generate logs that were accidentally persisted into mesh.json.
+  // A multi-MB excerpt freezes the tab on GET /api/mesh.
+  if (raw && meshDocLogIsBloated(raw)) {
+    const slimmed = slimMeshDoc(raw);
+    const simForSlim = getActiveSimulation(projectId, proj, simIdOpt);
+    const activeForSlim = findMeshById(all, slimmed.active_id) || all[0];
+    if (persist) {
+      if (simForSlim && activeForSlim) {
+        writeMeshFile(
+          projectId,
+          composeMeshDoc(projectId, simForSlim, slimmed, all, activeForSlim, new Date().toISOString())
+        );
+      } else {
+        writeMeshFile(projectId, slimmed);
+      }
+      raw = readMeshFile(projectId, sim && sim.id) || slimmed;
+    } else {
+      raw = slimmed;
+    }
+    all = meshesFromDoc(raw);
+  }
+  // Hydrate migrate: coerce bug-stamped cfmesh (no ui_mesh_engine) and persist.
+  let migrated = false;
+  if (raw && all.length) {
+    const next = [];
+    for (const m of all) {
+      const { entry, changed } = migrateMeshEngineEntry(m);
+      if (changed) migrated = true;
+      next.push(entry);
+    }
+    if (migrated) {
+      all = next;
+      const activeForWrite =
+        findMeshById(all, raw.active_id) || all[0];
+      const simForWrite = getActiveSimulation(projectId, proj, simIdOpt);
+      if (simForWrite && activeForWrite) {
+        const now = new Date().toISOString();
+        const docWrite = composeMeshDoc(projectId, simForWrite, raw, all, activeForWrite, now);
+        if (persist) {
+          writeMeshFile(projectId, docWrite);
+          raw = readMeshFile(projectId, sim && sim.id) || docWrite;
+        } else {
+          raw = docWrite;
+        }
+        all = meshesFromDoc(raw);
+      }
+    }
+  }
+  const primaryId = primaryGeometryId(proj);
+  const geomId = (sim && sim.geometry_id) || activeGeometryId(proj, geomIdOpt);
+  const scoped = filterByStudy(
+    filterByGeometry(all, geomId, primaryId),
+    sim && sim.id,
+    firstLegacySimId(projectId, proj)
+  );
+  const names = geomNames(proj);
+  const fields = scopedMeshFields(
+    { ...(raw || {}), meshes: all, active_id: wantId || (raw && raw.active_id) },
+    scoped,
+    projectId
+  );
+  return {
+    ok: true,
+    status: 200,
+    body: {
+      ok: true,
+      active: true,
+      project_id: projectId,
+      mesh: fields.mesh,
+      settings: fields.settings,
+      defaults: { ...W20_DEFAULTS, advanced: { ...W20_DEFAULTS.advanced } },
+      bank_exact: fields.bank_exact,
+      mesh_json_path: meshJsonPath(projectId),
+      mesh_json_exists: existsSync(meshJsonPath(projectId)),
+      project_mesh_ref: proj.mesh || null,
+      generated: fields.generated,
+      live_mesh_result: fields.live_mesh_result,
+      active_id: fields.active_id,
+      meshes: listPayload(scoped, fields.active_id, names),
+      meshes_all: listPayload(assembleAllMeshes(projectId), fields.active_id, names),
+      simulation_id: (sim && sim.id) || null,
+      geometry_id: geomId,
+      mesh_engine_migrated: migrated,
+      increment: 'W20',
+    },
+  };
+}
+
+/**
+ * Vite middleware for /api/mesh*
+ * Returns true if handled.
+ */
+export async function handleW20Api(req, res, u, parts, helpers) {
+  const { sendJson, readJsonBody } = helpers;
+
+  if (parts[0] === 'api' && parts[1] === 'mesh') {
+    // W21 handles generate/remesh upstream; if reached here, defer
+    if (parts[2] === 'generate' || parts[2] === 'remesh') {
+      return false;
+    }
+    if (parts[2] === 'kick') {
+      return sendJson(res, 404, {
+        error: 'Use POST /api/mesh/generate for W21 remesh (not W15.1 checkMesh kick)',
+        soft_pass: false,
+        increment: 'W21',
+      });
+    }
+    if (req.method === 'POST' && (parts[2] === 'delete' || !parts[2])) {
+      let body = {};
+      try {
+        body = await readJsonBody(req);
+      } catch (e) {
+        return sendJson(res, 400, { error: 'invalid JSON body', detail: String(e) });
+      }
+      if (body && (body.delete_record === true || body.delete_mesh === true)) {
+        const result = await deleteMeshRecord(body);
+        if (result.ok && typeof helpers.onGeneratedMeshDeleted === 'function') {
+          try {
+            helpers.onGeneratedMeshDeleted({
+              project_id: result.body && result.body.project_id,
+              deleted_runs: (result.body && result.body.deleted_runs) || [],
+            });
+          } catch (e) {
+            console.warn('[CFD W20] onGeneratedMeshDeleted', e);
+          }
+        }
+        res.setHeader('X-CFD-Source', 'mesh-delete-record');
+        res.setHeader('X-CFD-Increment', 'W20');
+        return sendJson(res, result.status, result.body);
+      }
+      if (
+        parts[2] === 'delete' ||
+        (body && (body.delete_generated === true || body.delete === true))
+      ) {
+        const result = await deleteGeneratedMesh(body);
+        if (result.ok && typeof helpers.onGeneratedMeshDeleted === 'function') {
+          try {
+            helpers.onGeneratedMeshDeleted({
+              project_id: result.body && result.body.project_id,
+              deleted_runs: (result.body && result.body.deleted_runs) || [],
+            });
+          } catch (e) {
+            console.warn('[CFD W20] onGeneratedMeshDeleted', e);
+          }
+        }
+        res.setHeader('X-CFD-Source', 'mesh-delete');
+        res.setHeader('X-CFD-Increment', 'W20');
+        return sendJson(res, result.status, result.body);
+      }
+      // Reject generate flags in POST body
+      if (body && (body.generate === true || body.remesh === true || body.kick === true)) {
+        return sendJson(res, 400, {
+          error: 'W20 settings-only: generate/remesh flags rejected',
+          soft_pass: false,
+          increment: 'W20',
+        });
+      }
+      const result = await upsertMesh(body);
+      res.setHeader('X-CFD-Source', 'mesh-upsert');
+      res.setHeader('X-CFD-Increment', 'W20');
+      if (result.ok && result.body.mesh) {
+        res.setHeader('X-CFD-Mesh-Id', result.body.mesh.id);
+        res.setHeader('X-CFD-Project-Id', result.body.project_id);
+        res.setHeader('X-CFD-Mesh-Algorithm', result.body.settings.algorithm);
+        res.setHeader('X-CFD-Mesh-Fineness', String(result.body.settings.fineness));
+        res.setHeader('X-CFD-Mesh-Bank-Exact', result.body.bank_exact ? '1' : '0');
+      }
+      return sendJson(res, result.status, result.body);
+    }
+    if ((req.method === 'GET' || req.method === 'HEAD') && !parts[2]) {
+      const pid = u.searchParams.get('project_id') || undefined;
+      const result = getMesh(
+        pid,
+        u.searchParams.get('geometry_id') || undefined,
+        u.searchParams.get('simulation_id') || undefined,
+        { meshId: u.searchParams.get('mesh_id') || undefined }
+      );
+      res.setHeader('X-CFD-Source', 'mesh-get');
+      res.setHeader('X-CFD-Increment', 'W20');
+      return sendJson(res, result.status, result.body);
+    }
+    return sendJson(res, 405, { error: 'method not allowed for /api/mesh' });
+  }
+
+  return false;
+}
+
+export const W20_META = {
+  increment: 'W20',
+  projects_root: PROJECTS_ROOT,
+  defaults: W20_DEFAULTS,
+};

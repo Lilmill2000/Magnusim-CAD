@@ -1,0 +1,852 @@
+/**
+ * Register live product routes (same request/response shape as the old if-chain).
+ */
+import { existsSync, readFileSync, rmSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { handleW16Api, attachLiveMeshJobReader, attachActiveProjectListener, importGeometry } from '../w16-project-geometry.js';
+import { handleProjectHydrate } from '../project-hydrate.js';
+import { caseDetachAllowed, caseDirBelongsToProject } from '../project-isolation.js';
+import { handleW17Api } from '../w17-simulation.js';
+import { registerLostFaceRoutes } from './link-routes.ts';
+import { registerOriginalImportRoute } from './geometry-edit-routes.ts';
+import { handleW18Api } from '../w18-materials.js';
+import { handleW19Api } from '../w19-boundary-conditions.js';
+import { handleW20Api, stopMeshRoute } from '../w20-mesh.js';
+import {
+  startMeshGenerate,
+  stopMeshGenerate,
+  liveMeshJobSnapshot,
+  reapOrphanMeshGeneratorsOnBoot,
+  projectTitleOf,
+} from '../w21-mesh-generate.js';
+import { handleW26Api } from '../w26-mesh-refinements.js';
+import { handleResultControlsApi } from '../w22-area-average.js';
+import { handleW27Api, startQueuedSolve, startSolve } from '../w27-solve.js';
+import { scheduleWslPrune } from '../wsl-prune.js';
+import { computeSlotHolder, holderIsRow, setSlotReleaseHook } from '../compute-slot.js';
+import { rediscoverAtBoot } from '../compute-rediscover.js';
+import { onQueueChange, onQueueLeave, startFoam } from '../foam-runner.js';
+import {
+  linkBootOnce,
+  linkRunFirst,
+  onLinkQueueChange,
+  onLinkQueueLeave,
+  resumeQueuedCreates,
+  startGeometryUpdate,
+} from './link-job.js';
+import { refreshSolveHooks } from '../solve-hooks.js';
+import {
+  configureComputeQueue,
+  snapshotComputeQueue,
+  enqueueComputeJob,
+  enqueueMeshWhenBusy,
+  mergeComputeQueueItems,
+  removeComputeJob,
+  dropComputeJobsForMesh,
+  reorderComputeQueue,
+  kickComputeQueue,
+  scheduleComputeQueueKick,
+  startResultFromEngine,
+} from './compute-queue.ts';
+import { handleW28Api } from '../w28-media.js';
+import { handlePrefsApi } from '../w32-prefs.js';
+import { startStudyMigrations } from './plugin-services.ts';
+import { getCaseFieldApi } from '../vite-plugin-case-fields.js';
+import { readBinaryBody, readJsonBody, sendJson } from './http.ts';
+import { WorkerUnavailableError } from './worker.ts';
+
+function wrap(handler) {
+  return async (ctx) => {
+    const parts = ctx.pathname.split('/').filter(Boolean);
+    try {
+      const handled = await handler(ctx.req, ctx.res, ctx.url, parts, {
+        sendJson,
+        readJsonBody,
+        readBinaryBody,
+      });
+      return handled !== false;
+    } catch (err) {
+      const status = err && err.status;
+      if (status === 400 || status === 403 || status === 404) {
+        sendJson(ctx.res, status, { error: (err && err.message) || 'request rejected' });
+        return true;
+      }
+      throw err;
+    }
+  };
+}
+
+/** The compute slot's holder, as the Queue chip shows it. */
+function computeQueueLive() {
+  const h = computeSlotHolder();
+  if (!h) return null;
+  if (h.kind === 'check') {
+    return { kind: 'check', phase: 'checking', name: 'Checking for jobs left running', stopping: false, project_id: null };
+  }
+  return {
+    kind: h.kind,
+    phase: h.phase,
+    name: h.name || null,
+    stopping: !!h.stop_requested,
+    project_id: h.project_id || null,
+    project_title: h.project_id ? projectTitleOf(h.project_id) : null,
+    run_id: h.run_id || null,
+    mesh_id: h.mesh_id || null,
+    mesh_name: h.mesh_name || null,
+    generate_id: h.generate_id || null,
+    path_kind: h.path_kind || null,
+    started_at: h.started_at || null,
+    job_id: h.job_id || null,
+    plugin: h.plugin || null,
+    study_id: h.study_id || null,
+    geometry_id: h.geometry_id || null,
+  };
+}
+
+function wireComputeQueue(api) {
+  configureComputeQueue({
+    isBusy: () => computeSlotHolder() !== null,
+    startFoam: (item) => startFoam(item),
+    startGeometry: (item) => startGeometryUpdate(item),
+    // A link recovery goes before every queued row (API 1.5).
+    runFirst: () => linkRunFirst(),
+    // One handler per event, by the row's kind: a geometry row is the link job's.
+    onLeave: (row, reason, error) =>
+      row && row.kind === 'geometry' ? onLinkQueueLeave(row, reason, error) : onQueueLeave(row, reason, error),
+    onChange: () => {
+      onQueueChange();
+      onLinkQueueChange();
+    },
+    holdsRow: (row) => holderIsRow(computeSlotHolder(), row),
+    meshIsGenerating: (meshId, projectId) => {
+      const snap = liveMeshJobSnapshot();
+      if (!snap || !meshId || String(snap.mesh_id || '') !== String(meshId)) return false;
+      return !projectId || String(snap.project_id || '') === String(projectId);
+    },
+    startMesh: (item) => {
+      const kicked = startMeshGenerate({
+        settings: item.settings || null,
+        projectId: item.project_id || null,
+        meshId: item.mesh_id || null,
+        onUpdate: (fields) => api.applyKickUpdate(fields),
+      });
+      if (kicked.ok) api.applyKickUpdate(kicked.bodyExtra);
+      return startResultFromEngine(kicked);
+    },
+    // A queued Start, or a queued Continue (F6: the row's settings.continue).
+    startSolve: async (item) => startResultFromEngine(await startQueuedSolve(item)),
+    live: computeQueueLive,
+  });
+}
+
+export function registerLiveRoutes(router, { worker, jobs, services }) {
+  // An old instance's release hook (a Vite re-import) is dropped until boot() installs this one's.
+  setSlotReleaseHook(null);
+  const api = getCaseFieldApi();
+
+  attachLiveMeshJobReader(liveMeshJobSnapshot);
+  attachActiveProjectListener(api.syncActiveCaseToActiveProject);
+  wireComputeQueue(api);
+  // Jobs a previous server left running hold the slot before the first request is served.
+  try {
+    void rediscoverAtBoot();
+  } catch (e) {
+    console.warn('[CFD] boot check failed', e);
+  }
+  // Once per process: link jobs left by the last server, and journals for the recovery.
+  linkBootOnce();
+  if (worker && typeof worker.on === 'function') {
+    worker.on('registry-changed', () => {
+      void refreshSolveHooks(worker);
+    });
+  }
+
+  router.get('/api/compute-queue', (ctx) => {
+    // No project: the whole queue (every project), with each row's position.
+    const project = ctx.url.searchParams.get('project_id') || ctx.url.searchParams.get('project') || undefined;
+    ctx.sendJson(200, snapshotComputeQueue(project));
+  });
+
+  router.post('/api/compute-queue', async (ctx) => {
+    let body;
+    try {
+      body = await ctx.readJsonBody();
+    } catch (e) {
+      ctx.sendJson(400, { error: 'invalid JSON body', detail: String(e) });
+      return;
+    }
+    const action = String(body.action || '');
+    if (action === 'merge') {
+      ctx.sendJson(200, mergeComputeQueueItems(body.items));
+      return;
+    }
+    if (action === 'drop-mesh') {
+      ctx.sendJson(200, dropComputeJobsForMesh(body.mesh_id, body.project_id));
+      return;
+    }
+    if (action === 'remove') {
+      ctx.sendJson(200, removeComputeJob(body.kind, body.id, body.project_id));
+      return;
+    }
+    const enqueued = enqueueComputeJob(body.item || body, {
+      setupIssue: body.setup_issue ? String(body.setup_issue) : '',
+      meshGenerating: !!body.mesh_generating,
+    });
+    if (!enqueued.ok) {
+      ctx.sendJson(400, { ok: false, error: enqueued.error, items: enqueued.items, live: computeQueueLive() });
+      return;
+    }
+    // Tabs kick after they enqueue, but a tab can close (or a job finish) in
+    // between; the queue must not sit idle with work in it.
+    scheduleComputeQueueKick(250);
+    ctx.sendJson(200, { ...snapshotComputeQueue(), item: enqueued.item });
+  });
+
+  router.add('PATCH', '/api/compute-queue', async (ctx) => {
+    let body;
+    try {
+      body = await ctx.readJsonBody();
+    } catch (e) {
+      ctx.sendJson(400, { error: 'invalid JSON body', detail: String(e) });
+      return;
+    }
+    const next = reorderComputeQueue(body.ids);
+    ctx.sendJson(next.ok === false ? 400 : 200, next);
+  });
+
+  router.add('DELETE', '/api/compute-queue/:id', (ctx) => {
+    ctx.sendJson(
+      200,
+      removeComputeJob(ctx.url.searchParams.get('kind'), ctx.params.id, ctx.url.searchParams.get('project_id')),
+    );
+  });
+
+  router.post('/api/compute-queue/kick', async (ctx) => {
+    const body = await ctx.readJsonBody().catch(() => ({}));
+    const project = String((body && (body.project_id || body.projectId)) || ctx.url.searchParams.get('project_id') || '');
+    ctx.sendJson(200, await kickComputeQueue(project));
+  });
+
+  router.get('/api/project/tree', async (ctx) => {
+    const id = String(ctx.url.searchParams.get('project_id') || '').trim();
+    if (!id) {
+      sendJson(ctx.res, 400, { error: 'project_id required' });
+      return;
+    }
+    try {
+      const doc = await worker.call('project.tree', { id });
+      // Plugin studies saved with an older schema: their plugin's service upgrades
+      // them in the background (the tree never waits for a plugin); the page reads
+      // the tree again while this says so.
+      if (services && doc && typeof doc === 'object') {
+        doc.plugin_studies_migrating = startStudyMigrations(worker, services, id, doc.plugin_studies);
+      }
+      ctx.sendJson(200, doc);
+    } catch (e) {
+      ctx.sendJson(500, { error: 'project tree failed', detail: String(e && e.message ? e.message : e) });
+    }
+  });
+
+  router.get('/api/project/hydrate', (ctx) =>
+    handleProjectHydrate(ctx.req, ctx.res, ctx.url, {
+      sendJson,
+      workerCall: (method, params) => worker.call(method, params),
+    }),
+  );
+
+  router.add(['GET', 'HEAD', 'POST'], '/api/prefs', wrap(handlePrefsApi));
+  router.add(['GET', 'HEAD', 'POST'], '/api/prefs/**rest', wrap(handlePrefsApi));
+
+  router.add(['GET', 'HEAD', 'POST'], '/api/media', wrap(handleW28Api));
+  router.add(['GET', 'HEAD', 'POST'], '/api/media/**rest', wrap(handleW28Api));
+
+  router.add(['GET', 'HEAD', 'POST'], '/api/simulation-control', wrap(handleW27Api));
+  router.add(['GET', 'HEAD', 'POST'], '/api/run', wrap(handleW27Api));
+  router.add(['GET', 'HEAD', 'POST'], '/api/run/**rest', wrap(handleW27Api));
+  router.add(['GET', 'HEAD', 'POST'], '/api/runs', wrap(handleW27Api));
+  router.add(['GET', 'HEAD', 'POST'], '/api/runs/**rest', wrap(handleW27Api));
+
+  // Read-only now; POST stays routed so the handler can say why it is refused.
+  router.add(['GET', 'HEAD', 'POST'], '/api/result-controls', wrap(handleResultControlsApi));
+  router.add(['GET', 'HEAD', 'POST'], '/api/area-average', wrap(handleResultControlsApi));
+
+  router.add(['GET', 'HEAD', 'POST'], '/api/mesh/refinements', wrap(handleW26Api));
+  router.add(['GET', 'HEAD', 'POST'], '/api/mesh-refinements', wrap(handleW26Api));
+
+  router.add(['GET', 'HEAD', 'POST'], '/api/bcs', wrap(handleW19Api));
+  router.add(['GET', 'HEAD', 'POST'], '/api/materials', wrap(handleW18Api));
+  router.add(['GET', 'HEAD', 'POST'], '/api/simulation', wrap(handleW17Api));
+  router.add(['GET', 'HEAD', 'POST'], '/api/simulation/**rest', wrap(handleW17Api));
+
+  router.add(['GET', 'HEAD', 'POST'], '/api/project', wrap(handleW16Api));
+  router.add(['GET', 'HEAD', 'POST'], '/api/project/**rest', wrap(handleW16Api));
+  router.add(['GET', 'HEAD'], '/api/projects', wrap(handleW16Api));
+  router.add(['GET', 'HEAD', 'POST'], '/api/folders', wrap(handleW16Api));
+  router.add(['GET', 'HEAD', 'POST'], '/api/geometry', wrap(handleW16Api));
+  // A linked geometry's lost faces (API 1.5), ahead of the catch-all below.
+  registerLostFaceRoutes(router, worker);
+  // An adopted geometry's original, imported again (API 1.7).
+  registerOriginalImportRoute(router, worker, importGeometry);
+  router.add(['GET', 'HEAD', 'POST'], '/api/geometry/**rest', wrap(handleW16Api));
+
+  router.post('/api/case/attach', async (ctx) => {
+    let body;
+    try {
+      body = await ctx.readJsonBody();
+    } catch (e) {
+      ctx.sendJson(400, { error: 'invalid JSON body', detail: String(e) });
+      return;
+    }
+    if (body.case !== undefined || body.path !== undefined) {
+      ctx.sendJson(400, { error: 'use case_dir' });
+      return;
+    }
+    const caseDir = body.case_dir || body.caseDir || '';
+    // A plugin study's case names its plugin and study (the router checked they go together).
+    const plugin = String(body.plugin || '');
+    const pluginStudyId = String(body.plugin_study_id || '');
+    const result = api.attachCaseDir(
+      caseDir,
+      body.project_id || body.projectId,
+      body.simulation_id || body.simulationId,
+      plugin && pluginStudyId ? { plugin, studyId: pluginStudyId } : null
+    );
+    ctx.res.setHeader('X-CFD-Source', 'case-attach');
+    if (result.ok && result.body && result.body.case_dir) {
+      ctx.res.setHeader('X-CFD-Case-Dir', result.body.case_dir);
+    }
+    ctx.sendJson(result.status, result.body);
+  });
+
+  router.get('/api/case', (ctx) => sendCaseStatus(ctx, api));
+  router.get('/api/case/status', (ctx) => sendCaseStatus(ctx, api));
+
+  router.post('/api/case/detach', async (ctx) => {
+    await ctx.readJsonBody().catch(() => ({}));
+    const active = api.caseSnapshot();
+    if (!caseDetachAllowed(active.case_dir, ctx.scope.projectId)) {
+      ctx.sendJson(200, { ...active, detach_skipped: 'attached case belongs to another project' });
+      return;
+    }
+    api.resetActiveCaseIdle('W15.1: detached; idle until next attach/kick. No fake progress.');
+    try {
+      await api.releaseVolume();
+    } catch {
+      /* worker may already be idle */
+    }
+    ctx.sendJson(200, api.caseSnapshot());
+  });
+
+  router.post('/api/mesh/generate', (ctx) => kickMesh(ctx, api, jobs));
+  router.post('/api/mesh/remesh', (ctx) => kickMesh(ctx, api, jobs));
+
+  router.add(['GET', 'HEAD', 'POST'], '/api/mesh', async (ctx) => {
+    if (/\/(generate|remesh|surface|section|refinements)(\/|$)/.test(ctx.pathname)) return false;
+    const parts = ctx.pathname.split('/').filter(Boolean);
+    const handled = await handleW20Api(ctx.req, ctx.res, ctx.url, parts, {
+      sendJson,
+      readJsonBody,
+      onGeneratedMeshDeleted({ deleted_runs }) {
+        const active = api.caseSnapshot().case_dir;
+        const removed = (deleted_runs || []).map((p) => resolve(p).toLowerCase());
+        if (active) {
+          const a = resolve(active).toLowerCase();
+          const hit = removed.some((p) => a === p || a.startsWith(`${p}\\`) || a.startsWith(`${p}/`));
+          if (hit || !existsSync(active)) api.resetActiveCaseIdle('Generated mesh deleted');
+        }
+        for (const p of deleted_runs || []) {
+          try {
+            const vtp = api.meshSurfaceCacheKey(p);
+            const meta = vtp.replace(/\.vtp$/i, '.meta.json');
+            if (existsSync(vtp)) rmSync(vtp, { force: true });
+            if (existsSync(meta)) rmSync(meta, { force: true });
+          } catch {
+            /* ignore */
+          }
+        }
+      },
+    });
+    return handled !== false;
+  });
+  router.add(['GET', 'HEAD', 'POST'], '/api/mesh/delete', wrap(handleW20Api));
+  // The mesh's Stop (Mesh panel, tree, the Assistant's jobs tool): ends its generate, deletes nothing.
+  router.post('/api/mesh/stop', async (ctx) => {
+    let body;
+    try {
+      body = await ctx.readJsonBody();
+    } catch (e) {
+      ctx.sendJson(400, { error: 'invalid JSON body', detail: String(e) });
+      return;
+    }
+    const result = await stopMeshRoute({ ...body, project_id: body.project_id || (ctx.scope && ctx.scope.projectId) || undefined });
+    ctx.sendJson(result.status, result.body);
+  });
+  router.add(['GET', 'HEAD', 'POST'], '/api/mesh/kick', wrap(handleW20Api));
+
+  router.get('/api/fields/:field/series-range', async (ctx) => {
+    const field = ctx.params.field;
+    if (!api.isFieldName(field)) {
+      ctx.sendJson(400, { error: 'unsupported field name' });
+      return;
+    }
+    const caseDir = api.resolveCaseDir(ctx.url);
+    if (!caseDir || !existsSync(caseDir)) {
+      ctx.sendJson(404, { error: 'case_dir not found', case: caseDir, empty: true });
+      return;
+    }
+    try {
+      const body = await api.ensureSeriesRange(caseDir, field);
+      ctx.sendJson(200, { ...body, proves_not_baked_only: true });
+    } catch (e) {
+      ctx.sendJson(500, { error: String(e && e.message ? e.message : e), empty: true });
+    }
+  });
+
+  router.add(['GET', 'POST'], '/api/volume/release', async (ctx) => {
+    try {
+      const body = await api.releaseVolume();
+      ctx.sendJson(200, body && typeof body === 'object' ? body : { ok: true, released: true });
+    } catch (err) {
+      if (err instanceof WorkerUnavailableError) {
+        ctx.sendJson(200, { ok: true, released: false, worker: false });
+        return;
+      }
+      ctx.sendJson(200, { ok: true, released: false, error: String(err && err.message ? err.message : err) });
+    }
+  });
+
+  router.get('/api/volume/warmup', async (ctx) => {
+    const caseDir = api.resolveCaseDir(ctx.url);
+    const time = ctx.url.searchParams.get('time') || api.DEFAULT_TIME;
+    if (!caseDir || !existsSync(caseDir)) {
+      ctx.sendJson(404, { error: 'case_dir not found', case: caseDir, empty: true });
+      return;
+    }
+    try {
+      const body = await api.warmVolume(caseDir, time);
+      ctx.sendJson(200, body && typeof body === 'object' ? body : { ok: true, case_dir: caseDir, time: String(time) });
+    } catch (err) {
+      if (err instanceof WorkerUnavailableError) {
+        ctx.sendJson(503, { error: err.message, ok: false });
+        return;
+      }
+      const status = err && err.status === 503 ? 503 : 500;
+      ctx.sendJson(status, { error: String(err && err.message ? err.message : err), ok: false });
+    }
+  });
+
+  router.get('/api/times', (ctx) => {
+    const caseDir = api.resolveCaseDir(ctx.url);
+    if (!caseDir || !existsSync(caseDir)) {
+      ctx.sendJson(404, { error: 'case_dir not found', case: caseDir, times: [], empty: true });
+      return;
+    }
+    const times = api.listCaseTimes(caseDir);
+    const last = times.length ? times[times.length - 1] : null;
+    ctx.res.setHeader('X-CFD-Source', 'case-tree-times');
+    ctx.res.setHeader('X-CFD-Case-Dir', caseDir);
+    ctx.sendJson(200, {
+      increment: 'W12',
+      case_dir: caseDir,
+      times,
+      n_times: times.length,
+      // What the last saved time can colour by and the sidecar's result_fields
+      // (null when it lists none), so results list the right fields before the
+      // first field loads.
+      fields_available: last != null ? api.caseShownFields(caseDir, last) : [],
+      result_fields: api.caseResultFieldRows(caseDir),
+      // A multi-region case's regions ({name, role}, host API 1.8): the region filter.
+      ...(api.caseRegions(caseDir).length ? { regions: api.caseRegions(caseDir) } : {}),
+      start: times.length ? times[0] : null,
+      end: times.length ? times[times.length - 1] : null,
+      proves_not_baked_only: true,
+      no_invented_frames: true,
+    });
+  });
+
+  router.get('/api/particle-trace/faces', (ctx) => {
+    const caseDir = api.resolveCaseDir(ctx.url);
+    ctx.sendJson(200, {
+      increment: 'W14',
+      case_dir: caseDir,
+      face_source_doc:
+        'Inlet/outlet openings for highlight. Any CAD face can be selected; walls seed from the CAD surface in mesh metres.',
+      faces: api.listCaseSeedFaces(caseDir),
+    });
+  });
+
+  const serveLegacyFilter = async (ctx, key) => {
+    const caseDir = api.resolveCaseDir(ctx.url);
+    const time = ctx.url.searchParams.get('time') || api.DEFAULT_TIME;
+    const wantMeta =
+      ctx.pathname.endsWith('/meta') || ctx.url.searchParams.get('meta') === '1' || ctx.method === 'HEAD';
+    if (!caseDir || !existsSync(caseDir)) {
+      ctx.sendJson(404, {
+        error: 'case_dir not found',
+        case: caseDir,
+        case_dir: caseDir,
+        empty: true,
+      });
+      return;
+    }
+
+    const sendVtp = (buf, name, headers) => {
+      ctx.res.statusCode = 200;
+      for (const [k, v] of Object.entries(headers || {})) ctx.res.setHeader(k, v);
+      ctx.res.setHeader('Content-Type', 'application/octet-stream');
+      ctx.res.setHeader('Content-Length', String(buf.length));
+      ctx.res.setHeader('Content-Disposition', `inline; filename="${name}"`);
+      ctx.res.setHeader('Cache-Control', 'no-store');
+      if (ctx.method === 'HEAD') {
+        ctx.res.end();
+        return;
+      }
+      ctx.res.end(buf);
+    };
+
+    if (key === 'fields') {
+      const field = ctx.url.searchParams.get('field') || ctx.params.field;
+      if (!api.isFieldName(field)) {
+        ctx.sendJson(400, { error: 'unsupported field name' });
+        return;
+      }
+      const foamPath = api.foamFieldPath(caseDir, time, field);
+      if (!existsSync(foamPath)) {
+        ctx.sendJson(404, {
+          error: 'time_not_found',
+          case: caseDir,
+          time: String(time),
+          field,
+          empty: true,
+          available_times: api.listCaseTimes(caseDir),
+          proves_not_baked_only: true,
+        });
+        return;
+      }
+      const exported = await api.ensureExported(caseDir, time, field);
+      const metaObj = JSON.parse(readFileSync(exported.meta, 'utf8'));
+      ctx.res.setHeader('X-CFD-Source', 'case-tree');
+      ctx.res.setHeader('X-CFD-Cache', exported.from_cache ? 'hit' : 'miss');
+      if (wantMeta) {
+        ctx.sendJson(200, { ...metaObj, from_cache: exported.from_cache, proves_not_baked_only: true });
+        return;
+      }
+      sendVtp(readFileSync(exported.vtp), `${field}.vtp`);
+      return;
+    }
+
+    if (key === 'cut_plane') {
+      const p = api.cutParamsFromUrl(ctx.url);
+      const exported = await api.ensureCutPlane(caseDir, time, p);
+      const metaObj = JSON.parse(readFileSync(exported.meta, 'utf8'));
+      if (wantMeta) {
+        ctx.sendJson(200, { ...metaObj, from_cache: exported.from_cache });
+        return;
+      }
+      sendVtp(readFileSync(exported.vtp), 'cut_plane.vtp');
+      return;
+    }
+    if (key === 'iso_surface') {
+      const p = api.isoParamsFromUrl(ctx.url);
+      const exported = await api.ensureIsoSurface(caseDir, time, p);
+      const metaObj = JSON.parse(readFileSync(exported.meta, 'utf8'));
+      if (wantMeta) {
+        ctx.sendJson(200, { ...metaObj, from_cache: exported.from_cache, proves_not_baked_only: true });
+        return;
+      }
+      sendVtp(readFileSync(exported.vtp), 'iso_surface.vtp');
+      return;
+    }
+    if (key === 'iso_volume') {
+      const p = api.isoVolParamsFromUrl(ctx.url);
+      const exported = await api.ensureIsoVolume(caseDir, time, p);
+      const metaObj = JSON.parse(readFileSync(exported.meta, 'utf8'));
+      if (wantMeta) {
+        ctx.sendJson(200, { ...metaObj, from_cache: exported.from_cache, proves_not_baked_only: true });
+        return;
+      }
+      sendVtp(readFileSync(exported.vtp), 'iso_volume.vtp');
+      return;
+    }
+    if (key === 'plot_over_path') {
+      const p = api.popParamsFromUrl(ctx.url);
+      const exported = await api.ensurePlotOverPath(caseDir, time, p);
+      const metaObj = JSON.parse(readFileSync(exported.meta, 'utf8'));
+      ctx.sendJson(200, { ...metaObj, from_cache: exported.from_cache, proves_not_baked_only: true });
+      return;
+    }
+    if (key === 'particle_trace') {
+      const p = api.ptParamsFromUrl(ctx.url);
+      const exported = await api.ensureParticleTrace(caseDir, time, p);
+      const metaObj = JSON.parse(readFileSync(exported.meta, 'utf8'));
+      if (wantMeta) {
+        ctx.sendJson(200, { ...metaObj, from_cache: exported.from_cache, proves_not_baked_only: true });
+        return;
+      }
+      sendVtp(readFileSync(exported.vtp), 'particle_trace.vtp');
+      return;
+    }
+    if (key === 'inspect') {
+      const p = api.inspectParamsFromUrl(ctx.url);
+      if (![p.x, p.y, p.z].every((v) => Number.isFinite(v))) {
+        ctx.sendJson(400, { error: 'x,y,z required as finite numbers', empty: true, hit: false });
+        return;
+      }
+      const exported = await api.ensureInspect(caseDir, time, p);
+      const metaObj = JSON.parse(readFileSync(exported.meta, 'utf8'));
+      ctx.sendJson(200, { ...metaObj, from_cache: exported.from_cache, proves_not_baked_only: true });
+      return;
+    }
+    if (key === 'mesh_surface') {
+      const ensured = await api.ensureMeshSurface(caseDir);
+      if (!ensured.ok) {
+        ctx.sendJson(500, { error: 'mesh-surface failed', detail: ensured });
+        return;
+      }
+      if (wantMeta) {
+        ctx.sendJson(200, { ok: true, increment: 'W27', case_dir: caseDir, meta: ensured.meta, cached: !!ensured.cached });
+        return;
+      }
+      sendVtp(readFileSync(ensured.path), 'mesh-surface.vtp');
+      return;
+    }
+    if (key === 'mesh_section') {
+      const axis = (ctx.url.searchParams.get('axis') || 'x').toLowerCase();
+      const frac = Number(ctx.url.searchParams.get('frac') || '0.5');
+      const ensured = await api.ensureMeshSection(caseDir, axis, Number.isFinite(frac) ? frac : 0.5);
+      if (!ensured.ok) {
+        ctx.sendJson(500, { error: 'mesh-section failed', detail: ensured });
+        return;
+      }
+      if (wantMeta) {
+        ctx.sendJson(200, { ok: true, increment: 'W25b', case_dir: caseDir, axis, frac, meta: ensured.meta, cached: !!ensured.cached });
+        return;
+      }
+      sendVtp(readFileSync(ensured.path), 'mesh-section.vtp');
+      return;
+    }
+    ctx.sendJson(404, { error: 'unknown filter', key });
+  };
+
+  return {
+    serveLegacyFilter,
+    caseSnapshot: () => api.caseSnapshot(),
+    attachCaseDir: (dir, pid) => api.attachCaseDir(dir, pid),
+    resetCaseIdle: (note) => api.resetActiveCaseIdle(note),
+    startMeshJob(params, job) {
+      const kicked = startMeshGenerate({
+        settings: params.settings || null,
+        projectId: params.project_id || params.projectId || null,
+        meshId: params.mesh_id || params.id || null,
+        onUpdate: (fields) => {
+          api.applyKickUpdate(fields);
+          if (fields && (fields.stage || fields.status)) {
+            jobs.pushEvent(job.id, {
+              event: 'progress',
+              stage: fields.stage || null,
+              stage_detail: fields.stage_detail || null,
+              status: fields.status || null,
+            });
+          }
+          if (fields && fields.status === 'done') jobs.finish(job.id, 'done', api.caseSnapshot());
+          if (fields && (fields.status === 'failed' || fields.status === 'stopped')) {
+            jobs.finish(job.id, fields.status, fields, fields.error || 'mesh failed');
+          }
+        },
+      });
+      if (!kicked.ok) {
+        jobs.finish(job.id, 'failed', kicked.bodyExtra, (kicked.bodyExtra && kicked.bodyExtra.error) || 'mesh failed');
+        return;
+      }
+      api.applyKickUpdate(kicked.bodyExtra);
+      const snap = api.caseSnapshot();
+      // The generator is w21's: Stop ends it there (a plain {pid} would kill nothing).
+      const meshId = params.mesh_id || params.id || null;
+      const projectId = params.project_id || params.projectId || null;
+      jobs.attachChild(job.id, { pid: snap.pid }, { stop: () => stopMeshGenerate({ meshId, projectId }) });
+      job.result = snap;
+    },
+    async startSolveJob(params, job) {
+      let started;
+      try {
+        started = await startSolve({
+          projectId: params.project_id || params.projectId,
+          endTime: params.endTime || params.end_time,
+          writeInterval: params.writeInterval || params.write_interval,
+          runId: params.runId || params.run_id,
+          transient: params.transient,
+          onDone: (result) => {
+            const status = result && result.status === 'done' ? 'done' : result && result.status === 'stopped' ? 'stopped' : 'failed';
+            jobs.finish(job.id, status, result, result && result.error);
+          },
+        });
+      } catch (e) {
+        jobs.finish(job.id, 'failed', null, e instanceof Error ? e.message : String(e));
+        return;
+      }
+      if (!started.ok) {
+        jobs.finish(job.id, 'failed', started.bodyExtra, (started.bodyExtra && started.bodyExtra.error) || 'solve failed');
+        return;
+      }
+      jobs.attachChild(job.id, { pid: started.bodyExtra && started.bodyExtra.pid });
+      job.result = started.bodyExtra || started;
+    },
+    startCadImportJob(params, job) {
+      importGeometry(params)
+        .then((result) => {
+          if (!result.ok) jobs.finish(job.id, 'failed', result.body, (result.body && result.body.error) || 'import failed');
+          else jobs.finish(job.id, 'done', result.body);
+        })
+        .catch((err) => jobs.finish(job.id, 'failed', null, String(err)));
+    },
+    boot() {
+      // Reap first: a generator the last server left behind is then gone, and
+      // hydrate marks its record interrupted instead of following it.
+      try {
+        reapOrphanMeshGeneratorsOnBoot();
+      } catch {
+        /* ignore */
+      }
+      api.hydrateActiveMeshCase();
+      // From now on every release of the compute slot moves the queue on.
+      setSlotReleaseHook(() => scheduleComputeQueueKick(250));
+      // First links queued when the last server stopped start now that plugins are known.
+      try {
+        resumeQueuedCreates();
+      } catch (e) {
+        console.warn('[CFD link] queued creates could not resume', e);
+      }
+      void refreshSolveHooks(worker);
+      try {
+        scheduleComputeQueueKick(400);
+      } catch {
+        /* ignore */
+      }
+      // Failed or interrupted runs leave their WSL copy behind; sweep those later.
+      try {
+        scheduleWslPrune();
+      } catch {
+        /* ignore */
+      }
+    },
+  };
+}
+
+function sendCaseStatus(ctx, api) {
+  const pid = api.requestProjectId(ctx.url);
+  const snap = api.caseSnapshot();
+  if (pid && snap.case_dir && !caseDirBelongsToProject(snap.case_dir, pid)) {
+    ctx.sendJson(200, {
+      ok: true,
+      case_dir: null,
+      status: 'idle',
+      mode: 'idle',
+      project_id: pid,
+      n_times: 0,
+      times: [],
+      note: 'idle — attached case belongs to another project',
+      pid: null,
+    });
+    return;
+  }
+  ctx.res.setHeader('X-CFD-Source', 'case-status');
+  if (snap.case_dir) ctx.res.setHeader('X-CFD-Case-Dir', snap.case_dir);
+  ctx.res.setHeader('X-CFD-Case-Status', snap.status);
+  ctx.sendJson(200, snap);
+}
+
+async function kickMesh(ctx, api, jobs) {
+  let body;
+  try {
+    body = await ctx.readJsonBody();
+  } catch (e) {
+    ctx.sendJson(400, { error: 'invalid JSON body', detail: String(e) });
+    return;
+  }
+  const projectId = body.project_id || (ctx.scope && ctx.scope.projectId) || null;
+  const simulationId = body.simulation_id || (ctx.scope && ctx.scope.simulationId) || null;
+  const queued = body.queue_if_busy
+    ? enqueueMeshWhenBusy(
+        {
+          mesh_id: body.mesh_id || body.id || null,
+          project_id: projectId,
+          simulation_id: simulationId,
+          name: body.name || null,
+          settings: body.settings || null,
+        },
+        computeQueueLive(),
+      )
+    : null;
+  if (queued) {
+    ctx.sendJson(queued.status, queued.body);
+    return;
+  }
+  let job = null;
+  if (jobs && projectId && simulationId) {
+    try {
+      job = jobs.create(
+        'mesh',
+        {
+          project_id: projectId,
+          simulation_id: simulationId,
+          mesh_id: body.mesh_id || body.id || null,
+          geometry_id: body.geometry_id || (ctx.scope && ctx.scope.geometryId) || null,
+        },
+        projectId,
+        { scope: 'study' },
+      );
+    } catch {
+      job = null;
+    }
+  }
+  let settled = false;
+  const kicked = startMeshGenerate({
+    settings: body.settings || null,
+    projectId: projectId,
+    meshId: body.mesh_id || body.id || null,
+    onUpdate: (fields) => {
+      api.applyKickUpdate(fields);
+      if (!job || !jobs || !fields) return;
+      if (fields.stage || fields.status) {
+        jobs.pushEvent(job.id, {
+          event: 'progress',
+          stage: fields.stage || null,
+          stage_detail: fields.stage_detail || null,
+          status: fields.status || null,
+        });
+      }
+      if (settled) return;
+      if (fields.status === 'done') {
+        settled = true;
+        jobs.finish(job.id, 'done', fields);
+      } else if (fields.status === 'failed' || fields.status === 'stopped') {
+        settled = true;
+        jobs.finish(job.id, fields.status, fields, fields.error || 'mesh failed');
+      }
+    },
+  });
+  if (!kicked.ok) {
+    if (job && jobs && !settled) {
+      settled = true;
+      jobs.finish(job.id, 'failed', kicked.bodyExtra, (kicked.bodyExtra && kicked.bodyExtra.error) || 'mesh failed');
+    }
+    ctx.sendJson(kicked.status, { ...api.caseSnapshot(), ...(kicked.bodyExtra || {}), ok: false, increment: 'W23', job_id: job && job.id });
+    return;
+  }
+  api.applyKickUpdate(kicked.bodyExtra);
+  if (job && jobs) {
+    const pid = kicked.bodyExtra && kicked.bodyExtra.pid;
+    const meshId = body.mesh_id || body.id || null;
+    // POST /api/jobs/:id/stop ends the generator through w21, as the mesh's own Stop does.
+    jobs.attachChild(job.id, { pid: pid || null }, { stop: () => stopMeshGenerate({ meshId, projectId }) });
+  }
+  const snap = api.caseSnapshot();
+  ctx.res.setHeader('X-CFD-Source', 'mesh-generate');
+  ctx.sendJson(kicked.status, {
+    ...snap,
+    ok: true,
+    increment: 'W23',
+    mtp1_silent_copy: false,
+    job_id: job && job.id,
+  });
+}

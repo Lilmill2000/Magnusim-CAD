@@ -1,0 +1,744 @@
+import { safeProjectPath } from './safe-path.js';
+import { projectIdOrActive } from './request-scope.js';
+/**
+ * W18 — Materials → Air + Body1 assign (filesystem persistence).
+ * Persists projects/<id>/materials.json via POST/GET /api/materials.
+ * Bank path: Materials + → Air (Newtonian) → assign Body1 → ✓ save.
+ * NO BCs / mesh form / solves in this slice.
+ */
+import { randomBytes } from 'node:crypto';
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { activeGeometryId, matchesGeometry, matchesStudy, primaryGeometryId, studyScopedGeometryId } from './w16-geometry-scope.js';
+import { firstLegacySimId, getActiveSimulation, liveStudyRows, writeActiveMirror } from './w17-sim-catalog.js';
+import { assembleAllMaterials, deleteOneMaterial, persistOneMaterial, readStudyJson, studyFilePath } from './study-io.js';
+import { fileURLToPath } from 'node:url';
+import { envGet } from './env-compat.js';
+import { commitRpc } from './py-json.js';
+import { checkRecordSave, stampRefusalOf } from './link-stamp.js';
+import { linkTestHook } from './server/link-job.js';
+import { materialModel, materialPreset, materialPresetOf } from './registry-defaults.js';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const ROOT = resolve(__dirname, '..');
+const _projectsRoot = envGet('PROJECTS_ROOT');
+const PROJECTS_ROOT = _projectsRoot ? resolve(_projectsRoot) : join(ROOT, 'projects');
+const ACTIVE_PATH = join(PROJECTS_ROOT, 'active.json');
+
+/**
+ * The Air record W18 wrote before fluid presets came from the analysis's
+ * material model. Frozen: an older project's Air without numbers reads these,
+ * so it solves as it always did. A new material is seeded from the model's
+ * presets (materialPreset).
+ */
+export const W18_LEGACY_AIR = Object.freeze({
+  name: 'Air',
+  type: 'Newtonian',
+  viscosity_model: 'Newtonian',
+  kinematic_viscosity: 1.529e-5,
+  kinematic_viscosity_unit: 'm2/s',
+  density: 1.196,
+  density_unit: 'kg/m3',
+  library: 'DEFAULT',
+});
+
+function readActiveId() {
+  if (!existsSync(ACTIVE_PATH)) return null;
+  try {
+    const j = JSON.parse(readFileSync(ACTIVE_PATH, 'utf8'));
+    return j.project_id || null;
+  } catch {
+    return null;
+  }
+}
+
+function projectDir(id) {
+  return safeProjectPath(PROJECTS_ROOT, id);
+}
+
+function projectJsonPath(id) {
+  return join(projectDir(id), 'project.json');
+}
+
+function materialsJsonPath(id, simId) {
+  return studyFilePath(id, simId, 'materials');
+}
+
+function simulationJsonPath(id) {
+  return join(projectDir(id), 'simulation.json');
+}
+
+function readProject(id) {
+  const p = projectJsonPath(id);
+  if (!existsSync(p)) return null;
+  return JSON.parse(readFileSync(p, 'utf8'));
+}
+
+function writeProject(proj) {
+  // Phase 1 Step 9: materials stamps go through project_cli set-materials (Python).
+  // Keep no-op so callers do not dual-write project.json from Node.
+  return proj;
+}
+
+const MATERIALS_MAX_BYTES = 256 * 1024;
+
+function stripMaterialNotes(doc) {
+  if (!doc || typeof doc !== 'object') return doc;
+  const next = { ...doc };
+  delete next.note;
+  if (next.air && typeof next.air === 'object') {
+    next.air = { ...next.air };
+    delete next.air.note;
+  }
+  if (Array.isArray(next.materials)) {
+    next.materials = next.materials.map((m) => {
+      if (!m || typeof m !== 'object') return m;
+      const row = { ...m };
+      delete row.note;
+      return row;
+    });
+  }
+  return next;
+}
+
+/** An older project's Air (project.json materials.air), as W18 first wrote it. */
+export function airFromProject(id) {
+  const proj = readProject(id);
+  const sim = getActiveSimulation(id, proj);
+  const ref = proj && proj.materials && proj.materials.air;
+  const air = {
+    id: (ref && ref.id) || `mat-${String(id).slice(-8)}`,
+    name: W18_LEGACY_AIR.name,
+    type: W18_LEGACY_AIR.type,
+    viscosity_model: W18_LEGACY_AIR.viscosity_model,
+    kinematic_viscosity: W18_LEGACY_AIR.kinematic_viscosity,
+    kinematic_viscosity_unit: W18_LEGACY_AIR.kinematic_viscosity_unit,
+    density: W18_LEGACY_AIR.density,
+    density_unit: W18_LEGACY_AIR.density_unit,
+    library: W18_LEGACY_AIR.library,
+    assigned_volumes: (ref && ref.assigned_volumes) || ['Body1'],
+    assigned_volume: ((ref && ref.assigned_volumes) || ['Body1'])[0] || 'Body1',
+    saved: true,
+    checkmark_saved: true,
+    persistence: 'filesystem',
+    increment: 'W18',
+    project_id: id,
+    simulation_id: (sim && sim.id) || null,
+    geometry_id: (sim && sim.geometry_id) || (proj && proj.active_geometry_id) || null,
+  };
+  return {
+    project_id: id,
+    simulation_id: air.simulation_id,
+    materials: [air],
+    air,
+    updated_at: new Date().toISOString(),
+    persistence: 'filesystem',
+    increment: 'W18',
+  };
+}
+
+/**
+ * The name of a material model's default fluid (its default preset); the
+ * frozen W18_LEGACY_AIR's when no material model is registered.
+ * @param {unknown} [modelKey]
+ */
+export function defaultFluidName(modelKey) {
+  const preset = materialPreset(modelKey || '', '');
+  return String((preset && preset.name) || W18_LEGACY_AIR.name);
+}
+
+/**
+ * The study's one fluid (a preset or custom): assigned first, else one named
+ * as its model's default fluid (an older study's), else the first.
+ */
+export function studyFluid(list) {
+  const rows = (Array.isArray(list) ? list : []).filter(Boolean);
+  const assigned = (m) => (Array.isArray(m.assigned_volumes) && m.assigned_volumes.length > 0) || !!m.assigned_volume;
+  return (
+    rows.find(assigned) || rows.find((m) => m.name === defaultFluidName(m.material_model)) || rows[0] || null
+  );
+}
+
+/**
+ * X-CFD-Material-Name for a saved material: its name; percent-encoded when it
+ * is not plain printable ASCII (a header cannot carry it as is).
+ * @param {{ name?: unknown, material_model?: unknown } | null | undefined} material
+ */
+export function materialHeaderName(material) {
+  const name = String((material && material.name) || defaultFluidName(material && material.material_model));
+  // Printable ASCII is space through tilde.
+  return /^[ -~]*$/.test(name) ? name : encodeURIComponent(name);
+}
+
+function readMaterialsFile(id, simId) {
+  if (!simId) return null;
+  const fromStudy = readStudyJson(id, simId, 'materials');
+  return fromStudy ? stripMaterialNotes(fromStudy) : null;
+}
+
+/**
+ * Write the material records, then materials.set (the aggregate and project.json).
+ * `geometryRev` is the rev the save's stamp check passed with on a linked geometry
+ * (host API 1.5): the records are stamped with it and Python checks it again. A
+ * refusal from that check is the answer to send (`{refusal}`); other errors keep
+ * today's handling (the folders are already written).
+ */
+async function writeMaterialsFile(id, doc, simId, only, geometryRev) {
+  const slim = stripMaterialNotes(doc);
+  const recs = only
+    ? (Array.isArray(only) ? only : [only]).filter(Boolean)
+    : (slim && slim.materials) || [];
+  for (const rec of recs) {
+    if (rec && rec.id) persistOneMaterial(id, simId, rec, { geometryRev });
+  }
+  await linkTestHook('beforeCommitRpc', { projectId: id, simId });
+  try {
+    await commitRpc('materials.set', {
+      project_dir: projectDir(id),
+      sim_id: String(simId || ''),
+      body: { ...slim, materials: recs, air: recs[0] || slim.air, only_id: recs[0] && recs[0].id },
+      ...(geometryRev != null ? { geometry_rev: geometryRev } : {}),
+    });
+  } catch (e) {
+    const refusal = stampRefusalOf(e);
+    if (refusal) return { refusal };
+    /* folders already written */
+  }
+  return { path: materialsJsonPath(id, simId) };
+}
+
+function readSimulationFile(id) {
+  const p = simulationJsonPath(id);
+  if (!existsSync(p)) return null;
+  try {
+    return JSON.parse(readFileSync(p, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function newMaterialId() {
+  return `mat-${Date.now().toString(36)}-${randomBytes(3).toString('hex')}`;
+}
+
+function normalizeAssignedVolumes(raw) {
+  if (!raw) return [];
+  const list = Array.isArray(raw) ? raw : [raw];
+  return list
+    .map((v) => String(v || '').trim())
+    .filter(Boolean);
+}
+
+function fluidNumber(raw, fallback) {
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+/** The record keys that may hold a model property, the first preferred. */
+function recordKeysOf(model, field) {
+  const keys = model && model.record_keys && model.record_keys[field];
+  return Array.isArray(keys) && keys.length ? keys.map(String) : [field];
+}
+
+/**
+ * A property whose schema gives no minimum takes any finite number, 0 and below too
+ * (host API 1.8: a solid's heat source); one with a minimum must be above 0.
+ */
+function takesAnyNumber(model, field) {
+  const props = (model && model.schema && model.schema.properties) || {};
+  const prop = Object.prototype.hasOwnProperty.call(props, field) ? props[field] : null;
+  return !!prop && typeof prop.minimum !== 'number';
+}
+
+/** A number, or text that is one (not blank text, a list or a boolean); else `fallback`. */
+function anyNumber(raw, fallback) {
+  if (typeof raw === 'number') return Number.isFinite(raw) ? raw : fallback;
+  if (typeof raw !== 'string' || !raw.trim()) return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+/** A saved record's value of a model property (any of its record keys), or undefined. */
+function savedNumber(model, rec, field) {
+  if (!rec) return undefined;
+  const read = takesAnyNumber(model, field) ? anyNumber : fluidNumber;
+  for (const k of recordKeysOf(model, field).concat(field)) {
+    const n = read(rec[k], undefined);
+    if (n !== undefined) return n;
+  }
+  return undefined;
+}
+
+/**
+ * A study's fluid from a POST body. The body names a preset by key, library
+ * code or fluid name (blank keeps the saved one's, else the default preset);
+ * any other name is a custom fluid. Values come from the body, else the saved
+ * record of the same preset, else the preset: a new material gets the
+ * preset's values, while a saved one that lacks a number reads what older
+ * versions filled in (the preset's legacy_values), so it solves as before.
+ */
+export function buildAirMaterial(body, existing) {
+  const model = materialModel((body && body.material_model) || (existing && existing.material_model) || '');
+  if (!model) {
+    return {
+      ok: false,
+      status: 503,
+      body: { error: 'No material model is registered: the analysis plugin is off or did not load.', soft_pass: false },
+    };
+  }
+  const asked = String(body.preset || body.name || body.material || '').trim();
+  const before = existing ? materialPresetOf(model.key, existing) : null;
+  const preset = asked ? materialPreset(model.key, asked) : before || materialPreset(model.key, '');
+  const custom = String(model.custom_preset || 'custom');
+  const isCustom = !preset || preset.key === custom;
+  const ownName = String(body.name || body.material || '').trim();
+  const name = isCustom
+    ? ownName || (before && before.key === custom ? String(existing.name || '') : '') || String((preset && preset.name) || '')
+    : String(preset.name);
+  const assigned = normalizeAssignedVolumes(
+    body.assigned_volumes || body.volumes || body.assign || body.body
+  );
+  const kept = assigned.length ? assigned : normalizeAssignedVolumes(existing && existing.assigned_volumes);
+  if (!kept.length && !existing) {
+    return {
+      ok: false,
+      status: 400,
+      body: {
+        error: 'Assign a body from the viewport before Apply',
+        got: assigned,
+        soft_pass: false,
+      },
+    };
+  }
+  const now = new Date().toISOString();
+  const id = (existing && existing.id) || body.id || newMaterialId();
+  const presetValues = (preset && preset.values) || {};
+  const legacyValues = { ...presetValues, ...((preset && preset.legacy_values) || {}) };
+  const samePreset = !!existing && !!before && !!preset && before.key === preset.key;
+  /** @type {Record<string, unknown>} */
+  const values = {};
+  const fields = new Set([
+    ...Object.keys((model.schema && model.schema.properties) || {}),
+    ...Object.keys(model.record_keys || {}),
+    ...Object.keys(presetValues),
+  ]);
+  for (const field of fields) {
+    const given = savedNumber(model, body, field);
+    // A value the new preset does not define (a solid's heat source) stays when the preset
+    // changes; one it defines is the preset's.
+    const presetHas = Object.prototype.hasOwnProperty.call(presetValues, field);
+    const saved = samePreset || !presetHas ? savedNumber(model, existing, field) : undefined;
+    const fill = samePreset ? legacyValues[field] : presetValues[field];
+    const v = given ?? saved ?? (takesAnyNumber(model, field) ? anyNumber : fluidNumber)(fill, undefined);
+    if (v === undefined) continue;
+    for (const k of recordKeysOf(model, field)) values[k] = v;
+  }
+  const material = {
+    id,
+    name,
+    ...(model.record_constants || {}),
+    ...values,
+    library: String((preset && (preset.library || (preset.codes || [])[0])) || ''),
+    material_model: String(model.key),
+    preset: String((preset && preset.key) || custom),
+    assigned_volumes: kept,
+    assigned_volume: kept[0],
+    saved: true,
+    checkmark_saved: true,
+    created_at: (existing && existing.created_at) || now,
+    updated_at: now,
+    persistence: 'filesystem',
+    materials_json: null,
+    soft_pass_avoided: true,
+    increment: 'W18',
+  };
+  return { ok: true, material };
+}
+
+async function upsertMaterials(body) {
+  const projectId = (body && body.project_id) || projectIdOrActive('', readActiveId);
+  if (!projectId) {
+    return {
+      ok: false,
+      status: 400,
+      body: { error: 'no active project; create project first', soft_pass: false },
+    };
+  }
+  const proj = readProject(projectId);
+  if (!proj) {
+    return {
+      ok: false,
+      status: 404,
+      body: { error: 'project not found', project_id: projectId },
+    };
+  }
+  const sim = getActiveSimulation(projectId, proj, body && body.simulation_id);
+  if (!sim) {
+    return {
+      ok: false,
+      status: 400,
+      body: {
+        error: 'no simulation; create a simulation first',
+        soft_pass: false,
+      },
+    };
+  }
+
+  // A linked geometry's stamp check (host API 1.5): nothing is written on a refusal.
+  const stamp = checkRecordSave(projectDir(projectId), sim.id, [body || {}], body && body.geometry_rev);
+  if (!stamp.ok) return stamp;
+
+  const existingDoc = readMaterialsFile(projectId, sim.id);
+  const geomId = studyScopedGeometryId(proj, sim, body && body.geometry_id);
+  const primaryId = primaryGeometryId(proj);
+  const allMats = (existingDoc && Array.isArray(existingDoc.materials) && existingDoc.materials) || [];
+  const legacyId = firstLegacySimId(projectId, proj);
+  const onStudy = (m) =>
+    m && matchesGeometry(m, geomId, primaryId) && matchesStudy(m, sim.id, legacyId);
+  const existingAir =
+    (body && body.id && allMats.find((m) => m && m.id === body.id && onStudy(m))) ||
+    allMats.find(onStudy) ||
+    null;
+
+  const built = buildAirMaterial(body || {}, existingAir || null);
+  if (!built.ok) return built;
+
+  const materialsPath = materialsJsonPath(projectId, sim.id);
+  built.material.materials_json = materialsPath;
+  built.material.project_id = projectId;
+  built.material.simulation_id = sim.id;
+  if (geomId) built.material.geometry_id = geomId;
+
+  const mine = allMats.filter((m) => m && matchesStudy(m, sim.id, legacyId));
+  const materials = mine.filter((m) => m && m.id !== built.material.id).concat([built.material]);
+
+  const doc = {
+    project_id: projectId,
+    simulation_id: sim.id,
+    materials,
+    air: built.material,
+    updated_at: built.material.updated_at,
+    persistence: 'filesystem',
+    materials_json: materialsPath,
+    soft_pass_avoided: true,
+    increment: 'W18',
+    out_of_scope: {
+      boundary_conditions: false,
+      mesh_form: false,
+      solves: false,
+    },
+  };
+
+  const wrote = await writeMaterialsFile(projectId, doc, sim.id, [built.material], stamp.rev);
+  if (wrote.refusal) return wrote.refusal;
+  // set_materials already stamps project.json.
+
+  proj.materials = {
+    air: {
+      id: built.material.id,
+      name: built.material.name,
+      viscosity_model: 'Newtonian',
+      kinematic_viscosity: built.material.kinematic_viscosity,
+      density: built.material.density,
+      assigned_volumes: built.material.assigned_volumes,
+      materials_json: materialsPath,
+      updated_at: built.material.updated_at,
+    },
+    materials_json: materialsPath,
+      count: materials.length,
+  };
+  proj.updated_at = built.material.updated_at;
+  proj.increment = 'W18';
+  writeProject(proj);
+
+  // Also stamp simulation.json with materials ref (without inventing BCs/mesh)
+  try {
+    const simDoc = { ...sim };
+    simDoc.materials = {
+      air: {
+        id: built.material.id,
+        name: built.material.name,
+        kinematic_viscosity: built.material.kinematic_viscosity,
+        density: built.material.density,
+        assigned_volumes: built.material.assigned_volumes,
+      },
+      materials_json: materialsPath,
+    };
+    simDoc.updated_at = built.material.updated_at;
+    simDoc.increment = 'W18';
+    writeActiveMirror(projectId, simDoc);
+  } catch {
+    /* non-fatal */
+  }
+
+  return {
+    ok: true,
+    status: existingAir ? 200 : 201,
+    body: {
+      ok: true,
+      material: built.material,
+      materials: materials.filter(
+        (m) => matchesGeometry(m, geomId, primaryId) && matchesStudy(m, sim.id, firstLegacySimId(projectId, proj))
+      ),
+      project_id: projectId,
+      simulation_id: sim.id,
+      materials_json: materialsPath,
+      assigned_volumes: built.material.assigned_volumes,
+      soft_pass_avoided: true,
+      increment: 'W18',
+    },
+  };
+}
+
+/**
+ * Delete one material record of a study (host API 1.8: a study with several
+ * materials). Its folder and its aggregate row go; the study's other materials
+ * stay, and the answer lists them.
+ */
+async function deleteOneMaterialRecord(projectIdOpt, geomIdOpt, simIdOpt, materialId) {
+  const projectId = projectIdOpt || projectIdOrActive('', readActiveId);
+  if (!projectId) return { ok: false, status: 400, body: { error: 'no active project', soft_pass: false } };
+  const proj = readProject(projectId);
+  if (!proj) return { ok: false, status: 404, body: { error: 'project not found', project_id: projectId } };
+  const sim = getActiveSimulation(projectId, proj, simIdOpt);
+  if (!sim) return { ok: false, status: 400, body: { error: 'no simulation; Create Simulation first' } };
+  const id = String(materialId);
+  deleteOneMaterial(projectId, sim.id, id);
+  const doc = readMaterialsFile(projectId, sim.id);
+  const all = (doc && Array.isArray(doc.materials) ? doc.materials : []).filter((m) => m && String(m.id || '') !== id);
+  const next = { ...(doc || {}), materials: all, air: studyFluid(all), updated_at: new Date().toISOString() };
+  await writeMaterialsFile(projectId, next, sim.id, []);
+  const p = materialsJsonPath(projectId, sim.id);
+  proj.materials = {
+    air: next.air
+      ? { id: next.air.id, name: next.air.name, assigned_volumes: next.air.assigned_volumes, materials_json: p, updated_at: next.updated_at }
+      : null,
+    materials_json: p,
+    count: all.length,
+  };
+  proj.updated_at = next.updated_at;
+  writeProject(proj);
+  return {
+    ok: true,
+    status: 200,
+    body: { ok: true, deleted: true, material_id: id, project_id: projectId, materials: all, air: next.air || null },
+  };
+}
+
+async function deleteMaterials(projectIdOpt, geomIdOpt, simIdOpt) {
+  const projectId = projectIdOpt || projectIdOrActive('', readActiveId);
+  if (!projectId) {
+    return {
+      ok: false,
+      status: 400,
+      body: { error: 'no active project', soft_pass: false },
+    };
+  }
+  const proj = readProject(projectId);
+  if (!proj) {
+    return {
+      ok: false,
+      status: 404,
+      body: { error: 'project not found', project_id: projectId },
+    };
+  }
+  const sim = getActiveSimulation(projectId, proj, simIdOpt);
+  const p = materialsJsonPath(projectId, sim && sim.id);
+  const geomId = studyScopedGeometryId(proj, sim, geomIdOpt);
+  const primaryId = primaryGeometryId(proj);
+  const doc = readMaterialsFile(projectId, sim && sim.id);
+  const legacyId = firstLegacySimId(projectId, proj);
+  const all = (doc && doc.materials) || [];
+  const kept = all.filter(
+    (m) => m && !(matchesGeometry(m, geomId, primaryId) && matchesStudy(m, sim && sim.id, legacyId))
+  );
+  const dropped = all.filter((m) => m && !kept.includes(m));
+  for (const m of dropped) {
+    if (m && m.id) deleteOneMaterial(projectId, sim && sim.id, m.id);
+  }
+  if (!kept.length) {
+    if (existsSync(p)) {
+      try {
+        unlinkSync(p);
+      } catch (e) {
+        return { ok: false, status: 500, body: { error: String(e) } };
+      }
+    }
+    if (proj.materials) delete proj.materials;
+  } else {
+    const next = { ...doc, materials: kept, air: studyFluid(kept), updated_at: new Date().toISOString() };
+    await writeMaterialsFile(projectId, next, sim && sim.id, []);
+    proj.materials = {
+      air: next.air
+        ? {
+            id: next.air.id,
+            name: next.air.name,
+            assigned_volumes: next.air.assigned_volumes,
+            materials_json: p,
+            updated_at: next.updated_at,
+          }
+        : null,
+      materials_json: p,
+      count: kept.length,
+    };
+  }
+  proj.updated_at = new Date().toISOString();
+  writeProject(proj);
+  try {
+    const sim = readSimulationFile(projectId);
+    if (sim && sim.materials) {
+      delete sim.materials;
+      sim.updated_at = proj.updated_at;
+      writeActiveMirror(projectId, sim);
+    }
+  } catch {
+    /* non-fatal */
+  }
+  return {
+    ok: true,
+    status: 200,
+    body: {
+      ok: true,
+      deleted: true,
+      project_id: projectId,
+      materials: [],
+      air: null,
+      assigned_volumes: [],
+    },
+  };
+}
+
+export function getMaterials(projectIdOpt, geomIdOpt, simIdOpt) {
+  const projectId = projectIdOpt || projectIdOrActive('', readActiveId);
+  if (!projectId) {
+    return {
+      ok: true,
+      status: 200,
+      body: {
+        ok: true,
+        active: false,
+        materials: [],
+        air: null,
+        note: 'No active project. POST /api/materials after simulation create.',
+        increment: 'W18',
+      },
+    };
+  }
+  const proj = readProject(projectId);
+  if (!proj) {
+    return {
+      ok: false,
+      status: 404,
+      body: { error: 'project not found', project_id: projectId },
+    };
+  }
+  const sim = getActiveSimulation(projectId, proj, simIdOpt);
+  const geomId = studyScopedGeometryId(proj, sim, geomIdOpt);
+  const primaryId = primaryGeometryId(proj);
+  const doc = readMaterialsFile(projectId, sim && sim.id);
+  const all = (doc && doc.materials) || [];
+  const legacyId = firstLegacySimId(projectId, proj);
+  const materials = all.filter(
+    (m) => matchesGeometry(m, geomId, primaryId) && matchesStudy(m, sim && sim.id, legacyId)
+  );
+  const air = studyFluid(materials);
+  const matPath = materialsJsonPath(projectId, sim && sim.id);
+  return {
+    ok: true,
+    status: 200,
+    body: {
+      ok: true,
+      active: true,
+      project_id: projectId,
+      materials,
+      materials_all: assembleAllMaterials(projectId),
+      air,
+      simulation_id: (sim && sim.id) || null,
+      materials_json_path: matPath,
+      materials_json_exists: !!(matPath && existsSync(matPath)),
+      assigned_volumes: air ? air.assigned_volumes || [] : [],
+      body1_assigned: !!(air && (air.assigned_volumes || []).includes('Body1')),
+      project_materials_ref: proj.materials || null,
+      increment: 'W18',
+    },
+  };
+}
+
+/**
+ * Vite middleware for /api/materials*
+ * Returns true if handled.
+ */
+export async function handleW18Api(req, res, u, parts, helpers) {
+  const { sendJson, readJsonBody } = helpers;
+
+  if (parts[0] === 'api' && parts[1] === 'materials') {
+    if (req.method === 'POST' && !parts[2]) {
+      let body = {};
+      try {
+        body = await readJsonBody(req);
+      } catch (e) {
+        return sendJson(res, 400, { error: 'invalid JSON body', detail: String(e) });
+      }
+      if (body && (body.delete === true || body.action === 'delete')) {
+        const result = body.material_id
+          ? await deleteOneMaterialRecord(body.project_id, body.geometry_id, body.simulation_id, body.material_id)
+          : await deleteMaterials(body.project_id, body.geometry_id, body.simulation_id);
+        res.setHeader('X-CFD-Source', 'materials-delete');
+        res.setHeader('X-CFD-Increment', 'W18');
+        return sendJson(res, result.status, result.body);
+      }
+      const result = await upsertMaterials(body);
+      res.setHeader('X-CFD-Source', 'materials-upsert');
+      res.setHeader('X-CFD-Increment', 'W18');
+      for (const [k, v] of Object.entries(result.headers || {})) res.setHeader(k, v);
+      if (result.ok && result.body.material) {
+        res.setHeader('X-CFD-Material-Id', result.body.material.id);
+        res.setHeader('X-CFD-Project-Id', result.body.project_id);
+        res.setHeader('X-CFD-Material-Name', materialHeaderName(result.body.material));
+        res.setHeader('X-CFD-Assigned-Volume', String((result.body.assigned_volumes || [])[0] || ''));
+      }
+      return sendJson(res, result.status, result.body);
+    }
+    if (req.method === 'DELETE' && !parts[2]) {
+      const pid = u.searchParams.get('project_id') || undefined;
+      const result = await deleteMaterials(
+        pid,
+        u.searchParams.get('geometry_id') || undefined,
+        u.searchParams.get('simulation_id') || undefined
+      );
+      res.setHeader('X-CFD-Source', 'materials-delete');
+      res.setHeader('X-CFD-Increment', 'W18');
+      return sendJson(res, result.status, result.body);
+    }
+    if ((req.method === 'GET' || req.method === 'HEAD') && !parts[2]) {
+      const pid = u.searchParams.get('project_id') || undefined;
+      const result = getMaterials(
+        pid,
+        u.searchParams.get('geometry_id') || undefined,
+        u.searchParams.get('simulation_id') || undefined
+      );
+      res.setHeader('X-CFD-Source', 'materials-get');
+      res.setHeader('X-CFD-Increment', 'W18');
+      return sendJson(res, result.status, result.body);
+    }
+    return sendJson(res, 405, { error: 'method not allowed for /api/materials' });
+  }
+
+  return false;
+}
+
+export const W18_META = {
+  increment: 'W18',
+  projects_root: PROJECTS_ROOT,
+  /** The fluid a new material starts as: the default material model's default preset. */
+  get air() {
+    return materialPreset('', '');
+  },
+};
