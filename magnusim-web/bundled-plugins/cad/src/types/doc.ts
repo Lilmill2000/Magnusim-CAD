@@ -762,6 +762,26 @@ export interface ExtrudeFeature extends FeatureBase<'extrude'>, BodyMaking {
    * instead of the profile's normal; flip reverses it. Absent or null: the normal.
    */
   direction?: AxisRef | null;
+  /**
+   * Draft angle (an angle expression): the side walls lean this far from the extrude direction,
+   * positive narrowing the profile as it goes (a countersink's cone, a moulding draft). Sketch
+   * profiles with Blind, Symmetric or Two sides only, along the normal. Absent, "" or 0: straight.
+   */
+  taper?: Expr | null;
+  /**
+   * A cosmetic thread (Hole's tapped hole): recorded, listed and drawn in the view (features/hole/
+   * threads.ts), the solid unchanged. It runs from the sketch plane into the cut, round each of the
+   * hole's circles (h1, h2...), as deep as the cut goes (Blind: its distance; Through all: to the
+   * far side of the body), so it follows the cut's depth.
+   */
+  thread?: HoleThread | null;
+}
+
+/** A cosmetic ISO metric thread: "M6x1", its major diameter and pitch (mm). */
+export interface HoleThread {
+  designation: string;
+  major: number;
+  pitch: number;
 }
 
 // ------------------------------------------------------------ P4a: solids (SOLIDS)

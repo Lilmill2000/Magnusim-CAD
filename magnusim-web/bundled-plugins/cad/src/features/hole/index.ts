@@ -1,7 +1,7 @@
 // Hole (SOLID): round holes drilled into one flat face in one step, the Assistant's hole tool on the
 // person's side: a sketch of circles and a cut extrude, the same two features. A tool panel (it
 // makes ordinary features, so it has no feature type of its own); "Hole" in a flat face's context
-// menu opens it with that face.
+// menu opens it with that face. Tapped holes' cosmetic threads are drawn in the view (threads.ts).
 // Owner: ASSISTANT (the person's side of hole).
 // SPDX-License-Identifier: GPL-3.0-or-later
 import '../p2/p2.css';
@@ -9,6 +9,7 @@ import type { CadModule } from '../../types/modules';
 import { uiFor } from '../../ui/controller';
 import { selectItem } from '../../lib/selection';
 import { HolePanel } from './panel';
+import { installThreads } from './threads';
 
 export const HOLE_TOOL = 'solid.hole';
 
@@ -36,7 +37,9 @@ const module: CadModule = {
   },
   install(services) {
     const ui = uiFor(services);
-    return services.commands.register({
+    // Tapped holes' cosmetic threads, drawn in the view.
+    const offThreads = installThreads(services);
+    const offCommand = services.commands.register({
       id: HOLE_TOOL,
       label: 'Hole',
       group: 'solid',
@@ -57,6 +60,10 @@ const module: CadModule = {
         else ui.openTool(HOLE_TOOL);
       },
     });
+    return () => {
+      offCommand();
+      offThreads();
+    };
   },
 };
 
