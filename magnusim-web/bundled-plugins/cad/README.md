@@ -273,11 +273,13 @@ touching bodies apart.
   Move down); **Ruled** for straight sides.
 - **Hole** (a flat face's menu, or SOLID > Hole): round holes into one flat face
   facing along X, Y or Z. Click the face for each centre, type them, or take
-  them **From a sketch** (a hole at each of its points and circle centres; the
-  holes stay put if that sketch changes later). **Size**: a custom diameter, a
-  **clearance hole for a bolt** (M1.6 to M64, close, normal or loose fit: ISO 273)
-  or a **tapped hole** (its tap drill, and a cosmetic thread: listed, and drawn
-  in the view as a coil with its size, "M6x1"; the solid is not threaded).
+  them **From a sketch** (a hole at each of its points and circle centres, and
+  they follow those points when that sketch changes). **Size**, metric or inch:
+  a custom diameter, a **clearance hole for a bolt** (M1.6 to M64, ISO 273; #0 to
+  1 in, ASME B18.2.8; close, normal or loose fit) or a **tapped hole** (ISO coarse
+  or UNC / UNF: its tap drill, and its thread, listed and drawn in the view as a
+  coil with its size, "M6x1"; **Thread: Modelled** also cuts the real thread into
+  the wall, as the feature "Hole 1 thread", which follows the hole).
   **Type**: simple, **counterbore** (diameter, depth) or **countersink**
   (diameter at the face, angle); with a clearance hole, **From the screw table**
   sizes them for a socket head cap screw (ISO 4762, DIN 974-1; M3 to M30) or a
@@ -778,7 +780,7 @@ plane or a sketch. A curved face is refused in words.
 modeling, 2D drawings, sheet metal and feature recognition on imported parts are
 not part of it. There is no draft of existing faces (Extrude's Draft angle
 tapers what it extrudes), variable-radius fillet, guide rail for Loft or Sweep,
-modelled thread (Hole's threads are cosmetic), or 3D sketch yet. A geometry that was added to a project
+external (bolt) thread, or 3D sketch yet. A geometry that was added to a project
 as a STEP file cannot be opened in CAD yet: start a Part and use Import STEP.
 
 **Size.** The kernel runs in the browser with at most 4 GB of memory. A 113 MB

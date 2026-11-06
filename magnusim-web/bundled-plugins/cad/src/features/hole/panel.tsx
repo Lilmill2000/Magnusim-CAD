@@ -3,24 +3,25 @@
 //   Face       one flat face facing along X, Y or Z (a face selected before Hole is taken).
 //   Centres    model X, Y, Z of each centre (the coordinate along the face's normal is the
 //              face's own); a click on the face adds a centre where it was clicked; Add centre
-//              adds a row to type in; From a sketch puts a centre at each of a sketch's points
-//              and circle centres (they do not follow later edits of that sketch).
-//   Size       Custom (Diameter, an expression: "5 mm", "hd"), Clearance hole (a metric bolt size and
-//              fit: the ISO 273 hole) or Tapped hole (a metric size: its tap drill; the thread is
-//              not modelled); Depth: Through (the face's body) or Blind (Depth).
+//              adds a row to type in; From a sketch puts a hole at each of a sketch's points and
+//              circle centres, following them when that sketch changes (× goes back to centres).
+//   Size       Custom (Diameter, an expression: "5 mm", "hd"), Clearance hole (a bolt size, metric or
+//              inch, and a fit: ISO 273 / ASME B18.2.8) or Tapped hole (a metric or UNC/UNF thread:
+//              its tap drill, and its thread drawn in the view, or also cut into the wall: Thread
+//              Modelled); Depth: Through (the face's body) or Blind (Depth).
 //   Type       Simple, Counterbore (diameter, depth) or Countersink (diameter at the face, angle);
 //              with a clearance hole, From the screw table fills them (ISO 4762 socket head,
-//              DIN 974-1; ISO 10642 countersunk head at 90°); a tapped hole gets a cosmetic thread,
-//              drawn in the view;
+//              DIN 974-1; ISO 10642 countersunk head at 90°);
 //   Bottom     a blind hole's: Flat or Drill point (its angle).
 //   Name       "" for the next free "Hole N".
 // Done runs the hole tool's own plan (every check, before anything changes: the refusal shows
 // here) and makes its features: "<name> sketch" and the cut "<name>" (with "<name> counterbore" or
-// "<name> countersink" before it, "<name> tip sketch" and "<name> tip" after it), one undo step,
-// editable as sketches and extrudes, the same records the Assistant's hole stores.
+// "<name> countersink" before it, "<name> tip sketch" and "<name> tip" after it, and a modelled
+// thread's "<name> thread"), one undo step, editable as sketches, extrudes and a thread, the same
+// records the Assistant's hole stores.
 // Owner: ASSISTANT (the person's side of hole).
 // SPDX-License-Identifier: GPL-3.0-or-later
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useServices } from '../../lib/services';
 import { useStateStore } from '../../lib/store';
 import type { Vec3 } from '../../types/doc';
@@ -34,7 +35,7 @@ import { PickList } from '../p2/PickList';
 import { usePicker, useSelectionMirror } from '../p2/pick';
 import { itemLabel } from '../measure/words';
 import { holeError, makeHoles, planFor, type HoleInput } from './make';
-import { clearanceDiameter, counterboreFor, countersinkFor, METRIC_SIZES, tapDrill, threadName, type ClearanceFit } from './sizes';
+import { counterboreFor, countersinkFor, fastener, SIZE_CHOICES, type ClearanceFit } from './sizes';
 import { sketchPoints } from '../../assistant/tools/hole';
 import { kernelLookup } from '../../naming';
 
@@ -76,9 +77,12 @@ export function HolePanel({ close }: ToolPanelProps) {
   });
   const [active, setActive] = useState<'face' | 'centres'>(() => (face ? 'centres' : 'face'));
   const [rows, setRows] = useState<CentreRow[]>([]);
+  const pointsFromRef = useRef('');
   const [diameter, setDiameter] = useState('5 mm');
   const [sizing, setSizing] = useState<'custom' | 'clearance' | 'tapped'>('custom');
+  const [system, setSystem] = useState<'metric' | 'unified'>('metric');
   const [size, setSize] = useState('M6');
+  const [threadMode, setThreadMode] = useState<HoleInput['thread']>('cosmetic');
   const [fit, setFit] = useState<ClearanceFit>('normal');
   const [type, setType] = useState<HoleInput['type']>('simple');
   const [cbDiameter, setCbDiameter] = useState('11 mm');
@@ -86,6 +90,9 @@ export function HolePanel({ close }: ToolPanelProps) {
   const [csDiameter, setCsDiameter] = useState('12 mm');
   const [csAngle, setCsAngle] = useState('90 deg');
   const [fromTable, setFromTable] = useState(true);
+  /** A sketch whose points are the centres (the holes follow them), or "". */
+  const [pointsFrom, setPointsFrom] = useState('');
+  pointsFromRef.current = pointsFrom;
   const [tip, setTip] = useState<HoleInput['tip']>('flat');
   const [tipAngle, setTipAngle] = useState('118 deg');
   const [depth, setDepth] = useState<'through' | 'blind'>('through');
@@ -96,7 +103,15 @@ export function HolePanel({ close }: ToolPanelProps) {
   const [note, setNote] = useState<string | null>(null);
 
   const fmt = (mm: number) => `${formatReadout(Math.round((mm / MM_PER[units.length]) * 1e4) / 1e4)} ${units.length}`;
-  const addCentre = (p: Vec3) => setRows((cur) => [...cur, { x: fmt(p[0]), y: fmt(p[1]), z: fmt(p[2]) }]);
+  // A click adding a centre leaves a sketch's points (read through a ref: the face picker keeps its first callback).
+  const addCentre = (p: Vec3) => {
+    if (pointsFromRef.current) {
+      setPointsFrom('');
+      setRows([{ x: fmt(p[0]), y: fmt(p[1]), z: fmt(p[2]) }]);
+      return;
+    }
+    setRows((cur) => [...cur, { x: fmt(p[0]), y: fmt(p[1]), z: fmt(p[2]) }]);
+  };
 
   usePicker(services, {
     id: 'hole',
@@ -161,21 +176,22 @@ export function HolePanel({ close }: ToolPanelProps) {
   const tabled = sizing === 'clearance' && fromTable && (type === 'counterbore' ? !!counterboreFor(size) : type === 'countersink' ? !!countersinkFor(size) : false);
   const doc = useStateStore(services.doc.state, (s) => s.doc);
   const sketches = doc.features.filter((f) => f.type === 'sketch' && f.entities.some((e) => e.kind === 'point' || e.kind === 'circle'));
-  /** Centres at the points of a sketch (its points and circle centres, as model coordinates). */
+  /** The holes at the points of a sketch (its points and circle centres), following them; the rows give way. */
   const fromSketch = (name: string) => {
     setError(null);
     try {
       const got = sketchPoints(services, name);
+      setPointsFrom(got.name);
       setRows(got.points.map((p) => ({ x: fmt(p[0]), y: fmt(p[1]), z: fmt(p[2]) })));
-      setNote(`${got.points.length} ${got.points.length === 1 ? 'centre' : 'centres'} from ${got.name}'s points: they stay where they are if that sketch changes later`);
+      setNote(`${got.points.length} ${got.points.length === 1 ? 'hole' : 'holes'} at ${got.name}'s points: they follow those points when ${got.name} changes`);
     } catch (e) {
       setError(holeError(e));
     }
   };
   const input = (): HoleInput => ({
     name: name.trim(),
-    centers: centreInput(rows, along),
-    points: '',
+    centers: pointsFrom ? [] : centreInput(rows, along),
+    points: pointsFrom,
     diameter: sized ? '' : diameter.trim(),
     size: sized ? size : '',
     fit: sizing === 'clearance' ? fit : sizing === 'tapped' ? 'tapped' : '',
@@ -188,9 +204,25 @@ export function HolePanel({ close }: ToolPanelProps) {
     cs_angle: type === 'countersink' && !tabled ? csAngle.trim() : '',
     tip: depth === 'blind' ? tip : 'flat',
     tip_angle: depth === 'blind' && tip === 'drill' ? tipAngle.trim() : '',
+    thread: sizing === 'tapped' ? threadMode : 'cosmetic',
   });
   /** The diameter a size gives, in words ("6.6 mm"), or null. */
-  const sizeMm = sizing === 'clearance' ? clearanceDiameter(size, fit) : sizing === 'tapped' ? tapDrill(size) : null;
+  const screw = sized ? fastener(size) : null;
+  // The size lists: metric sizes; inch sizes (with a clearance hole in the standard's table), or their UNC and UNF threads.
+  const sizeOptions = system === 'metric' ? SIZE_CHOICES.metric.map((r) => ({ value: r.value, label: sizing === 'tapped' ? r.tapped : r.label })) : sizing === 'tapped' ? SIZE_CHOICES.unified : SIZE_CHOICES.unifiedClearance;
+  const pickSystem = (v: 'metric' | 'unified') => {
+    setSystem(v);
+    setSize(v === 'metric' ? 'M6' : sizing === 'tapped' ? '1/4-20' : '1/4');
+  };
+  const pickSizing = (v: 'custom' | 'clearance' | 'tapped') => {
+    setSizing(v);
+    // An inch size changes form between the lists ("#10" for a clearance hole, "#10-24" for a thread): keep the size.
+    if (system !== 'unified') return;
+    const now = fastener(size);
+    const thread = now ? now.thread.split(' ')[0] : '1/4-20';
+    const bolt = now && now.clearance ? now.size : '1/4';
+    setSize(v === 'tapped' ? thread : bolt);
+  };
   const done = async () => {
     if (!face && !rows.length) {
       close();
@@ -252,7 +284,7 @@ export function HolePanel({ close }: ToolPanelProps) {
         />
         <div className={`cad-pick${active === 'centres' ? ' is-active' : ''}`} data-pick-field="hole-centres" data-active={active === 'centres' ? '1' : '0'} onClick={() => face && setActive('centres')}>
           <div className="cad-pick-head">
-            <span className="cad-pick-label">Centres ({rows.length})</span>
+            <span className="cad-pick-label">{pointsFrom ? `Centres: ${pointsFrom}'s points (${rows.length})` : `Centres (${rows.length})`}</span>
           </div>
           <table className="cad-p2-table" data-hole-centres="1">
             <tbody>
@@ -266,7 +298,7 @@ export function HolePanel({ close }: ToolPanelProps) {
                         aria-label={`Centre ${i + 1} ${a.toUpperCase()}`}
                         data-hole-coord={`${i}-${a}`}
                         spellCheck={false}
-                        disabled={along === k}
+                        disabled={along === k || !!pointsFrom}
                         placeholder={along === k ? 'on the face' : a.toUpperCase()}
                         value={along === k ? '' : r[a]}
                         onChange={(e) => setRows((cur) => cur.map((x, j) => (j === i ? { ...x, [a]: e.target.value } : x)))}
@@ -274,17 +306,32 @@ export function HolePanel({ close }: ToolPanelProps) {
                     </td>
                   ))}
                   <td>
-                    <button type="button" className="cad-vp-link" aria-label={`Remove centre ${i + 1}`} data-hole-remove={i} onClick={() => setRows((cur) => cur.filter((_, j) => j !== i))}>
-                      ×
-                    </button>
+                    {pointsFrom ? null : (
+                      <button type="button" className="cad-vp-link" aria-label={`Remove centre ${i + 1}`} data-hole-remove={i} onClick={() => setRows((cur) => cur.filter((_, j) => j !== i))}>
+                        ×
+                      </button>
+                    )}
                   </td>
                 </tr>
               ))}
             </tbody>
           </table>
-          <Button variant="link" onClick={() => setRows((cur) => [...cur, { x: '0 mm', y: '0 mm', z: '0 mm' }])} data-hole-add="1">
-            + Add centre
-          </Button>
+          {pointsFrom ? (
+            <Button
+              variant="link"
+              onClick={() => {
+                setPointsFrom('');
+                setNote(null);
+              }}
+              data-hole-own-centres="1"
+            >
+              Use my own centres instead
+            </Button>
+          ) : (
+            <Button variant="link" onClick={() => setRows((cur) => [...cur, { x: '0 mm', y: '0 mm', z: '0 mm' }])} data-hole-add="1">
+              + Add centre
+            </Button>
+          )}
           {sketches.length ? (
             <Field label="From a sketch" htmlFor="cad-hole-from-sketch" field="from-sketch">
               <Select
@@ -306,7 +353,7 @@ export function HolePanel({ close }: ToolPanelProps) {
             label="Size"
             field="sizing"
             value={sizing}
-            onChange={(v) => setSizing(v as 'custom' | 'clearance' | 'tapped')}
+            onChange={(v) => pickSizing(v as 'custom' | 'clearance' | 'tapped')}
             options={[
               { value: 'custom', label: 'Custom diameter' },
               { value: 'clearance', label: 'Clearance hole for a bolt' },
@@ -315,8 +362,23 @@ export function HolePanel({ close }: ToolPanelProps) {
           />
         </Field>
         {sized ? (
-          <Field label="Metric size" htmlFor="cad-hole-size" field="size">
-            <Select id="cad-hole-size" label="Metric size" field="size" value={size} onChange={setSize} options={METRIC_SIZES.map((r) => ({ value: r.size, label: sizing === 'tapped' ? `${r.size}x${r.pitch}` : r.size }))} />
+          <Field label="Standard" htmlFor="cad-hole-system" field="system">
+            <Select
+              id="cad-hole-system"
+              label="Standard"
+              field="system"
+              value={system}
+              onChange={(v) => pickSystem(v as 'metric' | 'unified')}
+              options={[
+                { value: 'metric', label: 'Metric (ISO)' },
+                { value: 'unified', label: 'Inch (UNC / UNF)' },
+              ]}
+            />
+          </Field>
+        ) : null}
+        {sized ? (
+          <Field label={sizing === 'tapped' ? 'Thread' : 'Bolt size'} htmlFor="cad-hole-size" field="size">
+            <Select id="cad-hole-size" label={sizing === 'tapped' ? 'Thread' : 'Bolt size'} field="size" value={size} onChange={setSize} options={sizeOptions} />
           </Field>
         ) : null}
         {sizing === 'clearance' ? (
@@ -337,13 +399,34 @@ export function HolePanel({ close }: ToolPanelProps) {
         ) : null}
         {sized ? (
           <Hint>
-            {sizeMm == null ? 'No such size' : sizing === 'tapped' ? `Tap drill ${sizeMm} mm for ${threadName(size)}; the thread is drawn in the view and listed, not modelled.` : `Clearance hole ${sizeMm} mm (ISO 273, ${fit} fit).`}
+            {!screw
+              ? 'No such size'
+              : sizing === 'tapped'
+                ? `Tap drill ${screw.tap.words} for ${screw.thread}; ${threadMode === 'modelled' ? 'the thread is cut into the wall (and labelled in the view)' : 'the thread is drawn in the view and listed, not modelled'}.`
+                : screw.clearance
+                  ? `Clearance hole ${screw.clearance[fit].expr} (${screw.system === 'metric' ? 'ISO 273' : 'ASME B18.2.8'}, ${fit} fit).`
+                  : `ASME B18.2.8 has no clearance hole for ${screw.size}.`}
           </Hint>
         ) : (
           <Field label="Diameter" htmlFor="cad-hole-diameter" field="diameter">
             <input id="cad-hole-diameter" className="mgk-input" type="text" spellCheck={false} value={diameter} data-field="diameter" onChange={(e) => setDiameter(e.target.value)} />
           </Field>
         )}
+        {sizing === 'tapped' ? (
+          <Field label="Thread" htmlFor="cad-hole-thread" field="thread">
+            <Select
+              id="cad-hole-thread"
+              label="Thread"
+              field="thread"
+              value={threadMode}
+              onChange={(v) => setThreadMode(v as HoleInput['thread'])}
+              options={[
+                { value: 'cosmetic', label: 'Cosmetic (drawn and listed)' },
+                { value: 'modelled', label: 'Modelled (cut into the wall)' },
+              ]}
+            />
+          </Field>
+        ) : null}
         <Field label="Depth" htmlFor="cad-hole-depth" field="depth">
           <Select
             id="cad-hole-depth"
@@ -404,7 +487,7 @@ export function HolePanel({ close }: ToolPanelProps) {
               : `Countersink ${countersinkFor(size)!.diameter} mm across at 90°, for an ${size} countersunk head screw (ISO 10642).`}
           </Hint>
         ) : null}
-        {sizing === 'clearance' && fromTable && type !== 'simple' && !tabled ? <Hint>The screw table has no {size}: give the sizes.</Hint> : null}
+        {sizing === 'clearance' && fromTable && type !== 'simple' && !tabled ? <Hint>{system === 'unified' ? 'The screw tables are metric: give the sizes.' : `The screw table has no ${size}: give the sizes.`}</Hint> : null}
         {type === 'counterbore' && !tabled ? textField('cb-diameter', 'Counterbore diameter', cbDiameter, setCbDiameter) : null}
         {type === 'counterbore' && !tabled ? textField('cb-depth', 'Counterbore depth', cbDepth, setCbDepth) : null}
         {type === 'countersink' && !tabled ? textField('cs-diameter', 'Countersink diameter', csDiameter, setCsDiameter) : null}

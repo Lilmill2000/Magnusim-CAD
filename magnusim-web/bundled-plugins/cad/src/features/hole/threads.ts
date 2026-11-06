@@ -3,8 +3,10 @@
 // per pitch (at most TURNS_MAX turns), faintly through the material, round each of the hole's
 // circles (h1, h2...) from its sketch plane into the cut, as deep as the cut goes: a Blind cut's
 // distance, or to the far side of the body for Through all (the body's box along the hole). The
-// designation ("M6x1") is labelled beside the first hole. The solid is not changed. It reads the
-// document and redraws only when a thread, its cut, its sketch or its body changed.
+// designation ("M6x1") is labelled beside the first hole. The solid is not changed. A thread that
+// is also modelled (a thread feature cut it into the wall) keeps only its label: the real groove
+// is there to see. It reads the document and redraws only when a thread, its cut, its sketch, its
+// body or its modelled thread changed.
 // Owner: ASSISTANT (the person's side of hole).
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { LineMaterial } from 'three/examples/jsm/lines/LineMaterial.js';
@@ -22,9 +24,10 @@ const THREADS_LAYER = 'hole.threads';
 const PER_TURN = 24;
 const TURNS_MAX = 200;
 
-/** One thread to draw: its cut's name, the thread, each hole's centre, the direction into the cut, the sketch's x, and its length (mm, or null: to the far side of `body`). */
+/** One thread to draw: its cut's name, the thread, each hole's centre, the direction into the cut, the sketch's x, its length (mm, or null: to the far side of `body`), and whether it is modelled (label only). */
 interface ThreadDraw {
   name: string;
+  modelled: boolean;
   thread: HoleThread;
   centres: Vec3[];
   d: Vec3;
@@ -55,6 +58,8 @@ function threadsOf(services: AppServices): { list: ThreadDraw[]; key: string } {
   const s = services.doc.state.get();
   const list: ThreadDraw[] = [];
   const parts: string[] = [];
+  // The holes a built thread feature cut the thread into.
+  const modelled = new Set(s.doc.features.flatMap((g) => (g.type === 'thread' && !g.suppressed && s.rebuild.features[g.id]?.state === 'ok' ? [g.hole] : [])));
   for (const g of s.doc.features) {
     if (g.type !== 'extrude' || !g.thread || g.suppressed) continue;
     const f = g as ExtrudeFeature;
@@ -73,8 +78,8 @@ function threadsOf(services: AppServices): { list: ThreadDraw[]; key: string } {
     if (f.extent.kind === 'blind' && length == null) continue;
     const body = f.scope[0] ?? null;
     const shape = length == null ? (s.rebuild.bodies.find((b) => b.id === body)?.shape ?? null) : null;
-    list.push({ name: f.name, thread: f.thread!, centres, d, x: out.plane.xdir as Vec3, length, body });
-    parts.push(JSON.stringify([f.name, f.thread, centres, d, out.plane.xdir, length, shape]));
+    list.push({ name: f.name, modelled: modelled.has(f.id), thread: f.thread!, centres, d, x: out.plane.xdir as Vec3, length, body });
+    parts.push(JSON.stringify([f.name, modelled.has(f.id), f.thread, centres, d, out.plane.xdir, length, shape]));
   }
   return { list, key: parts.join('|') };
 }
@@ -154,14 +159,16 @@ class ThreadOverlay {
   private draw(list: { t: ThreadDraw; length: number }[]): void {
     this.clear();
     for (const { t, length } of list) {
-      const pos: number[] = [];
-      for (const c of t.centres) pos.push(...helix(c, t.d, t.x, t.thread.major / 2, t.thread.pitch, length));
-      const geo = new LineSegmentsGeometry();
-      geo.setPositions(pos);
-      const line = new LineSegments2(geo, this.mat);
-      line.renderOrder = 35;
-      this.layer.group.add(line);
-      this.lines.push(line);
+      if (!t.modelled) {
+        const pos: number[] = [];
+        for (const c of t.centres) pos.push(...helix(c, t.d, t.x, t.thread.major / 2, t.thread.pitch, length));
+        const geo = new LineSegmentsGeometry();
+        geo.setPositions(pos);
+        const line = new LineSegments2(geo, this.mat);
+        line.renderOrder = 35;
+        this.layer.group.add(line);
+        this.lines.push(line);
+      }
       // The label just outside the first hole's mouth, on its diagonal.
       const c0 = t.centres[0];
       const y = ydirOf({ origin: c0, normal: t.d, xdir: t.x });
@@ -177,7 +184,7 @@ class ThreadOverlay {
   }
 
   private place(): void {
-    if (!this.lines.length) return;
+    if (!this.lines.length && !this.labels.length) return;
     const [rw, rh] = this.handle.lineResolution();
     this.mat.resolution.set(rw, rh);
     // project() gives frame client px; the labels sit in the layer's own box.

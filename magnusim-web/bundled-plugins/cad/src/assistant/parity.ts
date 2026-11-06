@@ -286,6 +286,8 @@ export const FEATURE_FIELDS: FeatureFields = {
     distance2: reach('modify', 'size2'),
     flip: reach('modify', 'flip'),
   },
+  // A modelled thread is made by hole (thread modelled); its length is an expression field (edit_feature).
+  thread: { ...BASE, hole: reach('hole', 'thread'), body: reach('hole', 'thread'), length: reach('edit_feature', 'set') },
   shell: { ...BASE, body: reach('modify', 'targets'), faces: reach('modify', 'targets'), thickness: reach('modify', 'size'), direction: reach('modify', 'inward') },
   combine: { ...BASE, op: reach('combine', 'op'), targets: reach('combine', 'targets'), tools: reach('combine', 'tools'), keepTools: reach('combine', 'keep_tools'), repair: REPAIR },
   import: {
@@ -1136,6 +1138,7 @@ export const AI_TOOLS: Readonly<Record<string, Readonly<Record<string, PersonPat
     cs_angle: HOLE,
     ...each(['flat', 'drill'], 'tip', HOLE),
     tip_angle: HOLE,
+    ...each(['cosmetic', 'modelled'], 'thread', HOLE),
   },
   workspace: {
     'action=roll_back_to': control('ui', 'rollBackTo'),

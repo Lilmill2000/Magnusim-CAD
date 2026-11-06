@@ -23,8 +23,22 @@ What changed in Magnusim CAD, newest first. How to use each part: `README.md`.
   Counterbores or countersinks that would overlap are refused.
 - A blind hole's **Bottom** can be a **Drill point** (118 deg by default):
   "<name> tip sketch" on the holes' bottom and the cut "<name> tip" to a point.
-- **From a sketch** puts a hole at each of a sketch's points and circle centres
-  (they do not follow later edits of that sketch).
+- **From a sketch** puts a hole at each of a sketch's points and circle centres,
+  and the holes follow those points: the holes' sketch links each centre to its
+  point (a new link source, another sketch's points), so moving a point moves its
+  hole. The holes are the points there were when it was made: a point added
+  later gets no hole, and a point removed leaves its hole where it was, with a
+  lost reference warning. That sketch cannot be deleted while holes follow it.
+- **Inch sizes**: Unified #0 to 1 in, UNC and UNF ("1/4-20", "#10-32 UNF"): the
+  ASME B18.2.8 clearance holes (no #12 or 9/16 in that table) and the tap drills
+  for about 75% thread, by drill name (1/4-20: #7, 0.201 in). Inch sizes stay in
+  inches in the hole's expressions. The screw-head tables stay metric.
+- **Modelled threads**: Thread *Modelled* on a tapped hole also cuts the ISO /
+  Unified internal thread into the wall, as the feature "<name> thread" (60 deg
+  flanks, a P/8 flat at the major diameter, a helical groove per hole). It
+  follows the hole's circles, depth and size; it stops a pitch short of a blind
+  hole's bottom and just inside a through hole's far face, and its Length can be
+  shorter. A cut the kernel could not make fails in words rather than passing.
 - Every size stays an expression the features keep, so the holes follow
   parameters; it is all one undo step, as before. A simple hole is made exactly
   as before. The Assistant's hole takes the same: points, size and fit, type,
