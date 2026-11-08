@@ -289,6 +289,10 @@ touching bodies apart.
   undo step, that follow your parameters. A blind hole deeper than the body says
   that it goes through; counterbores that would overlap are refused. A tapped
   hole's Extrude panel shows its **Thread**, with **Remove**.
+  The metric picker includes both choice series, including M1.8, M3.5, M7,
+  M18, M22, M27, M33, M39, M45 and M52. The screw-head tables include M3.5,
+  M18, M22 and M27 counterbores. Each head table lists
+  its available sizes when a requested size has no row.
 
 ## Modify: fillets, shells, booleans and direct edits
 

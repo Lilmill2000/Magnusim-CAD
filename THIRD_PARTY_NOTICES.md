@@ -42,13 +42,27 @@ PlaneGCS. Analysis Situs' licence and copyright lines:
 `LICENSES/AnalysisSitus-BSD-3-Clause.txt`.
 
 The Hole tool's metric sizes (`src/features/hole/sizes.ts`: ISO 273 clearance holes, ISO 261
-coarse pitches, the tap drill being the major diameter minus the pitch, DIN 974-1 counterbores
+coarse pitches and published cutting-tap drills, DIN 974-1 counterbore diameters
 for ISO 4762 socket head cap screws and ISO 10642 countersunk heads) are the standards' published
 values. The metric clearance holes, pitches and ISO 4762 head sizes, and the Unified inch
 major diameters and threads per inch (ASME B1.1), were cross-checked against SolidCraft's tables
 (https://github.com/tangency-labs/solidcraft, MIT OR Apache-2.0). The Unified tap drills (about 75%
 thread) and ASME B18.2.8 clearance holes are the published values, each checked against two or more
 public charts.
+
+The second-choice metric rows are checked against Bossard's ISO 262 selection series,
+Luna's SS-ISO 273 clearance chart and Gühring's Threading Tools catalogue (page 31).
+Alpha's tapping chart covers the larger cutting-tap drills. The added socket-head
+counterbore diameters are checked against Schraube & Mutter's DIN 974-1 chart. Their
+depths use the existing table's head-height allowance. The ISO 10642 selection is
+checked against Würth's DIN–ISO comparison table for countersunk socket screws.
+
+- https://assets.eu.ctfassets.net/0vp0u5uh75zd/2tYqENAuufvdsudjM8Qbrc/459d421475fda2aa2faf7d5dfbc64388/F088_F090_Fastening_ES_12_2024.pdf
+- https://productinfoimg.luna.se/c4documents/815986.pdf
+- https://guehring.com/wp-content/uploads/2018/dokumente/EN/threading-tools/Catalog_Threading_Tools_EN_Acrobat.pdf
+- https://www.sheffield.com.au/Documents/ProductDocument-Alpha/Tapping_Drilling_ChartA6.pdf
+- https://schraube-mutter.de/bohrtabelle-fuer-zylinderschrauben/
+- https://www.wuerth-industrie.nl/web/media/en/pictures/wuerthindustrie/unternehmen/download_center/Broschuere_DIN-EN-ISO_Normung_DE.pdf
 
 ## The Assistant's provider packages
 

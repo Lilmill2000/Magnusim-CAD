@@ -4,11 +4,18 @@ What changed in Magnusim CAD, newest first. How to use each part: `README.md`.
 
 ## Unreleased (0.2.0-dev)
 
+**Hole's metric sizes include both choice series.** Added M1.8, M3.5, M7,
+M18, M22, M27, M33, M39, M45 and M52 for all clearance fits and coarse tapped
+holes. The shared picker and Assistant lookup read these same rows. Added
+M3.5, M18, M22 and M27 counterbores. Head-table
+refusals list the available sizes. Cutting-tap drills are stored explicitly
+(M8 uses 6.8 mm, M12 uses 10.2 mm), and M30's DIN counterbore is 50 mm across.
+
 **Hole makes counterbores, countersinks, drill points, fastener sizes and threads (issue #7).**
 - SOLID > Hole has **Size**: Custom diameter, **Clearance hole for a bolt** (a
   metric size M1.6 to M64 and a fit: close, normal or loose, the ISO 273 hole:
-  M6 normal is 6.6 mm) or **Tapped hole** (the tap drill: major diameter minus
-  the coarse pitch, M6x1 is 5 mm).
+  M6 normal is 6.6 mm) or **Tapped hole** (the published cutting-tap drill,
+  M6x1 is 5 mm).
 - A tapped hole gets a **cosmetic thread**: its cut records it ("M6x1"),
   get_model lists it, and the view draws it as a coil at the thread's diameter,
   one turn per pitch, with its size beside the hole; it runs as deep as the cut

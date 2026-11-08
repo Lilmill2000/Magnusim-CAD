@@ -1,7 +1,7 @@
 // Hole sizes from a fastener, metric or inch (fastener()): the clearance hole for a bolt (close,
 // normal or loose fit) and the tap drill and thread of a tapped hole.
 //   Metric (ISO): M1.6 to M64, coarse pitches only (ISO 261); the ISO 273 clearance holes; the tap
-//   drill is the major diameter minus the pitch. With a clearance hole, the counterbore for an
+//   drills are the published cutting-tap drills. With a clearance hole, the counterbore for an
 //   ISO 4762 socket head cap screw (DIN 974-1, M3 to M30) and the countersink for an ISO 10642
 //   countersunk head screw (its head's theoretical diameter at 90 deg, M3 to M20).
 //   Unified inch: #0 to 1 in, UNC and UNF (ASME B1.1; "1/4-20", "1/4-28 UNF", "#10-32", "1/4"
@@ -35,29 +35,42 @@ export interface Fastener {
   clearance: Record<ClearanceFit, { expr: string; mm: number }> | null;
 }
 
-// ---- metric: [d, pitch, close, normal, loose] (mm)
-const METRIC: readonly [number, number, number, number, number][] = [
-  [1.6, 0.35, 1.7, 1.8, 2.0],
-  [2, 0.4, 2.2, 2.4, 2.6],
-  [2.5, 0.45, 2.7, 2.9, 3.1],
-  [3, 0.5, 3.2, 3.4, 3.6],
-  [4, 0.7, 4.3, 4.5, 4.8],
-  [5, 0.8, 5.3, 5.5, 5.8],
-  [6, 1, 6.4, 6.6, 7.0],
-  [8, 1.25, 8.4, 9.0, 10.0],
-  [10, 1.5, 10.5, 11.0, 12.0],
-  [12, 1.75, 13.0, 13.5, 14.5],
-  [14, 2, 15.0, 15.5, 16.5],
-  [16, 2, 17.0, 17.5, 18.5],
-  [20, 2.5, 21.0, 22.0, 24.0],
-  [24, 3, 25.0, 26.0, 28.0],
-  [30, 3.5, 31.0, 33.0, 35.0],
-  [36, 4, 37.0, 39.0, 42.0],
-  [42, 4.5, 43.0, 45.0, 48.0],
-  [48, 5, 50.0, 52.0, 56.0],
-  [56, 5.5, 58.0, 62.0, 66.0],
-  [60, 5.5, 62.0, 66.0, 70.0],
-  [64, 6, 66.0, 70.0, 74.0],
+// ---- metric: [d, pitch, tap drill, close, normal, loose] (mm)
+// ISO 262 first- and second-choice coarse threads within M1.6 to M64.
+// Clearances: Luna's SS-ISO 273 chart (productinfoimg.luna.se/c4documents/815986.pdf).
+// Tap drills: Gühring, Threading Tools, p. 31 (M1.6 to M52); Alpha's tapping chart.
+const METRIC: readonly [number, number, number, number, number, number][] = [
+  [1.6, 0.35, 1.25, 1.7, 1.8, 2.0],
+  [1.8, 0.35, 1.45, 2.0, 2.1, 2.2],
+  [2, 0.4, 1.6, 2.2, 2.4, 2.6],
+  [2.5, 0.45, 2.05, 2.7, 2.9, 3.1],
+  [3, 0.5, 2.5, 3.2, 3.4, 3.6],
+  [3.5, 0.6, 2.9, 3.7, 3.9, 4.2],
+  [4, 0.7, 3.3, 4.3, 4.5, 4.8],
+  [5, 0.8, 4.2, 5.3, 5.5, 5.8],
+  [6, 1, 5, 6.4, 6.6, 7.0],
+  [7, 1, 6, 7.4, 7.6, 8.0],
+  [8, 1.25, 6.8, 8.4, 9.0, 10.0],
+  [10, 1.5, 8.5, 10.5, 11.0, 12.0],
+  [12, 1.75, 10.2, 13.0, 13.5, 14.5],
+  [14, 2, 12, 15.0, 15.5, 16.5],
+  [16, 2, 14, 17.0, 17.5, 18.5],
+  [18, 2.5, 15.5, 19.0, 20.0, 21.0],
+  [20, 2.5, 17.5, 21.0, 22.0, 24.0],
+  [22, 2.5, 19.5, 23.0, 24.0, 26.0],
+  [24, 3, 21, 25.0, 26.0, 28.0],
+  [27, 3, 24, 28.0, 30.0, 32.0],
+  [30, 3.5, 26.5, 31.0, 33.0, 35.0],
+  [33, 3.5, 29.5, 34.0, 36.0, 38.0],
+  [36, 4, 32, 37.0, 39.0, 42.0],
+  [39, 4, 35, 40.0, 42.0, 45.0],
+  [42, 4.5, 37.5, 43.0, 45.0, 48.0],
+  [45, 4.5, 40.5, 46.0, 48.0, 52.0],
+  [48, 5, 43, 50.0, 52.0, 56.0],
+  [52, 5, 47, 54.0, 56.0, 62.0],
+  [56, 5.5, 51, 58.0, 62.0, 66.0],
+  [60, 5.5, 55, 62.0, 66.0, 70.0],
+  [64, 6, 58, 66.0, 70.0, 74.0],
 ];
 
 // ---- Unified inch: [size, major, UNC tpi | null, UNF tpi, UNC tap drill, UNF tap drill, B18.2.8 close/normal/loose | null] (in)
@@ -89,14 +102,14 @@ const FITS: readonly ClearanceFit[] = ['close', 'normal', 'loose'];
 const round = (v: number) => Math.round(v * 1e6) / 1e6;
 
 function metricOf(row: (typeof METRIC)[number]): Fastener {
-  const [d, pitch, ...holes] = row;
+  const [d, pitch, tap, ...holes] = row;
   return {
     system: 'metric',
     size: `M${d}`,
     thread: `M${d}x${pitch}`,
     major: d,
     pitch,
-    tap: { expr: `${round(d - pitch)} mm`, mm: round(d - pitch), words: `${round(d - pitch)} mm` },
+    tap: { expr: `${tap} mm`, mm: tap, words: `${tap} mm` },
     clearance: Object.fromEntries(FITS.map((f, i) => [f, { expr: `${holes[i]} mm`, mm: holes[i] }])) as Fastener['clearance'],
   };
 }
@@ -157,6 +170,7 @@ export const SIZE_CHOICES = {
  */
 const COUNTERBORES: readonly [number, number, number][] = [
   [3, 6.5, 3.4],
+  [3.5, 6.5, 3.9],
   [4, 8, 4.4],
   [5, 10, 5.4],
   [6, 11, 6.4],
@@ -165,9 +179,12 @@ const COUNTERBORES: readonly [number, number, number][] = [
   [12, 20, 12.6],
   [14, 24, 14.6],
   [16, 26, 16.6],
+  [18, 30, 18.6],
   [20, 33, 20.6],
+  [22, 36, 22.8],
   [24, 40, 24.8],
-  [30, 48, 30.8],
+  [27, 46, 27.8],
+  [30, 50, 30.8],
 ];
 
 /** Countersinks for ISO 10642 countersunk head screws: the head's theoretical diameter dk at 90 deg (mm), so it sits flush. M3 to M20. */
@@ -185,8 +202,8 @@ const COUNTERSINKS: readonly [number, number][] = [
 ];
 
 /** The sizes each table has, for the words of a refusal ("M3 to M30"). */
-export const COUNTERBORE_SIZES = 'M3 to M30';
-export const COUNTERSINK_SIZES = 'M3 to M20';
+export const COUNTERBORE_SIZES = COUNTERBORES.map(([d]) => `M${d}`).join(', ');
+export const COUNTERSINK_SIZES = COUNTERSINKS.map(([d]) => `M${d}`).join(', ');
 
 /** The counterbore for an ISO 4762 socket head cap screw of this size (mm), or null (an inch size has none). */
 export function counterboreFor(size: string): { diameter: number; depth: number } | null {
