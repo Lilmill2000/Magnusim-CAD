@@ -116,6 +116,9 @@
 #include <BRepFilletAPI_MakeChamfer.hxx>
 #include <BRepFilletAPI_MakeFillet.hxx>
 #include <BRepOffsetAPI_MakeThickSolid.hxx>
+#include <BRepOffsetAPI_MakeDraft.hxx>
+#include <BRepOffsetAPI_MakeOffset.hxx>
+#include <BOPAlgo_MakerVolume.hxx>
 #include <BRepOffset_MakeOffset.hxx>
 #include <BRepAlgoAPI_Check.hxx>
 #include <BRepOffsetAPI_MakePipe.hxx>
@@ -1114,21 +1117,24 @@ int faceIndexIn(int outId, const TopoDS_Shape& f) {
 // Fallback when a builder reports no generated face (OCCT's full 360 degree revolve
 // does this for planar faces): the face of the output that contains the profile
 // edge's midpoint, provided exactly one unassigned face does.
-int faceContainingEdge(int outId, const TopoDS_Edge& e, const std::vector<bool>& taken) {
+int faceContainingEdge(const TopTools_IndexedMapOfShape& faces, const TopoDS_Edge& e, const std::vector<bool>& taken) {
   BRepAdaptor_Curve c(e);
   gp_Pnt m = c.Value(0.5 * (c.FirstParameter() + c.LastParameter()));
   TopoDS_Vertex v = BRepBuilderAPI_MakeVertex(m).Vertex();
-  Indexed& ix = indexOf(outId);
   int found = -1;
-  for (int i = 1; i <= ix.f.Extent(); ++i) {
+  for (int i = 1; i <= faces.Extent(); ++i) {
     if (taken[i - 1]) continue;
-    BRepExtrema_DistShapeShape d(v, ix.f(i));
+    BRepExtrema_DistShapeShape d(v, faces(i));
     if (d.IsDone() && d.Value() < 1e-6) {
       if (found >= 0) return -1;  // ambiguous
       found = i - 1;
     }
   }
   return found;
+}
+
+int faceContainingEdge(int outId, const TopoDS_Edge& e, const std::vector<bool>& taken) {
+  return faceContainingEdge(indexOf(outId).f, e, taken);
 }
 
 // Side faces and caps of a swept profile.
@@ -1425,7 +1431,9 @@ struct Sweep {
 using ProfileAt = std::function<std::unique_ptr<Profile>(double shift)>;
 
 // Sweep a profile over a planned extent: a prism (clipped at a to_face plane), or with
-// a taper LocOpe_DPrism. LocOpe_DPrism measures its height along the drafted wall and
+// a taper. Widening drafts sweep the walls with sharp corner transitions.
+// Narrowing drafts use LocOpe_DPrism, including walls that meet before the end.
+// LocOpe_DPrism measures its height along the drafted wall and
 // sweeps along the profile plane's normal; positive taper narrows the section away
 // from the start. A sweep against the normal is built along it and mirrored through
 // the profile plane (the profile maps onto itself), so the taper keeps its sense.
@@ -1477,20 +1485,132 @@ Sweep sweepProfile(const ProfileAt& at, const ExtentPlan& pl, const gp_Pnt& o, c
   const double sN = pl.s0 * sigma, LN = pl.L * sigma;  // along the plane normal
   const bool mirror = LN < 0;
   std::shared_ptr<Profile> PT = mirror ? std::shared_ptr<Profile>(at(-sN).release()) : P;
-  auto dp = std::make_shared<LocOpe_DPrism>(PT->face, fabs(LN) / cos(a), a);
-  if (!dp->IsDone()) throw OcctError("tapered extrude failed");
-  sw.keep.push_back(dp);
-  if (!mirror) {
+  if (a < 0) {
+    GProp_GProps baseProps;
+    BRepGProp::SurfaceProperties(PT->face, baseProps);
+    const double straightVolume = fabs(baseProps.Mass() * LN);
+    // MakeDraft estimates wire orientation from a few samples. A concave
+    // profile's centre can lie outside it, so verify the sense by its volume.
+    for (bool internal : {false, true}) {
+      try {
+        sw.first.Nullify();
+        sw.last.Nullify();
+        const gp_Dir draftDir = n;
+        BRepBuilderAPI_Copy work(PT->face, true, false);
+        auto draft = std::make_unique<BRepOffsetAPI_MakeDraft>(work.Shape(), draftDir, -a);
+        draft->SetOptions(BRepBuilderAPI_RightCorner, Precision::Angular(), M_PI);
+        draft->SetDraft(internal);
+        const gp_Pnt end = PT->ax.Location().Translated(gp_Vec(n.XYZ()) * fabs(LN));
+        draft->Perform(new Geom_Plane(gp_Pln(end, draftDir)));
+        if (!draft->IsDone()) throw OcctError("tapered extrude failed (drafting walls)");
+        sw.shape = draft->Shape();
+        if (!TopExp_Explorer(sw.shape, TopAbs_SOLID).More() || !BRepCheck_Analyzer(sw.shape).IsValid()) {
+          // A widening profile can close a slot. MakeDraft's surface stop may then
+          // leave crossing cap wires or an open shell. Sweep past the end, cap with
+          // the profile's sharp offset and assemble the bounded cells between them.
+          BRepBuilderAPI_Copy fresh(PT->face, true, false);
+          draft = std::make_unique<BRepOffsetAPI_MakeDraft>(fresh.Shape(), draftDir, -a);
+          draft->SetOptions(BRepBuilderAPI_RightCorner, Precision::Angular(), M_PI);
+          draft->SetDraft(internal);
+          draft->Perform((fabs(pl.L) + 1) / cos(a));
+          if (!draft->IsDone()) throw OcctError("tapered extrude failed (drafting walls)");
+          BRepOffsetAPI_MakeOffset offset(PT->face, GeomAbs_Intersection);
+          offset.Perform(fabs(LN) * tan(-a));
+          if (!offset.IsDone()) throw OcctError("tapered extrude failed (end profile)");
+          gp_Trsf move;
+          move.SetTranslation(gp_Vec(n.XYZ()) * fabs(LN));
+          TopTools_ListOfShape faces;
+          for (TopExp_Explorer ex(draft->Shape(), TopAbs_FACE); ex.More(); ex.Next()) faces.Append(ex.Current());
+          for (TopExp_Explorer ex(offset.Shape(), TopAbs_WIRE); ex.More(); ex.Next()) {
+            TopoDS_Face cap = BRepBuilderAPI_MakeFace(gp_Pln(PT->ax), TopoDS::Wire(ex.Current()), true).Face();
+            faces.Append(BRepBuilderAPI_Transform(cap, move, true).Shape());
+          }
+          BOPAlgo_MakerVolume volume;
+          volume.SetArguments(faces);
+          volume.SetRunParallel(false);
+          volume.Perform();
+          if (volume.HasErrors()) throw OcctError("tapered extrude failed (closing walls)");
+          TopTools_ListOfShape solids;
+          for (TopExp_Explorer ex(volume.Shape(), TopAbs_SOLID); ex.More(); ex.Next()) {
+            GProp_GProps props;
+            BRepGProp::VolumeProperties(ex.Current(), props);
+            const double height = gp_Vec(PT->ax.Location(), props.CentreOfMass()).Dot(gp_Vec(draftDir.XYZ()));
+            if (height > 0 && height < fabs(LN)) solids.Append(ex.Current());
+          }
+          if (solids.IsEmpty()) throw OcctError("tapered extrude failed (no closed solid)");
+          if (solids.Extent() == 1) {
+            sw.shape = solids.First();
+          } else {
+            TopTools_ListOfShape args;
+            args.Append(solids.First());
+            solids.RemoveFirst();
+            BRepAlgoAPI_Fuse fuse;
+            fuse.SetArguments(args);
+            fuse.SetTools(solids);
+            fuse.SetRunParallel(false);
+            fuse.SetToFillHistory(true);
+            fuse.Build();
+            if (fuse.HasErrors()) throw OcctError("tapered extrude failed (joining closed cells)");
+            sw.shape = unwrap(fuse.Shape());
+          }
+          ShapeUpgrade_UnifySameDomain unify(sw.shape, true, true, false);
+          unify.SetSafeInputMode(true);
+          unify.Build();
+          if (BRepCheck_Analyzer(unify.Shape()).IsValid()) sw.shape = unify.Shape();
+        }
+        if (!TopExp_Explorer(sw.shape, TopAbs_SOLID).More()) throw OcctError("tapered extrude failed (no closed solid)");
+        if (!BRepCheck_Analyzer(sw.shape).IsValid()) throw OcctError("tapered extrude failed (invalid solid)");
+        GProp_GProps draftedProps;
+        BRepGProp::VolumeProperties(sw.shape, draftedProps);
+        if (fabs(draftedProps.Mass()) < straightVolume - 1e-9 * std::max(1.0, straightVolume))
+          throw OcctError("tapered extrude failed (walls narrowed instead of widening)");
+        for (TopExp_Explorer ex(sw.shape, TopAbs_FACE); ex.More(); ex.Next()) {
+          BRepAdaptor_Surface surface(TopoDS::Face(ex.Current()));
+          if (surface.GetType() != GeomAbs_Plane) continue;
+          const gp_Pln plane = surface.Plane();
+          if (!plane.Axis().Direction().IsParallel(n, Precision::Angular())) continue;
+          if (plane.Distance(PT->ax.Location()) < Precision::Confusion()) sw.first = ex.Current();
+          if (plane.Distance(end) < Precision::Confusion()) sw.last = ex.Current();
+        }
+        // The sketch boundary stays on the solid. Reuse the midpoint lookup, keeping
+        // caps out, and allow two collinear segments to name the same merged wall.
+        TopTools_IndexedMapOfShape faces;
+        TopExp::MapShapes(sw.shape, TopAbs_FACE, faces);
+        std::vector<bool> caps(faces.Extent(), false);
+        for (int i = 1; i <= faces.Extent(); ++i) {
+          BRepAdaptor_Surface surface(TopoDS::Face(faces(i)));
+          if (surface.GetType() != GeomAbs_Plane) continue;
+          const gp_Pln plane = surface.Plane();
+          caps[i - 1] = plane.Axis().Direction().IsParallel(n, Precision::Angular()) &&
+                        (plane.Distance(PT->ax.Location()) < Precision::Confusion() || plane.Distance(end) < Precision::Confusion());
+        }
+        sw.generated = [faces, caps](const TopoDS_Shape& e) {
+          TopTools_ListOfShape out;
+          const int i = faceContainingEdge(faces, TopoDS::Edge(e), caps);
+          if (i >= 0) out.Append(faces(i + 1));
+          return out;
+        };
+        break;
+      } catch (const Standard_Failure&) {
+        if (internal) throw;
+      } catch (const OcctError&) {
+        if (internal) throw;
+      }
+    }
+  } else {
+    auto dp = std::make_shared<LocOpe_DPrism>(PT->face, fabs(LN) / cos(a), a);
+    if (!dp->IsDone()) throw OcctError("tapered extrude failed");
+    sw.keep.push_back(dp);
     sw.shape = dp->Shape();
-    sw.prof = PT;
     sw.generated = [dp](const TopoDS_Shape& e) { return dp->Shapes(e); };
     sw.first = dp->FirstShape();
     sw.last = dp->LastShape();
-    return sw;
   }
+  sw.prof = PT;
+  if (!mirror) return sw;
   gp_Trsf m;
   m.SetMirror(gp_Ax2(o, n));
-  auto tf = std::make_shared<BRepBuilderAPI_Transform>(dp->Shape(), m, true);
+  auto tf = std::make_shared<BRepBuilderAPI_Transform>(sw.shape, m, true);
   if (!tf->IsDone()) throw OcctError("tapered extrude failed (mirror)");
   sw.keep.push_back(tf);
   sw.shape = tf->Shape();
@@ -1515,19 +1635,19 @@ Sweep sweepProfile(const ProfileAt& at, const ExtentPlan& pl, const gp_Pnt& o, c
   for (auto& se : PT->segEdges)
     mirrored->segEdges.emplace_back(se.first, TopoDS::Edge(BRepBuilderAPI_Transform(se.second, m, true).Shape()));
   sw.prof = mirrored;
-  sw.generated = [dp, PT, mirrored, mapFace](const TopoDS_Shape& e) {
+  sw.generated = [generated = sw.generated, PT, mirrored, mapFace](const TopoDS_Shape& e) {
     for (auto& se : PT->segEdges)
       for (auto& me : mirrored->segEdges)
         if (me.second.IsSame(e) && me.first == se.first) {
           TopTools_ListOfShape out;
-          const TopTools_ListOfShape& in = dp->Shapes(se.second);
+          const TopTools_ListOfShape in = generated(se.second);
           for (TopTools_ListIteratorOfListOfShape it(in); it.More(); it.Next()) mapFace(it.Value(), out);
           return out;
         }
     return TopTools_ListOfShape();
   };
-  sw.first = capViaMirror(dp->FirstShape());
-  sw.last = capViaMirror(dp->LastShape());
+  sw.first = capViaMirror(sw.first);
+  sw.last = capViaMirror(sw.last);
   return sw;
 }
 

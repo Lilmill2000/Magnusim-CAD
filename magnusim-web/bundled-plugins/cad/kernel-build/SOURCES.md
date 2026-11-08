@@ -265,6 +265,52 @@ must go, and the heal only grows faces. The other build order (R1 first) runs
   kernel; the budget test fails without 0002), `e2e/cad-kernel-api8.spec.ts`
   in the Part's own worker.
 
+## Widening draft
+
+The facade uses `BRepOffsetAPI_MakeDraft` with `BRepBuilderAPI_RightCorner` for
+negative taper. `LocOpe_DPrism` uses round joins on widening corners. Narrowing
+drafts continue through `LocOpe_DPrism`, including drill tips and meeting walls.
+Both senses use the existing reflection through the sketch plane for Flip.
+
+The widening sweep works on private copies. Its wire-orientation estimate can
+choose the wrong sense on concave outlines, so the facade checks the volume
+against the straight prism and tries the other sense when needed. Crossing walls
+are closed with an intersection offset of the end profile and `BOPAlgo_MakerVolume`,
+then fused and unified when valid. The result must contain solids and pass
+`BRepCheck`. The existing midpoint lookup maps sketch edges to the final walls,
+allowing collinear edges to name one merged face. A singular slot closing exactly
+at the end is refused. These operations use the already-linked TKOffset and TKBO.
+
+Verification used the complete facade against native OCCT 7.9.3 on Windows,
+with platform shims and `MK_NO_ASI`, through its JSON entry points. The 74 probes
+covered profiles, side/cap names, flips, oblique planes, small and large angles,
+closing slots, joins, cuts, and eight refusals for the singular end condition.
+
+A development WASM32 rebuild on 2026-11-08 used the pinned compiler commit
+(`6.0.10-git` in the Windows package), both OCCT patches and Analysis Situs.
+It passed 80 probes: 76 valid-solid/boolean cases and four expected refusals of
+the singular closing-slot boundary. The probes checked analytic volumes,
+planar polygon walls, cap indices and each named polygon wall's plane, across both
+extrusion entry points, flips and oblique frames. An Analysis Situs recognition
+smoke test passed too; its library's SHA-256 matches the existing build record.
+
+The app loaded that exact pair in headless Edge 157.0.4341.42. Its Hole panel
+passed 40 new-size/fit values, five counterbore rows and four actual cuts.
+Extrude passed the sharp square, narrowing, Flip, save/reload and the closing
+U profile (9269.333333333334 mm³, nine planar faces). Seven scripted local-model
+Assistant calls passed, including M27/M39 holes and the sharp square.
+`npm run build:cad:check` matched all nine generated files with the rebuilt
+kernel loaded. The square measured 1185.183015379251 mm³ with six planar faces,
+versus 1182.992855920397 mm³ and four corner cones in the tracked kernel.
+
+Development `mk32.wasm`: 23,459,851 bytes, SHA-256
+`327a7ae31cf777c718ec81fb73739c2aebbf5227c10d781725a4ca20b01c7d7a`.
+The development pair stays outside Git under the version-bump policy below;
+the tracked kernel pair is unchanged. [PR #20](https://github.com/Lilmill2000/Magnusim-CAD/pull/20)
+records the build and verification. Magnusim's private suites and the Electron
+shell were not run; integration still needs the maintainer's release build and
+private-suite run.
+
 ## Flags
 
 - Compile (OCCT and facade): `-O3 -fwasm-exceptions -msimd128`, plus
