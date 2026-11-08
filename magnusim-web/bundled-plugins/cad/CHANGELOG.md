@@ -4,6 +4,12 @@ What changed in Magnusim CAD, newest first. How to use each part: `README.md`.
 
 ## Unreleased (0.2.0-dev)
 
+**Widening draft preserves sharp corners.** The kernel sweeps widening walls
+with sharp transitions, including B-spline profiles and slots that close before
+the end. Its start, end and side names follow the result through Flip. A result
+must be a valid solid and widen in the requested sense. An exactly closing slot
+at the end can have a zero-thickness boundary and is refused.
+
 **Hole's metric sizes include both choice series.** Added M1.8, M3.5, M7,
 M18, M22, M27, M33, M39, M45 and M52 for all clearance fits and coarse tapped
 holes. The shared picker and Assistant lookup read these same rows. Added

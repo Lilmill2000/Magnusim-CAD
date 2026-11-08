@@ -265,6 +265,29 @@ must go, and the heal only grows faces. The other build order (R1 first) runs
   kernel; the budget test fails without 0002), `e2e/cad-kernel-api8.spec.ts`
   in the Part's own worker.
 
+## Widening draft
+
+The facade uses `BRepOffsetAPI_MakeDraft` with `BRepBuilderAPI_RightCorner` for
+negative taper. `LocOpe_DPrism` uses round joins on widening corners. Narrowing
+drafts continue through `LocOpe_DPrism`, including drill tips and meeting walls.
+Both senses use the existing reflection through the sketch plane for Flip.
+
+The widening sweep works on private copies. Its wire-orientation estimate can
+choose the wrong sense on concave outlines, so the facade checks the volume
+against the straight prism and tries the other sense when needed. Crossing walls
+are closed with an intersection offset of the end profile and `BOPAlgo_MakerVolume`,
+then fused and unified when valid. The result must contain solids and pass
+`BRepCheck`. The existing midpoint lookup maps sketch edges to the final walls,
+allowing collinear edges to name one merged face. A singular slot closing exactly
+at the end is refused. These operations use the already-linked TKOffset and TKBO.
+
+Verification used the complete facade against native OCCT 7.9.3 on Windows,
+with platform shims and `MK_NO_ASI`, through its JSON entry points. The 74 probes
+covered profiles, side/cap names, flips, oblique planes, small and large angles,
+closing slots, joins, cuts, and eight refusals for the singular end condition.
+The WebAssembly module and Magnusim's private suites require their own rebuild
+and run in the maintainer's development environment.
+
 ## Flags
 
 - Compile (OCCT and facade): `-O3 -fwasm-exceptions -msimd128`, plus
